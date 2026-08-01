@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from conftest import FakePacket
 from remora.fields import Field, FieldRef, MultiField, Packet, RawPacket
 from remora.reader.ek_reader import EkPacket, EkReader, ek_argv
 from remora.reader.process import TsharkProcess
@@ -51,16 +52,6 @@ def _golden_lines() -> list[str]:
 
 def _golden_packets() -> list[EkPacket]:
     return list(EkReader(_golden_lines()))
-
-
-class FakePacket:
-    """Minimal RawPacket: absent fields are ()."""
-
-    def __init__(self, data: dict[str, tuple[str, ...]]) -> None:
-        self._data = data
-
-    def get_raw(self, field_name: str) -> tuple[str, ...]:
-        return self._data.get(field_name, ())
 
 
 SRC_REF = FieldRef[IPv4Address]("ip.src", "FT_IPv4", False)
@@ -129,6 +120,19 @@ class TestGoldenSample:
         _, syn_ack, dns = _golden_packets()
         assert syn_ack.get_raw("tcp.flags.syn") == ("1",)
         assert dns.get_raw("dns.count.queries") == ("2",)
+
+    def test_container_prefixed_field_is_found_across_layers(self) -> None:
+        """_ws.expert.message has no "_ws" layer: its key is
+        _ws_expert__ws_expert_message inside layers["tcp"]["_ws_expert"], so
+        only the suffix-matching fallback across all layers can find it."""
+        syn, syn_ack, _ = _golden_packets()
+        assert syn.get_raw("_ws.expert.message") == (
+            "Connection establish request (SYN): server port 443",
+        )
+        assert syn_ack.get_raw("_ws.expert.message") == (
+            "Connection establish acknowledge (SYN+ACK): server port 443",
+        )
+        assert syn.get_raw("_ws.expert.severity") == ("2097152",)
 
     def test_unknown_field_on_real_packet_is_absent_not_an_error(self) -> None:
         """ek packets are complete: unknown fields are (), never FieldNotProjectedError."""
@@ -224,6 +228,14 @@ class TestEkPacketNormalization:
         pkt = self._packet({"tcp": {"tcp_tcp_flags": {"tcp_tcp_flags_syn": True}}})
         assert pkt.get_raw("tcp.flags") == ()
 
+    def test_subtree_dict_does_not_shadow_nested_value_under_same_key(self) -> None:
+        """A direct key hit whose value is a dict is a container, not a value:
+        the search must continue and find the real (nested) occurrence."""
+        pkt = self._packet(
+            {"tcp": {"tcp_tcp_flags": {"tcp_tcp_flags_syn": True}, "_sub": {"tcp_tcp_flags": "2"}}}
+        )
+        assert pkt.get_raw("tcp.flags") == ("2",)
+
     def test_present_empty_string_is_distinct_from_absent(self) -> None:
         pkt = self._packet({"dns": {"dns_dns_qry_name": ""}})
         assert pkt.get_raw("dns.qry.name") == ("",)
@@ -232,7 +244,8 @@ class TestEkPacketNormalization:
 class TestPacketContract:
     def test_satisfies_raw_packet_protocol(self) -> None:
         assert isinstance(EkPacket({}), RawPacket)
-        # Packet is not runtime_checkable; conformance is verified statically.
+        # Packet is not runtime_checkable; conformance is verified statically
+        # by mypy --strict, which CI runs over the test files too.
         _packet_view: Packet = EkPacket({})
 
     def test_getitem_builds_protocol_view(self) -> None:

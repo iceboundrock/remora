@@ -30,6 +30,12 @@ Each packet produces two lines: an index/action metadata line such as
 - **Nested dicts** hold subtree fields (e.g. ``layers["tcp"]["_ws_expert"]``
   contains ``"tcp_tcp_connection_syn"``), so a missing top-level key falls
   back to a depth-first search of nested dicts (and dicts inside arrays).
+- **Container-prefixed keys**: some fields' keys are prefixed with their
+  *container's* name rather than the enclosing layer's — ``_ws.expert.message``
+  appears as ``"_ws_expert__ws_expert_message"`` inside
+  ``layers["tcp"]["_ws_expert"]`` even though ``"_ws"`` is never a top-level
+  layer. :meth:`EkPacket.get_raw` handles these with a suffix-matching
+  fallback across all layers.
 
 Values stay RAW STRINGS here — typed conversion happens downstream in the
 descriptors / predicate backend via :mod:`remora.values`. Booleans normalize
@@ -81,10 +87,13 @@ def _find(container: dict[str, Any], key: str) -> object:
     """Depth-first lookup of ``key``: direct hit first, then nested dicts.
 
     Nested dicts (and dicts inside arrays) hold subtree fields such as expert
-    info; a direct hit always wins. Returns ``_MISSING`` when absent.
+    info; a direct hit wins — unless its value is itself a dict, which is a
+    subtree *container*, not a field value; that counts as a miss and the
+    search continues into nested dicts. Returns ``_MISSING`` when absent.
     """
-    if key in container:
-        return container[key]
+    hit = container.get(key, _MISSING)
+    if hit is not _MISSING and not isinstance(hit, dict):
+        return hit
     for value in container.values():
         if isinstance(value, dict):
             found = _find(value, key)
@@ -94,6 +103,29 @@ def _find(container: dict[str, Any], key: str) -> object:
             for element in value:
                 if isinstance(element, dict):
                     found = _find(element, key)
+                    if found is not _MISSING:
+                        return found
+    return _MISSING
+
+
+def _find_suffix(container: dict[str, Any], suffix: str) -> object:
+    """Depth-first search for the first non-dict value whose key ends in ``suffix``.
+
+    Dict values are subtree containers (searched, never returned); dicts inside
+    arrays are searched too. First match in iteration order wins. Returns
+    ``_MISSING`` when nothing matches.
+    """
+    for key, value in container.items():
+        if isinstance(value, dict):
+            found = _find_suffix(value, suffix)
+            if found is not _MISSING:
+                return found
+        elif key.endswith(suffix):
+            return value
+        elif isinstance(value, list):
+            for element in value:
+                if isinstance(element, dict):
+                    found = _find_suffix(element, suffix)
                     if found is not _MISSING:
                         return found
     return _MISSING
@@ -114,16 +146,35 @@ class EkPacket:
         self._layers = layers
 
     def get_raw(self, field_name: str) -> tuple[str, ...]:
-        """Raw string occurrences of ``field_name`` in wire order; ``()`` if absent."""
+        """Raw string occurrences of ``field_name`` in wire order; ``()`` if absent.
+
+        Fast path: the field's first dotted component names its layer, so the
+        mangled key ``layer + "_" + field_name.replace(".", "_")`` is looked up
+        (depth-first) inside that layer dict; a hit there wins. But not every
+        field lives under a layer named by its prefix — ``_ws.expert.message``
+        is keyed ``"_ws_expert__ws_expert_message"`` inside
+        ``layers["tcp"]["_ws_expert"]``, and ``"_ws"`` is not a ``layers`` key.
+        So when the layer is absent or the lookup misses, fall back to a
+        depth-first search of ALL layers for the first key ending in
+        ``"_" + mangled``: the container's name (e.g. ``_ws_expert``) supplies
+        the prefix, and the joining underscore plus the field's own leading
+        underscore yields the double underscore seen above. First match in
+        iteration order wins.
+        """
+        mangled = field_name.replace(".", "_")
         layer_name = field_name.split(".", 1)[0]
         layer = self._layers.get(layer_name)
-        if not isinstance(layer, dict):
-            return ()
-        key = layer_name + "_" + field_name.replace(".", "_")
-        value = _find(layer, key)
-        if value is _MISSING:
-            return ()
-        return _normalize(value)
+        if isinstance(layer, dict):
+            value = _find(layer, layer_name + "_" + mangled)
+            if value is not _MISSING:
+                return _normalize(value)
+        suffix = "_" + mangled
+        for candidate in self._layers.values():
+            if isinstance(candidate, dict):
+                value = _find_suffix(candidate, suffix)
+                if value is not _MISSING:
+                    return _normalize(value)
+        return ()
 
     def __getitem__(self, proto: type[P]) -> P:
         """Typed protocol view: ``pkt[IP]`` returns ``IP(pkt)``."""
