@@ -80,6 +80,12 @@ class TestProcessLifecycle:
             assert_type(pkt, Packet)
             break
         assert len(created) == 1
-        # close() ran and reaped the child: a live or zombie process would
-        # still poll() as None.
+        # ``close()`` sets ``_closed`` unconditionally on its first call, so this
+        # is a direct witness that cleanup ran on the early break. It is the
+        # load-bearing assert: ``returncode`` alone proves nothing here, because
+        # tshark writes all 3 packets into the pipe buffer and exits on its own
+        # regardless of whether anything closed it.
+        assert created[0]._closed is True
+        # And the child was reaped rather than left running (poll() is None only
+        # while it is still alive).
         assert created[0].returncode is not None
