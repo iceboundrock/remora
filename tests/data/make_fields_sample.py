@@ -22,24 +22,44 @@ The three packets exercise the parse rules the reader must honor:
 Checksums (IPv4 header, TCP, UDP) are computed properly so the capture
 is clean even with checksum validation enabled.
 
-Usage::
+Usage (requires the remora package to be installed, e.g. via ``uv sync``)::
 
-    python tests/data/make_fields_sample.py
+    uv run python tests/data/make_fields_sample.py
 
-Writes ``sample.pcap`` and ``fields_sample.txt`` next to this file. Both
-are checked in; rerun only to regenerate against a different tshark.
+tshark is located via the ``TSHARK`` environment variable if set, else
+``shutil.which("tshark")``, else the Homebrew default path.
+
+Writes ``sample.pcap`` and ``fields_sample.txt`` next to this file — and
+only after tshark has succeeded, so a failed run never leaves partial
+artifacts behind. Both are checked in; rerun only to regenerate against a
+different tshark.
 """
 
 from __future__ import annotations
 
+import os
+import shutil
 import struct
 import subprocess
-import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
+from remora.fields import FieldRef
+from remora.reader.fields_reader import fields_argv
+
 HERE = Path(__file__).resolve().parent
-TSHARK = "/opt/homebrew/bin/tshark"
+
+
+def find_tshark() -> str:
+    """Resolve tshark: $TSHARK, then PATH, then the Homebrew default."""
+    candidate = os.environ.get("TSHARK") or shutil.which("tshark") or "/opt/homebrew/bin/tshark"
+    if not Path(candidate).is_file():
+        raise SystemExit(
+            f"error: tshark not found at {candidate!r}; install tshark "
+            "or point the TSHARK environment variable at the binary"
+        )
+    return candidate
 
 
 def checksum(data: bytes) -> int:
@@ -145,12 +165,7 @@ def build_pcap() -> bytes:
 
 
 def main() -> None:
-    sys.path.insert(0, str(HERE.parent.parent / "src"))
-    from remora.fields import FieldRef
-    from remora.reader.fields_reader import fields_argv
-
-    pcap_path = HERE / "sample.pcap"
-    pcap_path.write_bytes(build_pcap())
+    pcap_bytes = build_pcap()
 
     projection: list[FieldRef[Any]] = [
         FieldRef[int]("frame.number", "FT_FRAMENUM", False),
@@ -158,8 +173,17 @@ def main() -> None:
         FieldRef[int]("tcp.port", "FT_UINT16", True),
         FieldRef[str]("dns.qry.name", "FT_STRING", False),
     ]
-    argv = [TSHARK, "-r", str(pcap_path), *fields_argv(projection)]
-    result = subprocess.run(argv, capture_output=True, text=True, check=True)
+
+    # Run tshark against a temporary pcap; write both checked-in artifacts
+    # only after it succeeds, so a failure leaves no partial artifacts.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_pcap = Path(tmpdir) / "sample.pcap"
+        tmp_pcap.write_bytes(pcap_bytes)
+        argv = [find_tshark(), "-r", str(tmp_pcap), *fields_argv(projection)]
+        result = subprocess.run(argv, capture_output=True, text=True, check=True)
+
+    pcap_path = HERE / "sample.pcap"
+    pcap_path.write_bytes(pcap_bytes)
     (HERE / "fields_sample.txt").write_text(result.stdout)
     # NB: count "\n" rather than splitlines() — str.splitlines() also splits
     # on \x1e, the very aggregator byte this output embeds.

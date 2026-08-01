@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from typing_extensions import assert_type
 
 from remora.fields import FieldNotProjectedError, FieldRef, RawPacket
 from remora.reader.fields_reader import (
@@ -65,7 +66,7 @@ SAMPLE_ROWS = [
 
 def sample_lines(text: str) -> list[str]:
     """Split raw tshark stdout into lines on \\n only (see module docstring)."""
-    return text.split("\n")[:-1]  # drop the empty tail after the final newline
+    return text.rstrip("\n").split("\n")
 
 
 def parse(lines: list[str], projection: Sequence[FieldRef[Any]] | None = None) -> list[FieldsRow]:
@@ -163,7 +164,10 @@ class TestFieldsRowPacketContract:
                 self._remora_packet = packet
 
         (row,) = parse([f"1{UNIT_SEP}10.0.0.1{UNIT_SEP}51234{OCC_SEP}443{UNIT_SEP}"])
+        # Static half of the contract: raw access and protocol-view typing.
+        assert_type(row.get_raw("ip.src"), tuple[str, ...])
         view = row[FakeProto]
+        assert_type(view, FakeProto)
         assert isinstance(view, FakeProto)
         assert view.src == IPv4Address("10.0.0.1")
         assert view.port == (51234, 443)
@@ -188,5 +192,10 @@ class TestIntegration:
         assert tshark is not None
         argv = [tshark, "-r", str(DATA_DIR / "sample.pcap"), *fields_argv(SAMPLE_PROJECTION)]
         with TsharkProcess(argv) as proc:
-            rows = list(FieldsReader(proc, SAMPLE_PROJECTION))
+            raw_lines = list(proc)
+        # Self-verify the raw-byte separator claim (module docstring of
+        # fields_reader): the control bytes really are in tshark's stdout.
+        assert any(UNIT_SEP in line for line in raw_lines)
+        assert any(OCC_SEP in line for line in raw_lines)
+        rows = list(FieldsReader(raw_lines, SAMPLE_PROJECTION))
         assert [row_dict(row) for row in rows] == SAMPLE_ROWS
