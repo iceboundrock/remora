@@ -7,57 +7,26 @@ display-filter backend lives in ``tests/test_semantics_table.py``.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from ipaddress import IPv4Address
 
 import pytest
 
+from conftest import FakePacket
 from remora.compile.predicate import compile_predicate
-from remora.expr import Expr, FieldExprOps
+from remora.expr import Expr
+from remora.fields import FieldRef
 
-
-class StubField(FieldExprOps):
-    """Minimal FieldLike for tests; FieldRef (issue #8) looks like this."""
-
-    __slots__ = ("_ftype", "_multi", "_name")
-
-    def __init__(self, name: str, ftype: str = "FT_STRING", multi: bool = False) -> None:
-        self._name = name
-        self._ftype = ftype
-        self._multi = multi
-
-    @property
-    def name(self) -> str:
-        return self._name
-
-    @property
-    def ftype(self) -> str:
-        return self._ftype
-
-    @property
-    def multi(self) -> bool:
-        return self._multi
-
-
-class FakePacket:
-    """Minimal RawPacket: absent fields are ()."""
-
-    def __init__(self, data: dict[str, tuple[str, ...]]) -> None:
-        self._data = data
-
-    def get_raw(self, field_name: str) -> tuple[str, ...]:
-        return self._data.get(field_name, ())
-
-
-SRC = StubField("ip.src", "FT_IPv4")
-DST = StubField("ip.dst", "FT_IPv4")
-PORT = StubField("tcp.port", "FT_UINT16", multi=True)
-TTL = StubField("ip.ttl", "FT_UINT8")
-HOST = StubField("http.host", "FT_STRING")
-PAYLOAD = StubField("tcp.payload", "FT_BYTES")
-TIME = StubField("frame.time", "FT_ABSOLUTE_TIME")
-DELTA = StubField("frame.time_delta", "FT_RELATIVE_TIME")
-SYN = StubField("tcp.flags.syn", "FT_BOOLEAN")
-LOSS = StubField("frame.loss", "FT_DOUBLE")
-CUSTOM = StubField("x.custom", "FT_SOMETHING_NEW")
+SRC = FieldRef[IPv4Address]("ip.src", "FT_IPv4", False)
+DST = FieldRef[IPv4Address]("ip.dst", "FT_IPv4", False)
+PORT = FieldRef[int]("tcp.port", "FT_UINT16", True)
+TTL = FieldRef[int]("ip.ttl", "FT_UINT8", False)
+HOST = FieldRef[str]("http.host", "FT_STRING", False)
+PAYLOAD = FieldRef[bytes]("tcp.payload", "FT_BYTES", False)
+TIME = FieldRef[datetime]("frame.time", "FT_ABSOLUTE_TIME", False)
+DELTA = FieldRef[timedelta]("frame.time_delta", "FT_RELATIVE_TIME", False)
+SYN = FieldRef[bool]("tcp.flags.syn", "FT_BOOLEAN", False)
+LOSS = FieldRef[float]("frame.loss", "FT_DOUBLE", False)
+CUSTOM = FieldRef[str]("x.custom", "FT_SOMETHING_NEW", False)
 
 EMPTY = FakePacket({})
 

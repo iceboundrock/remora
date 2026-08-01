@@ -69,10 +69,13 @@ def compile_predicate(expr: Expr) -> Callable[[RawPacket], bool]:
         name = expr.field.name
         ftype = expr.field.ftype
         lit = values.coerce_literal(ftype, expr.value)
+        # Bind the parse function once at compile time rather than looking the
+        # ftype up again for every occurrence of every packet.
+        parse = values.get_info(ftype).parse
 
         def compare(pkt: RawPacket) -> bool:
             # any() over () is False, so an absent field never matches.
-            return any(op(values.convert(ftype, raw), lit) for raw in pkt.get_raw(name))
+            return any(op(parse(raw), lit) for raw in pkt.get_raw(name))
 
         return compare
     if isinstance(expr, Presence):
