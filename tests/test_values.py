@@ -64,6 +64,12 @@ _EXPECTED_PY_TYPES: dict[str, type] = {
 
 
 class TestTable:
+    def test_expected_types_cover_exactly_the_module_table(self) -> None:
+        """Bidirectional completeness: an ftype added to (or removed from)
+        FTYPE_TABLE fails here until the test's expectations are updated."""
+        assert set(_EXPECTED_PY_TYPES) == set(FTYPE_TABLE)
+        assert set(_ALL_FTYPES) == set(FTYPE_TABLE)
+
     @pytest.mark.parametrize("ftype", _ALL_FTYPES)
     def test_every_ftype_has_converter_and_target_type(self, ftype: str) -> None:
         info = FTYPE_TABLE[ftype]
