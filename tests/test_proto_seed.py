@@ -13,11 +13,18 @@ from __future__ import annotations
 
 import ast
 import pathlib
+from ipaddress import IPv4Address
 from types import ModuleType
+from typing import TypeVar, cast
 
 import pytest
+from typing_extensions import assert_type
 
+from conftest import FakePacket
 from remora import values
+from remora.expr import Comparison
+from remora.fields import FieldRef, Packet
+from remora.proto import DNS, IP, TCP
 from remora.proto import dns as dns_mod
 from remora.proto import eth as eth_mod
 from remora.proto import ip as ip_mod
@@ -100,3 +107,66 @@ class TestStubTablePairing:
 
     def test_proto_matches_module_name(self, module: ModuleType, cls: type[ProtocolBase]) -> None:
         assert module.__name__.rsplit(".", 1)[-1] == cls._proto_
+
+
+P = TypeVar("P", bound=ProtocolBase)
+
+
+class FullFakePacket:
+    """Packet test double: raw access plus ``pkt[Proto]`` typed views."""
+
+    def __init__(self, data: dict[str, tuple[str, ...]]) -> None:
+        self._data = data
+
+    def get_raw(self, field_name: str) -> tuple[str, ...]:
+        return self._data.get(field_name, ())
+
+    def __getitem__(self, proto: type[P]) -> P:
+        return proto(self)
+
+
+def check_packet_protocol_typing(pkt: Packet) -> None:
+    """Static half of the ``pkt[TCP]`` acceptance criterion; body checked by mypy."""
+    assert_type(pkt[TCP].srcport, int | None)
+    assert_type(pkt[IP].src, IPv4Address | None)
+    assert_type(pkt[TCP].port, tuple[int, ...])
+
+
+class TestAcceptance:
+    """Runtime + static checks for the issue #13 acceptance criteria."""
+
+    def test_ip_src_class_access_is_field_ref(self) -> None:
+        ref = IP.src
+        assert isinstance(ref, FieldRef)
+        assert ref.name == "ip.src"
+        assert ref.ftype == "FT_IPv4"
+        assert_type(IP.src, FieldRef[IPv4Address])
+
+    def test_ip_instance_access_parses_or_none(self) -> None:
+        view = IP(FakePacket({"ip.src": ("10.0.0.1",)}))
+        assert_type(view.src, IPv4Address | None)
+        assert view.src == IPv4Address("10.0.0.1")
+        assert view.dst is None
+
+    def test_tcp_port_is_multi_valued(self) -> None:
+        view = TCP(FakePacket({"tcp.port": ("443", "51234")}))
+        assert_type(view.port, tuple[int, ...])
+        assert view.port == (443, 51234)
+        assert TCP(FakePacket({})).port == ()
+
+    def test_tcp_port_comparison_builds_expr(self) -> None:
+        e = TCP.port == 443
+        assert isinstance(e, Comparison)
+        assert e.field.name == "tcp.port"
+        assert_type(e, Comparison)
+
+    def test_dns_answers_are_tuples(self) -> None:
+        view = DNS(FakePacket({"dns.a": ("1.2.3.4", "5.6.7.8")}))
+        assert view.a == (IPv4Address("1.2.3.4"), IPv4Address("5.6.7.8"))
+
+    def test_packet_view_access(self) -> None:
+        pkt = FullFakePacket({"tcp.srcport": ("443",)})
+        view = pkt[TCP]
+        assert_type(view.srcport, int | None)
+        assert view.srcport == 443
+        check_packet_protocol_typing(cast(Packet, pkt))
