@@ -19,9 +19,10 @@ Planning algorithm
    deliberately NOT caught; they surface from :func:`make_plan`.
 3. ``dfilter`` joins the pushed strings with ``&&`` (each parenthesized);
    ``None`` when nothing was pushed.
-4. ``residual`` is the AND-composition (short-circuit, left-to-right, in
-   original order) of the residual-``Expr`` predicates followed by the
-   opaque callables; ``None`` when there are none.
+4. ``residual`` is the short-circuit AND-composition of two groups, each in
+   original order: first every residual-``Expr`` predicate, then every opaque
+   callable — cheap compiled predicates run before arbitrary user lambdas
+   regardless of how the terms were interleaved. ``None`` when there are none.
 5. Mode: ``"ek"`` if any opaque callable is present OR ``select`` is None
    (M1's Capture has no projection API yet, so the consumer may access
    arbitrary fields); otherwise ``"fields"`` with a projection of the
@@ -35,7 +36,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, Literal, TypeAlias, cast
+from typing import Any, Literal, TypeAlias
 
 from remora.compile.dfilter import UnsupportedExprError, compile_dfilter
 from remora.compile.predicate import compile_predicate
@@ -71,7 +72,7 @@ def _residual_conjuncts(residual: Callable[[RawPacket], bool]) -> int:
     return 1
 
 
-@dataclass(frozen=True, eq=False)
+@dataclass(frozen=True, eq=False, slots=True)
 class Plan:
     """Inspectable output of :func:`make_plan` — decisions only, no execution."""
 
@@ -140,6 +141,10 @@ def make_plan(
 
     for term in terms:
         if not isinstance(term, Expr):
+            if not callable(term):
+                raise TypeError(
+                    f"query term must be an Expr or a callable predicate, not {type(term).__name__}"
+                )
             opaque.append(term)
             continue
         for conjunct in conjuncts(term):
@@ -164,10 +169,11 @@ def make_plan(
         projected.setdefault(ref.name, ref)
     for expr in residual_exprs:
         for field in field_refs(expr):
-            # field_refs yields the FieldLike protocol; in practice every
-            # field in an Expr tree is a FieldRef. Dedup is by name because
-            # FieldRef is deliberately unhashable.
-            projected.setdefault(field.name, cast("FieldRef[Any]", field))
+            # field_refs yields the FieldLike protocol; normalize to a real
+            # FieldRef from its metadata so any structural FieldLike is safe
+            # in the projection. Dedup is by name (FieldRef is unhashable).
+            if field.name not in projected:
+                projected[field.name] = FieldRef(field.name, field.ftype, field.multi)
     return Plan(
         dfilter=dfilter,
         mode="fields",

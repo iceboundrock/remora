@@ -7,6 +7,7 @@ asserted on directly and its residual predicate is evaluated against
 
 from __future__ import annotations
 
+import dataclasses
 from datetime import datetime, timezone
 from ipaddress import IPv4Address
 
@@ -93,7 +94,7 @@ class TestUnsupportedExprFallback:
         assert [ref.name for ref in plan.projection] == ["ip.src", "frame.time"]
 
     def test_user_error_literal_raises_and_is_not_swallowed(self) -> None:
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="not-an-ip"):
             make_plan([SRC == "not-an-ip"])
 
 
@@ -228,5 +229,5 @@ class TestExplainAndRepr:
         plan = make_plan([SRC == "10.0.0.1"], select=[SRC])
         assert isinstance(plan, Plan)
         # Frozen: decisions are immutable once planned.
-        with pytest.raises(AttributeError):
+        with pytest.raises(dataclasses.FrozenInstanceError):
             plan.mode = "ek"  # type: ignore[misc]
