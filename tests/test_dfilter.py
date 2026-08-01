@@ -82,6 +82,12 @@ class TestComparisonOps:
     def test_int_widened_to_float(self) -> None:
         assert compile_dfilter(LOSS > 1) == "frame.loss > 1.0"
 
+    def test_small_float_renders_scientific_notation(self) -> None:
+        """repr() may emit scientific notation; Wireshark's float parser
+        (g_ascii_strtod) accepts it, so we pin rather than reformat."""
+        assert compile_dfilter(LOSS > 1e-05) == "frame.loss > 1e-05"
+        assert compile_dfilter(LOSS < 1e21) == "frame.loss < 1e+21"
+
 
 class TestPresence:
     def test_presence_renders_bare_field_name(self) -> None:
@@ -142,6 +148,14 @@ class TestStringLiterals:
 
     def test_non_ascii_passes_through_unescaped(self) -> None:
         assert compile_dfilter(HOST == "café.example") == 'http.host == "café.example"'
+
+    def test_named_control_characters_are_escaped(self) -> None:
+        """Raw control bytes in the filter string are a parse/quoting hazard."""
+        assert compile_dfilter(HOST == "a\nb\tc\rd") == 'http.host == "a\\nb\\tc\\rd"'
+        assert compile_dfilter(HOST == "\a\b\f\v") == 'http.host == "\\a\\b\\f\\v"'
+
+    def test_other_control_characters_use_hex_escapes(self) -> None:
+        assert compile_dfilter(HOST == "\x00\x1b\x7f") == 'http.host == "\\x00\\x1b\\x7f"'
 
     def test_unknown_ftype_falls_back_to_quoted_string(self) -> None:
         assert compile_dfilter(CUSTOM == "hello") == 'x.custom == "hello"'
