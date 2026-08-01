@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import importlib.util
+import pathlib
 import time
 from ipaddress import IPv4Address
 from unittest import mock
@@ -46,13 +48,31 @@ class TestLazyMaterialization:
 
     def test_descriptor_constructed_once_and_cached(self) -> None:
         ip = make_proto("IP", IP_TABLE)
-        with mock.patch.object(_meta, "Field", wraps=Field) as counted:
+        with (
+            mock.patch.object(_meta, "Field", wraps=Field) as fields,
+            mock.patch.object(_meta, "MultiField", wraps=MultiField) as multis,
+            mock.patch.object(_meta, "FieldRef", wraps=FieldRef) as refs,
+        ):
             first = ip.src
             second = ip.src
             third = ip.src
-        assert counted.call_count == 1
+        assert fields.call_count == 1
+        assert refs.call_count == 1
+        assert multis.call_count == 0
         assert first is second is third  # the cached descriptor serves one FieldRef
         assert isinstance(ip.__dict__["src"], Field)
+
+    def test_multi_descriptor_constructed_once_and_cached(self) -> None:
+        tcp = make_proto("TCP", TCP_TABLE)
+        with (
+            mock.patch.object(_meta, "MultiField", wraps=MultiField) as multis,
+            mock.patch.object(_meta, "FieldRef", wraps=FieldRef) as refs,
+        ):
+            first = tcp.port
+            second = tcp.port
+        assert multis.call_count == 1
+        assert refs.call_count == 1
+        assert first is second
 
     def test_multi_spec_materializes_multifield(self) -> None:
         tcp = make_proto("TCP", TCP_TABLE)
@@ -75,13 +95,20 @@ class TestLazyMaterialization:
 class TestDir:
     def test_dir_lists_all_fields_without_materializing(self) -> None:
         ip = make_proto("IP", IP_TABLE)
-        listed = dir(ip)
+        with (
+            mock.patch.object(_meta, "Field", wraps=Field) as fields,
+            mock.patch.object(_meta, "MultiField", wraps=MultiField) as multis,
+            mock.patch.object(_meta, "FieldRef", wraps=FieldRef) as refs,
+        ):
+            listed = dir(ip)
         assert {"src", "dst", "ttl"} <= set(listed)
-        assert "src" not in ip.__dict__  # no Field was constructed
+        assert fields.call_count == multis.call_count == refs.call_count == 0
+        assert "src" not in ip.__dict__
 
     def test_dir_still_includes_regular_attributes(self) -> None:
         ip = make_proto("IP", IP_TABLE)
-        assert "_table_" in dir(ip) or "_proto_" in dir(ip)
+        assert "_table_" in dir(ip)
+        assert "_proto_" in dir(ip)
 
 
 class TestExprConstruction:
@@ -136,19 +163,33 @@ class TestImportCostBudget:
     these budgets by orders of magnitude.
     """
 
-    def test_ten_thousand_fields_class_creation_and_one_access(self) -> None:
-        table: FieldTable = {
-            f"field_{i}": (f"big.field_{i}", "FT_UINT32", 0) for i in range(10_000)
-        }
-        start = time.perf_counter()
-        big = make_proto("BIG", table)
-        creation = time.perf_counter() - start
+    def test_ten_thousand_field_module_imports_within_budget(self, tmp_path: pathlib.Path) -> None:
+        """Write a real 10k-field module in the frozen table format and import it."""
+        entries = "\n".join(
+            f'    "field_{i}": ("big.field_{i}", "FT_UINT32", 0),' for i in range(10_000)
+        )
+        source = (
+            "from remora.proto._meta import ProtocolBase\n\n"
+            "class BIG(ProtocolBase):\n"
+            '    _proto_ = "big"\n'
+            "    _table_ = {\n" + entries + "\n    }\n"
+        )
+        module_path = tmp_path / "big_proto.py"
+        module_path.write_text(source)
 
+        spec = importlib.util.spec_from_file_location("big_proto", module_path)
+        assert spec is not None and spec.loader is not None
+        start = time.perf_counter()
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        import_time = time.perf_counter() - start
+
+        big = module.BIG
         start = time.perf_counter()
         ref = big.field_9999
         first_access = time.perf_counter() - start
 
         assert ref.name == "big.field_9999"
-        assert creation < 0.5, f"class creation took {creation:.3f}s — per-field work at import?"
+        assert import_time < 0.5, f"module import took {import_time:.3f}s — per-field work?"
         assert first_access < 0.05, f"one field access took {first_access:.4f}s"
-        assert len([k for k in big.__dict__ if k.startswith("field_")]) == 1  # only the touched one
+        assert len([k for k in vars(big) if k.startswith("field_")]) == 1  # only the touched one

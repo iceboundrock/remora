@@ -20,10 +20,11 @@ Two lookup paths need care:
   ``__getattr__`` that forces class-level materialization and then re-invokes
   the descriptor in instance mode.
 
-The table format is frozen: it is exactly what the M2 code generator will
-emit. Attribute names may differ from tshark names (``dns.qry.name`` ->
-attribute ``qry_name``), which is why the full tshark name is stored rather
-than derived.
+The table format is frozen: it is exactly what the code generator (issue #14)
+will emit, and what the hand-written seed modules (issue #13) follow.
+Attribute names may differ from tshark names (``dns.qry.name`` -> attribute
+``qry_name``), which is why the full tshark name is stored rather than
+derived.
 """
 
 from __future__ import annotations
@@ -50,9 +51,10 @@ class ProtocolMeta(type):
         # never field attributes; refusing them here also breaks the recursion
         # that would occur looking up ``_table_`` on a class that lacks it.
         if name.startswith("_"):
-            raise AttributeError(f"type object {cls.__name__!r} has no attribute {name!r}")
-        # Normal MRO lookup: _table_ always resolves (ProtocolBase defaults it),
-        # and subclasses may inherit a parent protocol's table.
+            raise AttributeError(f"protocol {cls.__name__!r} has no attribute {name!r}")
+        # _table_ resolves via normal MRO lookup; ProtocolBase defaults it to
+        # an empty table. (A subclass that sets its own _table_ replaces the
+        # parent's — tables are whole-class data, not merged.)
         table: FieldTable = cls._table_
         spec = table.get(name)
         if spec is None:

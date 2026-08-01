@@ -1,1 +1,1 @@
-"""Protocol classes: hand-written seeds in M1, generated modules from M2 on."""
+"""Protocol classes: hand-written seeds (issue #13) now, generated (issue #14) later."""
