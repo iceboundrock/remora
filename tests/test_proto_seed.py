@@ -20,11 +20,13 @@ import pytest
 from remora import values
 from remora.proto import eth as eth_mod
 from remora.proto import ip as ip_mod
+from remora.proto import tcp as tcp_mod
 from remora.proto._meta import ProtocolBase
 
 SEEDS: list[tuple[ModuleType, type[ProtocolBase]]] = [
     (eth_mod, eth_mod.ETH),
     (ip_mod, ip_mod.IP),
+    (tcp_mod, tcp_mod.TCP),
 ]
 
 seed_params = pytest.mark.parametrize(
