@@ -87,8 +87,7 @@ def _render_literal(value: object) -> str:
     if isinstance(value, float):
         return repr(value)
     if isinstance(value, str):
-        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-        return f'"{escaped}"'
+        return _render_str(value)
     if isinstance(value, IPv4Address | IPv6Address):
         return str(value)
     if isinstance(value, bytes):
@@ -101,3 +100,34 @@ def _render_literal(value: object) -> str:
             "the planner evaluates them as Python predicates"
         )
     raise UnsupportedExprError(f"cannot render literal of type {type(value).__name__}")
+
+
+#: C-style two-character escapes understood by the display-filter string syntax.
+_NAMED_ESCAPES = {
+    "\\": "\\\\",
+    '"': '\\"',
+    "\a": "\\a",
+    "\b": "\\b",
+    "\f": "\\f",
+    "\n": "\\n",
+    "\r": "\\r",
+    "\t": "\\t",
+    "\v": "\\v",
+}
+
+
+def _render_str(value: str) -> str:
+    """Double-quote a string literal, escaping quotes, backslashes, and
+    control characters (named C escapes where Wireshark defines them, ``\\xHH``
+    for the rest of C0 and DEL). Other characters — including non-ASCII —
+    pass through as UTF-8."""
+    out: list[str] = []
+    for ch in value:
+        escape = _NAMED_ESCAPES.get(ch)
+        if escape is not None:
+            out.append(escape)
+        elif ord(ch) < 0x20 or ord(ch) == 0x7F:
+            out.append(f"\\x{ord(ch):02x}")
+        else:
+            out.append(ch)
+    return '"{}"'.format("".join(out))

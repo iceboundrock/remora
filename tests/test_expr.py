@@ -100,8 +100,10 @@ class TestOperatorConstruction:
         assert isinstance(e, Presence)
         assert e.field.name == "ip.src"
 
-    def test_field_hash_is_name_hash(self) -> None:
-        assert hash(SRC) == hash("ip.src")
+    def test_fields_are_unhashable(self) -> None:
+        """Defining __eq__ (returning Expr) disables hashing; dedup by .name."""
+        with pytest.raises(TypeError, match="unhashable"):
+            hash(SRC)
 
 
 class TestBoolGuard:

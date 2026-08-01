@@ -77,10 +77,19 @@ class TestClassAccess:
         both: Expr = (FakeProto.src == "10.0.0.1") & (FakeProto.port == 443)
         assert isinstance(both, Expr)
 
-    def test_hash_and_repr(self) -> None:
-        assert hash(SRC_REF) == hash("ip.src")
+    def test_refs_are_unhashable(self) -> None:
+        """__eq__ builds Expr (never bool), so hashing is deliberately disabled:
+        a hash-by-name would explode inside set/dict on any collision probe."""
+        with pytest.raises(TypeError, match="unhashable"):
+            hash(SRC_REF)
+
+    def test_repr(self) -> None:
         assert repr(SRC_REF) == "<FieldRef ip.src (FT_IPv4)>"
         assert repr(PORT_REF) == "<FieldRef tcp.port (FT_UINT16, multi)>"
+
+    def test_scalar_field_rejects_multi_ref(self) -> None:
+        with pytest.raises(ValueError, match="MultiField"):
+            Field(PORT_REF)
 
 
 class TestScalarInstanceAccess:
