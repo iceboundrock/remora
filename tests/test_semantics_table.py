@@ -19,51 +19,19 @@ from ipaddress import IPv4Address, IPv6Address
 
 import pytest
 
+from conftest import FakePacket
 from remora import values
 from remora.compile.dfilter import UnsupportedExprError, compile_dfilter
 from remora.compile.predicate import compile_predicate
-from remora.expr import CompareOp, Comparison, Expr, FieldExprOps, LiteralValue
+from remora.expr import CompareOp, Comparison, Expr, LiteralValue
+from remora.fields import FieldRef
 
-
-class StubField(FieldExprOps):
-    """Minimal FieldLike for tests; FieldRef (issue #8) looks like this."""
-
-    __slots__ = ("_ftype", "_multi", "_name")
-
-    def __init__(self, name: str, ftype: str = "FT_STRING", multi: bool = False) -> None:
-        self._name = name
-        self._ftype = ftype
-        self._multi = multi
-
-    @property
-    def name(self) -> str:
-        return self._name
-
-    @property
-    def ftype(self) -> str:
-        return self._ftype
-
-    @property
-    def multi(self) -> bool:
-        return self._multi
-
-
-class FakePacket:
-    """Minimal RawPacket: absent fields are ()."""
-
-    def __init__(self, data: dict[str, tuple[str, ...]]) -> None:
-        self._data = data
-
-    def get_raw(self, field_name: str) -> tuple[str, ...]:
-        return self._data.get(field_name, ())
-
-
-SRC = StubField("ip.src", "FT_IPv4")
-DST = StubField("ip.dst", "FT_IPv4")
-PORT = StubField("tcp.port", "FT_UINT16", multi=True)
-TTL = StubField("ip.ttl", "FT_UINT8")
-HOST = StubField("http.host", "FT_STRING")
-TIME = StubField("frame.time", "FT_ABSOLUTE_TIME")
+SRC = FieldRef[IPv4Address]("ip.src", "FT_IPv4", False)
+DST = FieldRef[IPv4Address]("ip.dst", "FT_IPv4", False)
+PORT = FieldRef[int]("tcp.port", "FT_UINT16", True)
+TTL = FieldRef[int]("ip.ttl", "FT_UINT8", False)
+HOST = FieldRef[str]("http.host", "FT_STRING", False)
+TIME = FieldRef[datetime]("frame.time", "FT_ABSOLUTE_TIME", False)
 
 EMPTY = FakePacket({})
 
@@ -287,5 +255,5 @@ def test_every_ftype_py_type_is_a_valid_comparison_literal(ftype: str) -> None:
         "add it to _SAMPLE_LITERALS (and to expr.LiteralValue if needed)"
     )
     sample = _SAMPLE_LITERALS[info.py_type]
-    expr = Comparison(CompareOp.EQ, StubField("x.sample", ftype), sample)
+    expr = Comparison(CompareOp.EQ, FieldRef[object]("x.sample", ftype, False), sample)
     compile_predicate(expr)  # coerce_literal must accept the ftype's own py_type
