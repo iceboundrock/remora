@@ -13,18 +13,18 @@
 - `requires-python = ">=3.10"` — no 3.11+ syntax.
 - CI gate: `uv run ruff check .`, `uv run ruff format --check .`, `uv run mypy --strict src tests`, `uv run pytest` must all pass.
 - Line length 100 (ruff).
-- The `.py` table format is frozen by `src/remora/proto/_meta.py`: `FieldSpec = tuple[str, str, int]` (tshark_name, ftype, multi as 0/1), `FieldTable = dict[str, FieldSpec]`; classes set only `_proto_` and `_table_`.
-- Attribute naming rule: `attr == tshark_name.removeprefix(f"{proto}.").replace(".", "_")` (e.g. `dns.qry.name` → `qry_name`).
+- The `.py` table format is frozen by `src/remora/proto/_meta.py`: `FieldSpec = tuple[str, str, int]` (tshark_name, ftype, multi as 0/1), `FieldTable = dict[str, FieldSpec]`; classes set only `_proto_` and `_table_`. Declare tables as `_table_: ClassVar[FieldTable] = {...}` — ruff RUF012 rejects a bare mutable class-attribute assignment.
+- Seed naming convention (a typo guard for the hand-written modules, **not** part of the frozen format): `attr == tshark_name.removeprefix(f"{proto}.").replace(".", "_")` (e.g. `dns.qry.name` → `qry_name`). Generated modules (M2, issue #14) may deviate — e.g. to escape Python keywords — which is exactly why `_meta.py` stores the full tshark name instead of deriving it.
 - Every ftype used must be a key of `remora.values.FTYPE_TABLE` (no silent str fallback).
 - Work on branch `feat/13-seed-protocols`; commit per task.
 
 ## File Structure
 
 - `src/remora/proto/eth.py` / `eth.pyi` — `ETH` (11 fields)
-- `src/remora/proto/ip.py` / `ip.pyi` — `IP` (18 fields)
-- `src/remora/proto/tcp.py` / `tcp.pyi` — `TCP` (26 fields)
+- `src/remora/proto/ip.py` / `ip.pyi` — `IP` (19 fields)
+- `src/remora/proto/tcp.py` / `tcp.pyi` — `TCP` (27 fields)
 - `src/remora/proto/udp.py` / `udp.pyi` — `UDP` (10 fields)
-- `src/remora/proto/dns.py` / `dns.pyi` — `DNS` (28 fields)
+- `src/remora/proto/dns.py` / `dns.pyi` — `DNS` (29 fields)
 - `src/remora/proto/__init__.py` — re-export the five classes via `__all__`
 - `tests/test_proto_seed.py` — pairing tests (parametrized over all five) + acceptance tests
 
@@ -136,9 +136,10 @@ class TestStubTablePairing:
         for attr, (_, ftype, _) in cls._table_.items():
             assert ftype in values.FTYPE_TABLE, f"{attr}: unknown ftype {ftype!r}"
 
-    def test_attr_names_derive_from_tshark_names(
+    def test_attr_names_follow_seed_naming_convention(
         self, module: ModuleType, cls: type[ProtocolBase]
     ) -> None:
+        """Seed-only convention (typo guard), not part of the frozen format."""
         prefix = f"{cls._proto_}."
         for attr, (tshark_name, _, _) in cls._table_.items():
             assert tshark_name.startswith(prefix), f"{attr}: {tshark_name!r} lacks {prefix!r}"
@@ -161,7 +162,9 @@ Create `src/remora/proto/eth.py`:
 ```python
 """Ethernet seed protocol — compact-table format (frozen; matches the M2 emitter)."""
 
-from remora.proto._meta import ProtocolBase
+from typing import ClassVar
+
+from remora.proto._meta import FieldTable, ProtocolBase
 
 __all__ = ["ETH"]
 
@@ -170,7 +173,7 @@ class ETH(ProtocolBase):
     """Ethernet II / 802.3 (tshark layer ``eth``)."""
 
     _proto_ = "eth"
-    _table_ = {
+    _table_: ClassVar[FieldTable] = {
         "dst": ("eth.dst", "FT_ETHER", 0),
         "src": ("eth.src", "FT_ETHER", 0),
         "addr": ("eth.addr", "FT_ETHER", 1),
@@ -267,7 +270,9 @@ Create `src/remora/proto/ip.py`:
 ```python
 """IPv4 seed protocol — compact-table format (frozen; matches the M2 emitter)."""
 
-from remora.proto._meta import ProtocolBase
+from typing import ClassVar
+
+from remora.proto._meta import FieldTable, ProtocolBase
 
 __all__ = ["IP"]
 
@@ -276,7 +281,7 @@ class IP(ProtocolBase):
     """Internet Protocol version 4 (tshark layer ``ip``)."""
 
     _proto_ = "ip"
-    _table_ = {
+    _table_: ClassVar[FieldTable] = {
         "version": ("ip.version", "FT_UINT8", 0),
         "hdr_len": ("ip.hdr_len", "FT_UINT8", 0),
         "dsfield": ("ip.dsfield", "FT_UINT8", 0),
@@ -298,8 +303,6 @@ class IP(ProtocolBase):
         "addr": ("ip.addr", "FT_IPv4", 1),
     }
 ```
-
-(That is 19 entries — the File Structure count of 18 was pre-final; 19 is within the issue's 10–30 band.)
 
 - [ ] **Step 4: Write the IP stub**
 
@@ -394,7 +397,9 @@ Create `src/remora/proto/tcp.py`:
 ```python
 """TCP seed protocol — compact-table format (frozen; matches the M2 emitter)."""
 
-from remora.proto._meta import ProtocolBase
+from typing import ClassVar
+
+from remora.proto._meta import FieldTable, ProtocolBase
 
 __all__ = ["TCP"]
 
@@ -403,7 +408,7 @@ class TCP(ProtocolBase):
     """Transmission Control Protocol (tshark layer ``tcp``)."""
 
     _proto_ = "tcp"
-    _table_ = {
+    _table_: ClassVar[FieldTable] = {
         "srcport": ("tcp.srcport", "FT_UINT16", 0),
         "dstport": ("tcp.dstport", "FT_UINT16", 0),
         "port": ("tcp.port", "FT_UINT16", 1),
@@ -536,7 +541,9 @@ Create `src/remora/proto/udp.py`:
 ```python
 """UDP seed protocol — compact-table format (frozen; matches the M2 emitter)."""
 
-from remora.proto._meta import ProtocolBase
+from typing import ClassVar
+
+from remora.proto._meta import FieldTable, ProtocolBase
 
 __all__ = ["UDP"]
 
@@ -545,7 +552,7 @@ class UDP(ProtocolBase):
     """User Datagram Protocol (tshark layer ``udp``)."""
 
     _proto_ = "udp"
-    _table_ = {
+    _table_: ClassVar[FieldTable] = {
         "srcport": ("udp.srcport", "FT_UINT16", 0),
         "dstport": ("udp.dstport", "FT_UINT16", 0),
         "port": ("udp.port", "FT_UINT16", 1),
@@ -647,7 +654,9 @@ occurrence per record.
 ```python
 """DNS seed protocol — compact-table format (frozen; matches the M2 emitter)."""
 
-from remora.proto._meta import ProtocolBase
+from typing import ClassVar
+
+from remora.proto._meta import FieldTable, ProtocolBase
 
 __all__ = ["DNS"]
 
@@ -656,7 +665,7 @@ class DNS(ProtocolBase):
     """Domain Name System (tshark layer ``dns``)."""
 
     _proto_ = "dns"
-    _table_ = {
+    _table_: ClassVar[FieldTable] = {
         "id": ("dns.id", "FT_UINT16", 0),
         "flags": ("dns.flags", "FT_UINT16", 0),
         "flags_response": ("dns.flags.response", "FT_BOOLEAN", 0),

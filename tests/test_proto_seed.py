@@ -96,9 +96,17 @@ class TestStubTablePairing:
         for attr, (_, ftype, _) in cls._table_.items():
             assert ftype in values.FTYPE_TABLE, f"{attr}: unknown ftype {ftype!r}"
 
-    def test_attr_names_derive_from_tshark_names(
+    def test_attr_names_follow_seed_naming_convention(
         self, module: ModuleType, cls: type[ProtocolBase]
     ) -> None:
+        """The hand-written seeds derive attrs as dots-to-underscores (typo guard).
+
+        This is a convention of the seed modules only, not part of the frozen
+        compact-table format: ``_meta.py`` stores the full tshark name precisely
+        so that generated modules (issue #14) may deviate, e.g. to escape Python
+        keywords (``*.class`` cannot flatten to ``class``). When the M2 emitter
+        replaces the seeds, its output encodes whatever rule it adopts.
+        """
         prefix = f"{cls._proto_}."
         for attr, (tshark_name, _, _) in cls._table_.items():
             assert tshark_name.startswith(prefix), f"{attr}: {tshark_name!r} lacks {prefix!r}"
