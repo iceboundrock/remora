@@ -523,11 +523,7 @@ class TestQuickstart:
 
 class TestEkFallback:
     def test_expr_plus_lambda_takes_ek_path_end_to_end(self) -> None:
-        cap = (
-            Capture(PCAP)
-            .filter(IP.src.present())
-            .filter(lambda pkt: pkt[UDP].dstport == 53)
-        )
+        cap = Capture(PCAP).filter(IP.src.present()).filter(lambda pkt: pkt[UDP].dstport == 53)
         assert cap.plan().mode == "ek"
         assert cap.plan().dfilter == "(ip.src)"
         matched = list(cap)
