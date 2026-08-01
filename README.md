@@ -6,6 +6,15 @@ A type-safe, IDE-friendly Python DSL for Wireshark/tshark capture analysis. Remo
 
 ## Roadmap
 
+Each milestone has an EPIC issue defining its execution path and the PR ↔ issue plan:
+
+| Milestone | EPIC | Goal |
+|-----------|------|------|
+| M1 可用内核 | [#40](https://github.com/iceboundrock/remora/issues/40) | end-to-end typed query over a pcap |
+| M2 生成器与分发 | [#41](https://github.com/iceboundrock/remora/issues/41) | codegen + fingerprint + distribution |
+| M3 打磨 | [#42](https://github.com/iceboundrock/remora/issues/42) | extended operators, real-tshark validation, docs |
+| M4 数据工作区 | [#43](https://github.com/iceboundrock/remora/issues/43) | DuckDB materialized workspace |
+
 ### M1 可用内核 — dependency graph
 
 Goal: run one end-to-end typed query against a pcap. Arrows point from a blocker to the issue it unblocks.
