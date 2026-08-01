@@ -33,6 +33,7 @@ dev = [
     "mypy>=1.14",
     "pytest>=8.0",
     "ruff>=0.9",
+    "typing-extensions>=4.4",
 ]
 
 [tool.ruff]
