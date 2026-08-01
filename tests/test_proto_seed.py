@@ -18,6 +18,7 @@ from types import ModuleType
 import pytest
 
 from remora import values
+from remora.proto import dns as dns_mod
 from remora.proto import eth as eth_mod
 from remora.proto import ip as ip_mod
 from remora.proto import tcp as tcp_mod
@@ -29,6 +30,7 @@ SEEDS: list[tuple[ModuleType, type[ProtocolBase]]] = [
     (ip_mod, ip_mod.IP),
     (tcp_mod, tcp_mod.TCP),
     (udp_mod, udp_mod.UDP),
+    (dns_mod, dns_mod.DNS),
 ]
 
 seed_params = pytest.mark.parametrize(
