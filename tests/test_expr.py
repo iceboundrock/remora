@@ -1,3 +1,5 @@
+"""Tests for the Expr IR: operator construction, guards, and structural comparison."""
+
 from __future__ import annotations
 
 import dataclasses
