@@ -11,9 +11,11 @@ Two failure modes are engineered away at this layer:
    forever mid-write. A daemon thread drains stderr from the moment the child
    is spawned, keeping only a bounded tail of lines for error messages.
 2. **orphaned children** — a consumer that breaks out of the stdout iterator
-   early must not leak a running tshark. ``close()`` (invoked by ``__exit__``)
-   terminates, waits with a timeout, escalates to kill, and always reaps the
-   child, so cleanup is bounded in time and leaves no zombies.
+   early must not leak a running tshark. ``close()`` terminates, waits with a
+   timeout, escalates to kill, and always reaps the child, so cleanup is
+   bounded in time and leaves no zombies. It is invoked by ``__exit__``, by
+   the iterator's ``finally`` clause (early break, iterator close, consumer
+   exception, or GC of the generator), and as a last resort by ``__del__``.
 """
 
 from __future__ import annotations
@@ -23,6 +25,8 @@ import subprocess
 import threading
 from collections import deque
 from collections.abc import Iterator, Sequence
+
+__all__ = ["TsharkError", "TsharkNotFoundError", "TsharkProcess"]
 
 #: Number of trailing stderr lines retained for diagnostics.
 _STDERR_TAIL_LINES = 256
@@ -89,21 +93,39 @@ class TsharkProcess:
     def __exit__(self, *exc: object) -> None:
         self.close()
 
+    def __del__(self) -> None:
+        # Last-resort safety net for consumers that use neither the context
+        # manager nor the iterator; close() is idempotent and bounded.
+        with contextlib.suppress(Exception):
+            self.close()
+
+    @property
+    def returncode(self) -> int | None:
+        """The child's exit code, or None while it is still running."""
+        return self._proc.poll()
+
     def __iter__(self) -> Iterator[str]:
         stdout = self._proc.stdout
         if stdout is None:  # pragma: no cover - stdout=PIPE guarantees a stream
             return
-        for line in stdout:
-            yield line.rstrip("\r\n")
-        # Natural EOF: reap the child and surface its failure, if any.
-        returncode = self._proc.wait()
-        self._stderr_thread.join(timeout=_THREAD_JOIN_TIMEOUT)
-        if returncode != 0 and not self._we_terminated:
-            message = f"tshark exited with code {returncode}"
-            tail = self._stderr_tail()
-            if tail:
-                message = f"{message}; stderr tail:\n{tail}"
-            raise TsharkError(message)
+        # The finally clause honors "terminate-and-reap on iterator close":
+        # closing this generator (explicitly, on early break, or via GC)
+        # raises GeneratorExit at the yield point, and any consumer exception
+        # unwinds through here too — with or without the context manager.
+        try:
+            for line in stdout:
+                yield line.rstrip("\r\n")
+            # Natural EOF: reap the child and surface its failure, if any.
+            returncode = self._proc.wait()
+            self._stderr_thread.join(timeout=_THREAD_JOIN_TIMEOUT)
+            if returncode != 0 and not self._we_terminated:
+                message = f"tshark exited with code {returncode}"
+                tail = self._stderr_tail()
+                if tail:
+                    message = f"{message}; stderr tail:\n{tail}"
+                raise TsharkError(message)
+        finally:
+            self.close()
 
     def close(self) -> None:
         """Stop the child if still running and reap it. Idempotent and bounded."""

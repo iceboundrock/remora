@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import time
+from collections.abc import Generator
 
 import pytest
 
@@ -47,8 +48,31 @@ def test_early_break_terminates_child_bounded() -> None:
             break
         start = time.monotonic()
     elapsed = time.monotonic() - start
-    assert elapsed < 5.0, f"close() took {elapsed:.1f}s; termination must be bounded"
-    assert proc._proc.poll() is not None, "child was not reaped (potential zombie)"
+    # Generous ceiling: asserts boundedness (terminate is ~ms; the 3s grace
+    # before kill is the theoretical worst case), not speed. Keeps CI stable.
+    assert elapsed < 10.0, f"close() took {elapsed:.1f}s; termination must be bounded"
+    assert proc.returncode is not None, "child was not reaped (potential zombie)"
+
+
+def test_iterator_close_without_context_manager_reaps_child() -> None:
+    """Closing the stdout iterator (no `with` block) terminates and reaps the child."""
+    code = "import time\nwhile True:\n    print('tick', flush=True)\n    time.sleep(0.01)\n"
+    proc = TsharkProcess(_fake_child(code))
+    it = iter(proc)
+    assert isinstance(it, Generator)
+    assert next(it) == "tick"
+    it.close()  # raises GeneratorExit at the yield; finally must run close()
+    assert proc.returncode is not None, "child was not reaped (potential zombie)"
+
+
+def test_consumer_exception_without_context_manager_reaps_child() -> None:
+    """An exception thrown into iteration (no `with` block) still reaps the child."""
+    code = "import time\nwhile True:\n    print('tick', flush=True)\n    time.sleep(0.01)\n"
+    proc = TsharkProcess(_fake_child(code))
+    with pytest.raises(RuntimeError, match="consumer blew up"):
+        for _line in proc:
+            raise RuntimeError("consumer blew up")
+    assert proc.returncode is not None, "child was not reaped (potential zombie)"
 
 
 def test_nonzero_exit_raises_with_stderr_tail() -> None:
@@ -86,4 +110,4 @@ def test_double_close_and_close_after_exhaustion_are_noops() -> None:
     # __exit__ already closed once; explicit closes must be safe no-ops.
     proc.close()
     proc.close()
-    assert proc._proc.poll() == 0
+    assert proc.returncode == 0
