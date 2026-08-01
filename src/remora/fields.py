@@ -127,9 +127,6 @@ class _FieldBase(Generic[T]):
         self.ref = ref
         self._parse = _values.get_info(ref.ftype).parse
 
-    def __set_name__(self, owner: type, name: str) -> None:  # pragma: no cover - hook only
-        pass
-
     def _raw(self, obj: PacketCarrier) -> tuple[str, ...]:
         return obj._remora_packet.get_raw(self.ref.name)
 
@@ -138,12 +135,22 @@ class Field(_FieldBase[T]):
     """Scalar field descriptor: dual-mode ``__get__``.
 
     Class access returns the :class:`FieldRef`; instance access returns the
-    parsed value or ``None`` when the field is absent. If the field occurs
-    multiple times, the first occurrence wins (declare such fields with
-    :class:`MultiField` instead).
+    parsed value or ``None`` when the field is absent. A ref declared
+    ``multi=True`` is rejected at construction — silently keeping only the
+    first occurrence would drop data; declare such fields with
+    :class:`MultiField`. (Unexpected extra occurrences of a scalar-declared
+    field at runtime still resolve to the first one.)
     """
 
     __slots__ = ()
+
+    def __init__(self, ref: FieldRef[T]) -> None:
+        if ref.multi:
+            raise ValueError(
+                f"field {ref.name!r} is multi-valued; declare it with MultiField, "
+                "not Field (a scalar view would silently drop occurrences)"
+            )
+        super().__init__(ref)
 
     @overload
     def __get__(self, obj: None, objtype: type[Any]) -> FieldRef[T]: ...
