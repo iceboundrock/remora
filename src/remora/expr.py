@@ -214,8 +214,11 @@ class FieldExprOps:
     """Mixin giving a :class:`FieldLike` object expression-building operators.
 
     ``remora.fields.FieldRef`` inherits this; a class using it must satisfy
-    :class:`FieldLike`. Because ``__eq__`` is overridden, ``__hash__`` is
-    defined here explicitly as ``hash(self.name)``.
+    :class:`FieldLike`. Because ``__eq__`` is overridden to build ``Expr``
+    (never a bool), instances are deliberately **unhashable** (defining
+    ``__eq__`` sets ``__hash__`` to ``None``): a hash-by-name would break the
+    moment a set or dict probed equality on a collision and got an ``Expr``
+    back. Code that needs to dedup or key field refs should use ``.name``.
     """
 
     __slots__ = ()
@@ -245,9 +248,6 @@ class FieldExprOps:
 
     def __ge__(self, other: object) -> Comparison:
         return Comparison(CompareOp.GE, self._self_field(), _literal(other))
-
-    def __hash__(self) -> int:
-        return hash(self._self_field().name)
 
     def present(self) -> Presence:
         """Build a field-existence test: ``IP.src.present()``."""
