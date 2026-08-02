@@ -12,12 +12,10 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from dfilter_corpus import GOLDEN, GoldenCase, StubField
+from dfilter_corpus import DELTA, GOLDEN, PAYLOAD, PORT, SRC, TIME, GoldenCase, StubField
 from remora.compile.dfilter import UnsupportedExprError, compile_dfilter
 from remora.expr import Expr
 
-TIME = StubField("frame.time", "FT_ABSOLUTE_TIME")
-DELTA = StubField("frame.time_delta", "FT_RELATIVE_TIME")
 # Deliberately fake: exercises the unknown-ftype fallback. Its golden string
 # can never validate against a real tshark, so it is excluded from GOLDEN.
 CUSTOM = StubField("x.custom", "FT_SOMETHING_NEW")
@@ -35,8 +33,6 @@ class TestGoldenCorpus:
 
 class TestStructuralInvariants:
     def test_eq_on_multi_value_field_means_any_occurrence_matches(self) -> None:
-        from dfilter_corpus import PORT
-
         # Wireshark semantics: tcp.port occurs twice per packet (src and dst);
         # `tcp.port == 443` is true if ANY occurrence equals 443. That is the
         # DSL's intended meaning, so plain == passes through unchanged.
@@ -44,8 +40,6 @@ class TestStructuralInvariants:
         assert compile_dfilter(PORT == 443) == "tcp.port == 443"
 
     def test_ne_compiles_to_negated_eq_never_bang_eq(self) -> None:
-        from dfilter_corpus import PORT
-
         # Wireshark's `tcp.port != 443` on a multi-value field means "SOME
         # occurrence differs" — almost never what the user meant. The DSL's !=
         # arrives as Not(Comparison(EQ, ...)) and must render as
@@ -60,14 +54,10 @@ class TestFallbacksAndErrors:
         assert compile_dfilter(CUSTOM == "hello") == 'x.custom == "hello"'
 
     def test_bad_ip_literal_raises_value_error_not_unsupported(self) -> None:
-        from dfilter_corpus import SRC
-
         with pytest.raises(ValueError, match="not-an-ip"):
             compile_dfilter(SRC == "not-an-ip")
 
     def test_empty_bytes_raise_unsupported(self) -> None:
-        from dfilter_corpus import PAYLOAD
-
         with pytest.raises(UnsupportedExprError, match="empty bytes"):
             compile_dfilter(PAYLOAD == b"")
 
