@@ -22,9 +22,10 @@ import pytest
 from typing_extensions import assert_type
 
 from remora import DNS, IP, TCP, UDP, Capture
+from remora.capture import _build_argv, _resolve_tshark
 from remora.fields import FieldNotProjectedError, Packet
 from remora.planner import make_plan
-from remora.reader.fields_reader import FieldsReader, fields_argv
+from remora.reader.fields_reader import FieldsReader
 from remora.reader.process import TsharkProcess
 
 FIXTURES_DIR = Path(__file__).resolve().parent.parent / "fixtures"
@@ -36,7 +37,8 @@ DNS_MULTI = FIXTURES_DIR / "dns_multi.pcap"
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.skipif(
-        shutil.which("tshark") is None and not os.environ.get("REMORA_REQUIRE_TSHARK"),
+        shutil.which(os.environ.get("TSHARK") or "tshark") is None
+        and not os.environ.get("REMORA_REQUIRE_TSHARK"),
         reason="tshark not installed; skipping integration tests",
     ),
 ]
@@ -105,6 +107,12 @@ class TestEkFallback:
         assert names == ("alpha.example", "beta.example")
         assert matched[1][DNS].qry_name == ("gamma.example",)
 
+    def test_residual_lambda_matches_any_occurrence_of_multi_value_field(self) -> None:
+        # Same row set as the pushed-down TCP.port == 443 query, but matched
+        # by the Python predicate backend over the multi-value tuple.
+        matched = list(Capture(TCP_MIXED).filter(lambda pkt: 443 in pkt[TCP].port))
+        assert len(matched) == 2
+
 
 class TestFieldsProjection:
     def test_projection_returns_exactly_the_requested_fields(self) -> None:
@@ -115,9 +123,7 @@ class TestFieldsProjection:
         names = [ref.name for ref in plan.projection]
         assert names == ["ip.src", "tcp.port"]
 
-        tshark = os.environ.get("TSHARK") or "tshark"
-        argv = [tshark, "-r", str(TCP_MIXED), "-Y", plan.dfilter]
-        argv += fields_argv(plan.projection)
+        argv = _build_argv(_resolve_tshark(None), TCP_MIXED, plan)
         process = TsharkProcess(argv)
         try:
             rows: list[Packet] = list(FieldsReader(process, plan.projection))

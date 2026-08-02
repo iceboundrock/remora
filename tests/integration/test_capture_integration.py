@@ -31,7 +31,8 @@ PCAP = DATA_DIR / "sample.pcap"
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.skipif(
-        shutil.which("tshark") is None and not os.environ.get("REMORA_REQUIRE_TSHARK"),
+        shutil.which(os.environ.get("TSHARK") or "tshark") is None
+        and not os.environ.get("REMORA_REQUIRE_TSHARK"),
         reason="tshark not installed; skipping integration tests",
     ),
 ]
