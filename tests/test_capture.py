@@ -17,6 +17,16 @@ from remora.planner import make_plan
 from remora.proto import IP, TCP
 from remora.reader.fields_reader import UNIT_SEP
 
+# Golden display-filter strings this module asserts plans/argv against.
+DF_SRC = "(ip.src == 10.0.0.1)"
+DF_PORT = "(tcp.port == 443)"
+DF_SRC_AND_PORT = "(ip.src == 10.0.0.1) && (tcp.port == 443)"
+
+#: Imported by tests/test_dfilter_validation.py so a real tshark accepts each
+#: string this module puts into a tshark argv (#18). Any new `plan.dfilter`
+#: golden asserted in this file must be added here too, or it goes unvalidated.
+CAPTURE_DFILTER_GOLDENS: tuple[str, ...] = (DF_SRC, DF_PORT, DF_SRC_AND_PORT)
+
 
 def ek_line(layers: dict[str, Any]) -> str:
     return json.dumps({"layers": layers})
@@ -72,11 +82,11 @@ class TestFilterBuilder:
         filtered = cap.filter(IP.src == "10.0.0.1")
         assert filtered is not cap
         assert cap.plan().dfilter is None
-        assert filtered.plan().dfilter == "(ip.src == 10.0.0.1)"
+        assert filtered.plan().dfilter == DF_SRC
 
     def test_filters_accumulate_across_calls(self) -> None:
         cap = Capture("x.pcap").filter(IP.src == "10.0.0.1").filter(TCP.port == 443)
-        assert cap.plan().dfilter == "(ip.src == 10.0.0.1) && (tcp.port == 443)"
+        assert cap.plan().dfilter == DF_SRC_AND_PORT
 
     def test_filter_preserves_the_resolved_tshark_binary(self, fake_tshark: FakeTshark) -> None:
         list(Capture("x.pcap", tshark="/opt/tshark").filter(IP.src == "10.0.0.1"))
@@ -92,7 +102,7 @@ class TestArgvAssembly:
         plan = make_plan([IP.src == "10.0.0.1"])
         argv = _build_argv("tshark", Path("x.pcap"), plan)
         assert argv[:3] == ["tshark", "-r", "x.pcap"]
-        assert argv[3:5] == ["-Y", "(ip.src == 10.0.0.1)"]
+        assert argv[3:5] == ["-Y", DF_SRC]
         assert argv[5:] == ["-T", "ek"]
 
     def test_ek_argv_without_dfilter(self) -> None:
@@ -104,7 +114,7 @@ class TestArgvAssembly:
         select: list[FieldRef[Any]] = [FieldRef("ip.src", "FT_IPv4", False)]
         plan = make_plan([TCP.port == 443], select=select)
         argv = _build_argv("tshark", Path("x.pcap"), plan)
-        assert argv[3:5] == ["-Y", "(tcp.port == 443)"]
+        assert argv[3:5] == ["-Y", DF_PORT]
         assert argv[5:7] == ["-T", "fields"]
         assert argv[-2:] == ["-e", "ip.src"]
 
@@ -137,7 +147,7 @@ class TestIteration:
     def test_pushed_expr_lands_in_argv(self, fake_tshark: FakeTshark) -> None:
         list(Capture("x.pcap").filter(IP.src == "10.0.0.1"))
         argv = fake_tshark.created[0].argv
-        assert argv[argv.index("-Y") + 1] == "(ip.src == 10.0.0.1)"
+        assert argv[argv.index("-Y") + 1] == DF_SRC
 
     def test_typed_access_on_yielded_packet(self, fake_tshark: FakeTshark) -> None:
         first = next(iter(Capture("x.pcap")))

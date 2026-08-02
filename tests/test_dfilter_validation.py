@@ -2,7 +2,9 @@
 
 Two halves:
 
-1. Syntax: every golden string in dfilter_corpus.GOLDEN and every filter
+1. Syntax: every golden dfilter string the test suite asserts anywhere —
+   dfilter_corpus.GOLDEN, the semantics table's per-case goldens, and the
+   planner/capture unit tests' composed plan strings — plus every filter
    compiled from exprgen's 200-tree seeded corpus must be accepted by
    ``tshark -r <fixture> -Y <filter>``. Filters are batch-validated in
    OR-joined chunks (one tshark spawn per ~32 filters); a failing chunk is
@@ -34,6 +36,9 @@ from remora import DNS, IP, TCP, UDP, Capture
 from remora.compile.dfilter import compile_dfilter
 from remora.compile.predicate import compile_predicate
 from remora.expr import Expr
+from test_capture import CAPTURE_DFILTER_GOLDENS
+from test_planner import PLANNER_DFILTER_GOLDENS
+from test_semantics_table import CASES
 
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 TCP_MIXED = FIXTURES_DIR / "tcp_mixed.pcap"
@@ -53,6 +58,9 @@ pytestmark = [
 
 _TSHARK = os.environ.get("TSHARK") or "tshark"
 _CHUNK_SIZE = 32
+# Every tshark spawn here is bounded so a wedged binary cannot hang CI; on
+# expiry subprocess.TimeoutExpired carries the full argv (filter included).
+_TSHARK_TIMEOUT = 60
 
 
 @functools.lru_cache(maxsize=1)
@@ -70,6 +78,7 @@ def _tshark_version() -> str:
         encoding="utf-8",
         errors="replace",
         check=False,
+        timeout=_TSHARK_TIMEOUT,
     )
     lines = result.stdout.strip().splitlines()
     return lines[0].strip() if lines else "unknown tshark version"
@@ -83,7 +92,13 @@ def _run_tshark(dfilter: str) -> subprocess.CompletedProcess[str]:
     """
     argv = [_TSHARK, "-n", "-r", str(TCP_MIXED), "-Y", dfilter]
     return subprocess.run(
-        argv, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False
+        argv,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+        timeout=_TSHARK_TIMEOUT,
     )
 
 
@@ -126,9 +141,10 @@ def _assert_all_valid(cases: list[tuple[str, str]]) -> None:
 
 class TestGoldenCorpusValidates:
     def test_every_golden_string_is_accepted_by_tshark(self) -> None:
-        # Size guard: a shrunken corpus must fail loudly rather than validate
-        # nothing (mirrors the generated half's `assert len(trees) >= 200`).
-        assert len(GOLDEN) >= 30
+        # Size guard, exact so silent shrinkage is impossible: dropping a
+        # golden case must fail here rather than quietly validate less.
+        # Update deliberately when cases are added.
+        assert len(GOLDEN) == 34
         cases: list[tuple[str, str]] = []
         for case in GOLDEN:
             # Validate what the compiler emits, not just the literal golden
@@ -136,6 +152,41 @@ class TestGoldenCorpusValidates:
             assert compile_dfilter(case.expr) == case.expected
             cases.append((f"golden[{case.id}]: {case.expr!r}", case.expected))
         _assert_all_valid(cases)
+
+
+class TestSemanticsTableGoldensValidate:
+    """The dual-backend semantics table (tests/test_semantics_table.py) carries
+    its own golden dfilter strings; they must be real tshark syntax too."""
+
+    def test_every_semantics_golden_is_accepted_by_tshark(self) -> None:
+        dfilters = [case.dfilter for case in CASES if case.dfilter is not None]
+        # Exact count: a case losing its golden string must fail loudly here.
+        # Update deliberately when the table grows.
+        assert len(dfilters) == 13
+        _assert_all_valid(
+            [
+                (f"semantics[{case.id}]: {case.expr!r}", case.dfilter)
+                for case in CASES
+                if case.dfilter is not None
+            ]
+        )
+
+
+class TestPlannerAndCaptureGoldensValidate:
+    """Plans and argv assembled by the planner/capture unit tests are asserted
+    against inline golden strings there (no tshark runs in those files); a real
+    tshark must accept every one of those composed filters."""
+
+    def test_planner_and_capture_goldens_are_accepted_by_tshark(self) -> None:
+        cases: list[tuple[str, str]] = [
+            (f"planner[{i}]", dfilter) for i, dfilter in enumerate(PLANNER_DFILTER_GOLDENS)
+        ] + [(f"capture[{i}]", dfilter) for i, dfilter in enumerate(CAPTURE_DFILTER_GOLDENS)]
+        # Dedup by filter string (capture repeats two planner strings), first
+        # description wins, insertion order preserved.
+        deduped: dict[str, str] = {}
+        for description, dfilter in cases:
+            deduped.setdefault(dfilter, description)
+        _assert_all_valid([(description, dfilter) for dfilter, description in deduped.items()])
 
 
 class TestGeneratedCorpusValidates:
@@ -161,7 +212,13 @@ def _tshark_matching_frames(pcap: Path, dfilter: str) -> set[int]:
         "frame.number",
     ]
     result = subprocess.run(
-        argv, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False
+        argv,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+        timeout=_TSHARK_TIMEOUT,
     )
     assert result.returncode == 0, f"tshark rejected {dfilter!r}: {result.stderr.strip()}"
     return {int(line) for line in result.stdout.split() if line}
