@@ -7,6 +7,10 @@ consumed by:
 - tests/test_dfilter_validation.py — every golden string is syntax-validated
   by a real tshark
 
+It also carries the planner/capture COMPOSED golden strings (see the section at
+the bottom of this file), single-sourced so the asserting unit tests and the
+tshark validation suite can never drift apart.
+
 Every StubField here uses a REAL tshark field name with its real ftype, so
 each golden string is valid input for tshark's display-filter parser. Cases
 whose strings cannot validate (the deliberately fake ``x.custom`` field) live
@@ -141,3 +145,37 @@ GOLDEN: tuple[GoldenCase, ...] = (
     GoldenCase("bool-true", SYN == True, "tcp.flags.syn == 1"),  # noqa: E712
     GoldenCase("bool-false", SYN == False, "tcp.flags.syn == 0"),  # noqa: E712
 )
+
+
+# ---------------------------------------------------------------------------
+# Planner/capture COMPOSED golden display filters
+# ---------------------------------------------------------------------------
+# Unlike GOLDEN above (one Expr → one compile_dfilter string), these are the
+# strings the PLANNER composes: it wraps each pushable conjunct in parens and
+# joins them with " && ". tests/test_planner.py and tests/test_capture.py assert
+# `plan.dfilter` / tshark argv against the DF_* constants; tests/
+# test_dfilter_validation.py feeds the two tuples to a real tshark. They live
+# here — not in either test module — so the asserting tests and the validating
+# test consume literally the same strings and cannot drift.
+#
+# Any new `plan.dfilter` golden must be added here, and to the tuple below, or
+# it goes unvalidated.
+
+DF_SRC = "(ip.src == 10.0.0.1)"
+DF_DST = "(ip.dst == 10.0.0.2)"
+DF_PORT = "(tcp.port == 443)"
+DF_SRC_AND_PORT = "(ip.src == 10.0.0.1) && (tcp.port == 443)"
+DF_SRC_OR_PORT = "((ip.src == 10.0.0.1) || (tcp.port == 443))"
+DF_NOT_SRC = "(!(ip.src == 10.0.0.1))"
+
+#: Every composed string tests/test_planner.py asserts `plan.dfilter` against.
+PLANNER_DFILTER_GOLDENS: tuple[str, ...] = (
+    DF_SRC,
+    DF_DST,
+    DF_SRC_AND_PORT,
+    DF_SRC_OR_PORT,
+    DF_NOT_SRC,
+)
+
+#: Every composed string tests/test_capture.py puts into a plan or tshark argv.
+CAPTURE_DFILTER_GOLDENS: tuple[str, ...] = (DF_SRC, DF_PORT, DF_SRC_AND_PORT)

@@ -4,7 +4,7 @@ Two halves:
 
 1. Syntax: every golden dfilter string the test suite asserts anywhere —
    dfilter_corpus.GOLDEN, the semantics table's per-case goldens, and the
-   planner/capture unit tests' composed plan strings — plus every filter
+   planner/capture composed plan strings (also in dfilter_corpus) — plus every filter
    compiled from exprgen's 200-tree seeded corpus must be accepted by
    ``tshark -r <fixture> -Y <filter>``. Filters are batch-validated in
    OR-joined chunks (one tshark spawn per ~32 filters); a failing chunk is
@@ -30,14 +30,13 @@ from pathlib import Path
 
 import pytest
 
-from dfilter_corpus import GOLDEN
+from dfilter_corpus import CAPTURE_DFILTER_GOLDENS, GOLDEN, PLANNER_DFILTER_GOLDENS
 from exprgen import gen_corpus
-from remora import DNS, IP, TCP, UDP, Capture
+from remora import DNS, IP, TCP, UDP
 from remora.compile.dfilter import compile_dfilter
 from remora.compile.predicate import compile_predicate
 from remora.expr import Expr
-from test_capture import CAPTURE_DFILTER_GOLDENS
-from test_planner import PLANNER_DFILTER_GOLDENS
+from remora.reader.ek_reader import EkReader
 from test_semantics_table import CASES
 
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
@@ -174,10 +173,14 @@ class TestSemanticsTableGoldensValidate:
 
 class TestPlannerAndCaptureGoldensValidate:
     """Plans and argv assembled by the planner/capture unit tests are asserted
-    against inline golden strings there (no tshark runs in those files); a real
-    tshark must accept every one of those composed filters."""
+    against the shared DF_* golden strings there (no tshark runs in those
+    files); a real tshark must accept every one of those composed filters."""
 
     def test_planner_and_capture_goldens_are_accepted_by_tshark(self) -> None:
+        # Exact counts, so a golden dropped from either tuple fails here rather
+        # than quietly validating less. Update deliberately when they grow.
+        assert len(PLANNER_DFILTER_GOLDENS) == 5
+        assert len(CAPTURE_DFILTER_GOLDENS) == 3
         cases: list[tuple[str, str]] = [
             (f"planner[{i}]", dfilter) for i, dfilter in enumerate(PLANNER_DFILTER_GOLDENS)
         ] + [(f"capture[{i}]", dfilter) for i, dfilter in enumerate(CAPTURE_DFILTER_GOLDENS)]
@@ -186,6 +189,9 @@ class TestPlannerAndCaptureGoldensValidate:
         deduped: dict[str, str] = {}
         for description, dfilter in cases:
             deduped.setdefault(dfilter, description)
+        # Exact count after dedup (capture repeats two planner strings).
+        # Update deliberately when a distinct composed string is added.
+        assert len(deduped) == 6
         _assert_all_valid([(description, dfilter) for dfilter, description in deduped.items()])
 
 
@@ -225,8 +231,28 @@ def _tshark_matching_frames(pcap: Path, dfilter: str) -> set[int]:
 
 
 def _predicate_matching_frames(pcap: Path, expr: Expr) -> set[int]:
+    """Row set the predicate backend matches over *pcap*, by frame number.
+
+    tshark is spawned here directly rather than through ``Capture`` so this
+    path stays bounded by ``_TSHARK_TIMEOUT`` too — ``TsharkProcess`` waits on
+    natural EOF without a timeout, and a wedged binary would hang CI. ``-T ek``
+    with no ``-Y`` gives every frame in file order, so the 1-based enumeration
+    index is the frame number; ``EkReader`` accepts any iterable of decoded
+    lines and yields packets satisfying the RawPacket protocol.
+    """
+    argv = [_TSHARK, "-n", "-r", str(pcap), "-T", "ek"]
+    result = subprocess.run(
+        argv,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+        timeout=_TSHARK_TIMEOUT,
+    )
+    assert result.returncode == 0, f"tshark -T ek failed: {result.stderr.strip()}"
     predicate = compile_predicate(expr)
-    packets = list(Capture(pcap))  # no filter: every frame, in file order
+    packets = list(EkReader(result.stdout.splitlines()))
     return {number for number, packet in enumerate(packets, start=1) if predicate(packet)}
 
 

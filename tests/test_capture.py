@@ -11,21 +11,16 @@ from typing import Any
 import pytest
 
 import remora.capture as capture_module
+from dfilter_corpus import DF_PORT, DF_SRC, DF_SRC_AND_PORT
 from remora.capture import Capture, _build_argv, _resolve_tshark
 from remora.fields import FieldRef
 from remora.planner import make_plan
 from remora.proto import IP, TCP
 from remora.reader.fields_reader import UNIT_SEP
 
-# Golden display-filter strings this module asserts plans/argv against.
-DF_SRC = "(ip.src == 10.0.0.1)"
-DF_PORT = "(tcp.port == 443)"
-DF_SRC_AND_PORT = "(ip.src == 10.0.0.1) && (tcp.port == 443)"
-
-#: Imported by tests/test_dfilter_validation.py so a real tshark accepts each
-#: string this module puts into a tshark argv (#18). Any new `plan.dfilter`
-#: golden asserted in this file must be added here too, or it goes unvalidated.
-CAPTURE_DFILTER_GOLDENS: tuple[str, ...] = (DF_SRC, DF_PORT, DF_SRC_AND_PORT)
+# The DF_* golden display-filter strings asserted below live in
+# dfilter_corpus.py (with CAPTURE_DFILTER_GOLDENS, which feeds them to a real
+# tshark in tests/test_dfilter_validation.py); add new ones there.
 
 
 def ek_line(layers: dict[str, Any]) -> str:

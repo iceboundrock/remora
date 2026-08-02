@@ -14,6 +14,7 @@ from ipaddress import IPv4Address
 import pytest
 
 from conftest import FakePacket
+from dfilter_corpus import DF_DST, DF_NOT_SRC, DF_SRC, DF_SRC_AND_PORT, DF_SRC_OR_PORT
 from remora.fields import FieldRef, RawPacket
 from remora.planner import Plan, make_plan
 
@@ -28,23 +29,9 @@ PORT_BYTES = FieldRef[bytes]("tcp.port", "FT_BYTES", True)
 
 JULY_2021 = datetime(2021, 7, 1, tzinfo=timezone.utc)  # epoch 1625097600
 
-# Golden display-filter strings this module asserts `plan.dfilter` against.
-DF_SRC = "(ip.src == 10.0.0.1)"
-DF_DST = "(ip.dst == 10.0.0.2)"
-DF_SRC_AND_PORT = "(ip.src == 10.0.0.1) && (tcp.port == 443)"
-DF_SRC_OR_PORT = "((ip.src == 10.0.0.1) || (tcp.port == 443))"
-DF_NOT_SRC = "(!(ip.src == 10.0.0.1))"
-
-#: Imported by tests/test_dfilter_validation.py so a real tshark accepts each
-#: string the planner composes (#18). Any new `plan.dfilter` golden asserted in
-#: this file must be added here too, or it goes unvalidated.
-PLANNER_DFILTER_GOLDENS: tuple[str, ...] = (
-    DF_SRC,
-    DF_DST,
-    DF_SRC_AND_PORT,
-    DF_SRC_OR_PORT,
-    DF_NOT_SRC,
-)
+# The DF_* golden display-filter strings asserted below live in
+# dfilter_corpus.py (with PLANNER_DFILTER_GOLDENS, which feeds them to a real
+# tshark in tests/test_dfilter_validation.py); add new ones there.
 
 
 class TestFullyPushed:
