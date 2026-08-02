@@ -66,19 +66,33 @@ def _run_tshark(dfilter: str) -> subprocess.CompletedProcess[str]:
 
 def _assert_all_valid(cases: list[tuple[str, str]]) -> None:
     """``cases`` is (description, filter). Chunk-validate via OR-join; on a
-    failing chunk, re-check each filter individually to attribute blame."""
+    failing chunk, re-check each filter individually to attribute blame.
+
+    Bisection must never fail open: if the joined form is rejected but every
+    filter in the chunk passes alone (dfilter depth/complexity limits, argv
+    length, resource errors), the chunk itself is reported — otherwise the
+    suite would go green on the only form it actually ran.
+    """
     failures: list[str] = []
     for start in range(0, len(cases), _CHUNK_SIZE):
         chunk = cases[start : start + _CHUNK_SIZE]
         joined = " || ".join(f"({dfilter})" for _, dfilter in chunk)
-        if _run_tshark(joined).returncode == 0:
+        joined_result = _run_tshark(joined)
+        if joined_result.returncode == 0:
             continue
+        before = len(failures)
         for description, dfilter in chunk:
             result = _run_tshark(dfilter)
             if result.returncode != 0:
                 failures.append(
                     f"{description}\n  filter: {dfilter}\n  tshark: {result.stderr.strip()}"
                 )
+        if len(failures) == before:
+            failures.append(
+                f"chunk[{start}:{start + len(chunk)}] failed OR-joined but every filter "
+                f"passed individually\n  joined: {joined}\n"
+                f"  tshark: {joined_result.stderr.strip()}"
+            )
     if failures:
         pytest.fail(
             "tshark rejected compiled display filters:\n" + "\n".join(failures), pytrace=False
