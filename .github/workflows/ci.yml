@@ -25,5 +25,12 @@ jobs:
         run: uv run ruff format --check .
       - name: Typecheck
         run: uv run mypy --strict src tests
+      - name: Install tshark
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tshark
+          tshark --version | head -n 1
       - name: Test
         run: uv run pytest
+        env:
+          REMORA_REQUIRE_TSHARK: "1"
