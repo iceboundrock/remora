@@ -433,7 +433,9 @@ def _gen_bytes(rng: random.Random) -> bytes:
 
 
 #: (field, allowed comparison ops, literal generator)
-_FIELD_SPECS: tuple[tuple[StubField, tuple[CompareOp, ...], Callable[[random.Random], LiteralValue]], ...] = (
+_FIELD_SPECS: tuple[
+    tuple[StubField, tuple[CompareOp, ...], Callable[[random.Random], LiteralValue]], ...
+] = (
     (SRC, _ORDERED, lambda rng: IPv4Address(rng.getrandbits(32))),
     (DST, _ORDERED, lambda rng: IPv4Address(rng.getrandbits(32))),
     (SRC6, _ORDERED, lambda rng: IPv6Address(rng.getrandbits(128))),
@@ -598,7 +600,16 @@ class TestGeneratedCorpusValidates:
 
 def _tshark_matching_frames(pcap: Path, dfilter: str) -> set[int]:
     argv = [
-        _TSHARK, "-n", "-r", str(pcap), "-Y", dfilter, "-T", "fields", "-e", "frame.number",
+        _TSHARK,
+        "-n",
+        "-r",
+        str(pcap),
+        "-Y",
+        dfilter,
+        "-T",
+        "fields",
+        "-e",
+        "frame.number",
     ]
     result = subprocess.run(argv, capture_output=True, text=True, check=False)
     assert result.returncode == 0, f"tshark rejected {dfilter!r}: {result.stderr.strip()}"
