@@ -9,6 +9,7 @@ would narrow the type and break them.
 
 from __future__ import annotations
 
+import os
 import shutil
 from collections.abc import Sequence
 from ipaddress import IPv4Address
@@ -22,12 +23,18 @@ from remora import DNS, IP, TCP, UDP, Capture
 from remora.fields import Packet
 from remora.reader.process import TsharkProcess
 
-DATA_DIR = Path(__file__).resolve().parent / "data"
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 PCAP = DATA_DIR / "sample.pcap"
 
+# REMORA_REQUIRE_TSHARK (set in CI) turns "tshark missing" from a skip into a
+# hard failure, so a broken CI install can never silently skip the suite.
 pytestmark = [
     pytest.mark.integration,
-    pytest.mark.skipif(shutil.which("tshark") is None, reason="tshark not installed"),
+    pytest.mark.skipif(
+        shutil.which(os.environ.get("TSHARK") or "tshark") is None
+        and not os.environ.get("REMORA_REQUIRE_TSHARK"),
+        reason="tshark not installed; skipping integration tests",
+    ),
 ]
 
 
