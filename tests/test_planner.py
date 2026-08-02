@@ -14,6 +14,7 @@ from ipaddress import IPv4Address
 import pytest
 
 from conftest import FakePacket
+from dfilter_corpus import DF_DST, DF_NOT_SRC, DF_SRC, DF_SRC_AND_PORT, DF_SRC_OR_PORT
 from remora.fields import FieldRef, RawPacket
 from remora.planner import Plan, make_plan
 
@@ -28,11 +29,15 @@ PORT_BYTES = FieldRef[bytes]("tcp.port", "FT_BYTES", True)
 
 JULY_2021 = datetime(2021, 7, 1, tzinfo=timezone.utc)  # epoch 1625097600
 
+# The DF_* golden display-filter strings asserted below live in
+# dfilter_corpus.py (with PLANNER_DFILTER_GOLDENS, which feeds them to a real
+# tshark in tests/test_dfilter_validation.py); add new ones there.
+
 
 class TestFullyPushed:
     def test_pure_expr_conjunction_is_fully_pushed(self) -> None:
         plan = make_plan([SRC == "10.0.0.1", PORT == 443], select=[SRC, PORT])
-        assert plan.dfilter == "(ip.src == 10.0.0.1) && (tcp.port == 443)"
+        assert plan.dfilter == DF_SRC_AND_PORT
         assert plan.residual is None
 
     def test_select_given_yields_fields_mode_with_exactly_select(self) -> None:
@@ -43,7 +48,7 @@ class TestFullyPushed:
 
     def test_select_none_yields_ek_mode_even_when_fully_pushed(self) -> None:
         plan = make_plan([SRC == "10.0.0.1", PORT == 443])
-        assert plan.dfilter == "(ip.src == 10.0.0.1) && (tcp.port == 443)"
+        assert plan.dfilter == DF_SRC_AND_PORT
         assert plan.residual is None
         assert plan.mode == "ek"
         assert plan.projection is None
@@ -57,7 +62,7 @@ class TestFullyPushed:
 class TestOpaqueLambdas:
     def test_expr_plus_lambda_splits_and_forces_ek_without_select(self) -> None:
         plan = make_plan([SRC == "10.0.0.1", lambda pkt: True])
-        assert plan.dfilter == "(ip.src == 10.0.0.1)"
+        assert plan.dfilter == DF_SRC
         assert plan.mode == "ek"
         assert plan.projection is None
         assert plan.residual is not None
@@ -82,7 +87,7 @@ class TestOpaqueLambdas:
 class TestUnsupportedExprFallback:
     def test_time_conjunct_goes_residual_and_evaluates(self) -> None:
         plan = make_plan([SRC == "10.0.0.1", TIME >= JULY_2021], select=[SRC])
-        assert plan.dfilter == "(ip.src == 10.0.0.1)"
+        assert plan.dfilter == DF_SRC
         assert plan.residual is not None
         assert plan.residual(FakePacket({"frame.time": ("1625097600.000000000",)})) is True
         assert plan.residual(FakePacket({"frame.time": ("1625097599.999999000",)})) is False
@@ -105,7 +110,7 @@ class TestProjection:
         # DST must NOT appear in the projection.
         residual_expr = (PORT_BYTES == b"") | (SRC == "10.0.0.1")
         plan = make_plan([DST == "10.0.0.2", residual_expr], select=[SRC])
-        assert plan.dfilter == "(ip.dst == 10.0.0.2)"
+        assert plan.dfilter == DF_DST
         assert plan.mode == "fields"
         assert plan.projection is not None
         assert [ref.name for ref in plan.projection] == ["ip.src", "tcp.port"]
@@ -167,16 +172,16 @@ class TestResidualComposition:
 class TestTermFlattening:
     def test_nested_and_term_flattens_into_two_pushed_conjuncts(self) -> None:
         plan = make_plan([(SRC == "10.0.0.1") & (PORT == 443)])
-        assert plan.dfilter == "(ip.src == 10.0.0.1) && (tcp.port == 443)"
+        assert plan.dfilter == DF_SRC_AND_PORT
         assert plan.residual is None
 
     def test_or_term_pushes_as_a_single_conjunct(self) -> None:
         plan = make_plan([(SRC == "10.0.0.1") | (PORT == 443)])
-        assert plan.dfilter == "((ip.src == 10.0.0.1) || (tcp.port == 443))"
+        assert plan.dfilter == DF_SRC_OR_PORT
 
     def test_not_term_pushes_as_a_single_conjunct(self) -> None:
         plan = make_plan([~(SRC == "10.0.0.1")])
-        assert plan.dfilter == "(!(ip.src == 10.0.0.1))"
+        assert plan.dfilter == DF_NOT_SRC
 
 
 class TestEmptyTerms:
@@ -201,7 +206,7 @@ class TestExplainAndRepr:
         plan = make_plan([SRC == "10.0.0.1", TIME >= JULY_2021], select=[SRC])
         text = plan.explain()
         assert "mode: fields" in text
-        assert "dfilter (-Y): (ip.src == 10.0.0.1)" in text
+        assert f"dfilter (-Y): {DF_SRC}" in text
         assert "projection: ip.src, frame.time" in text
         assert "residual: 1 conjunct(s)" in text
 
@@ -222,7 +227,7 @@ class TestExplainAndRepr:
         text = repr(plan)
         assert "\n" not in text
         assert text.startswith("<Plan mode=ek ")
-        assert "'(ip.src == 10.0.0.1)'" in text
+        assert f"'{DF_SRC}'" in text
         assert "1 conjunct(s)" in text
 
     def test_plan_is_a_plain_dataclass_usable_without_tshark(self) -> None:
