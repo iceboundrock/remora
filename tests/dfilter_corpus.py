@@ -130,6 +130,8 @@ GOLDEN: tuple[GoldenCase, ...] = (
     GoldenCase("str-hex-controls", HOST == "\x00\x1b\x7f", 'http.host == "\\x00\\x1b\\x7f"'),
     # address literals
     GoldenCase("ipv4-from-str", SRC == "10.0.0.1", "ip.src == 10.0.0.1"),
+    # SIM300 ("Yoda condition") is suppressed here: swapping the operands would
+    # dispatch to the literal's own operator, not the field's.
     GoldenCase("ipv4-object", SRC == IPv4Address("10.0.0.1"), "ip.src == 10.0.0.1"),  # noqa: SIM300
     GoldenCase("ipv6-compressed", SRC6 == "2001:0db8:0::1", "ipv6.src == 2001:db8::1"),
     # bytes literals

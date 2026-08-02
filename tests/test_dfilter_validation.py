@@ -20,6 +20,7 @@ vanish.
 
 from __future__ import annotations
 
+import functools
 import os
 import shutil
 import subprocess
@@ -54,6 +55,26 @@ _TSHARK = os.environ.get("TSHARK") or "tshark"
 _CHUNK_SIZE = 32
 
 
+@functools.lru_cache(maxsize=1)
+def _tshark_version() -> str:
+    """First line of ``tshark -v``, captured once per session.
+
+    The validating tshark differs between a developer's box and CI's apt
+    build; a rejection caused by version drift must be identifiable from the
+    failure report alone rather than misread as a compiler bug.
+    """
+    result = subprocess.run(
+        [_TSHARK, "-v"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    lines = result.stdout.strip().splitlines()
+    return lines[0].strip() if lines else "unknown tshark version"
+
+
 def _run_tshark(dfilter: str) -> subprocess.CompletedProcess[str]:
     """Run tshark over the tcp_mixed fixture with *dfilter* as ``-Y``.
 
@@ -61,7 +82,9 @@ def _run_tshark(dfilter: str) -> subprocess.CompletedProcess[str]:
     hermetic and fast. argv list, never ``shell=True``.
     """
     argv = [_TSHARK, "-n", "-r", str(TCP_MIXED), "-Y", dfilter]
-    return subprocess.run(argv, capture_output=True, text=True, check=False)
+    return subprocess.run(
+        argv, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False
+    )
 
 
 def _assert_all_valid(cases: list[tuple[str, str]]) -> None:
@@ -95,13 +118,24 @@ def _assert_all_valid(cases: list[tuple[str, str]]) -> None:
             )
     if failures:
         pytest.fail(
-            "tshark rejected compiled display filters:\n" + "\n".join(failures), pytrace=False
+            f"tshark rejected compiled display filters [{_tshark_version()}]:\n"
+            + "\n".join(failures),
+            pytrace=False,
         )
 
 
 class TestGoldenCorpusValidates:
     def test_every_golden_string_is_accepted_by_tshark(self) -> None:
-        _assert_all_valid([(f"golden[{case.id}]", case.expected) for case in GOLDEN])
+        # Size guard: a shrunken corpus must fail loudly rather than validate
+        # nothing (mirrors the generated half's `assert len(trees) >= 200`).
+        assert len(GOLDEN) >= 30
+        cases: list[tuple[str, str]] = []
+        for case in GOLDEN:
+            # Validate what the compiler emits, not just the literal golden
+            # string, so this file is self-contained proof about the compiler.
+            assert compile_dfilter(case.expr) == case.expected
+            cases.append((f"golden[{case.id}]: {case.expr!r}", case.expected))
+        _assert_all_valid(cases)
 
 
 class TestGeneratedCorpusValidates:
@@ -126,7 +160,9 @@ def _tshark_matching_frames(pcap: Path, dfilter: str) -> set[int]:
         "-e",
         "frame.number",
     ]
-    result = subprocess.run(argv, capture_output=True, text=True, check=False)
+    result = subprocess.run(
+        argv, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False
+    )
     assert result.returncode == 0, f"tshark rejected {dfilter!r}: {result.stderr.strip()}"
     return {int(line) for line in result.stdout.split() if line}
 
