@@ -180,6 +180,22 @@ class TestGenerateArtifacts:
             _config(), SAMPLE_DUMP
         )
 
+    def test_duplicate_protocol_in_config_raises(self) -> None:
+        with pytest.raises(ValueError, match=r"module name.*collides"):
+            generate_artifacts(_config(protocols=("udp", "udp")), SAMPLE_DUMP)
+
+    def test_colliding_module_names_raise(self) -> None:
+        # Create a dump with two protocols that mangle to the same name:
+        # 'x.y' and 'x-y' both mangle to 'x_y'
+        colliding_dump = (
+            "P\tProtocol One\tx.y\n"
+            "F\tField A\tx.y.a\tFT_UINT16\tx.y\tBASE_DEC\t0x0\t\n"
+            "P\tProtocol Two\tx-y\n"
+            "F\tField B\tx-y.b\tFT_UINT16\tx-y\tBASE_DEC\t0x0\t\n"
+        )
+        with pytest.raises(ValueError, match=r"module name.*collides"):
+            generate_artifacts(_config(protocols=("x.y", "x-y")), colliding_dump)
+
 
 class TestCheckArtifacts:
     def _write_all(self, proto_dir: Path, artifacts: tuple[Artifact, ...]) -> None:

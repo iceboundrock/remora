@@ -159,7 +159,8 @@ def generate_artifacts(
 ) -> tuple[tuple[Artifact, ...], tuple[EmitWarning, ...]]:
     """Emit fingerprinted ``.py``/``.pyi`` pairs for every configured protocol.
 
-    Raises ValueError if a configured protocol abbrev is not in the dump.
+    Raises ValueError if a configured protocol abbrev is not in the dump or if
+    two configured protocols mangle to the same module name.
     """
     dictionary = parse_fields_dump(dump)
     fingerprint = make_fingerprint(
@@ -168,12 +169,20 @@ def generate_artifacts(
     by_abbrev = {protocol.abbrev: protocol for protocol in dictionary.protocols}
     artifacts: list[Artifact] = []
     warnings: list[EmitWarning] = []
+    module_name_to_abbrev: dict[str, str] = {}
     for abbrev in config.protocols:
         protocol = by_abbrev.get(abbrev)
         if protocol is None:
             raise ValueError(f"protocol {abbrev!r} not found in the -G fields dump")
         fields = [field for field in dictionary.fields if field.parent == abbrev]
         module = emit_protocol(protocol, fields, config.multi)
+        if module.module_name in module_name_to_abbrev:
+            prior_abbrev = module_name_to_abbrev[module.module_name]
+            raise ValueError(
+                f"module name {module.module_name!r} collides: protocols {prior_abbrev!r} "
+                f"and {abbrev!r} both mangle to the same name"
+            )
+        module_name_to_abbrev[module.module_name] = abbrev
         artifacts.append(
             Artifact(f"{module.module_name}.py", add_header(module.py_source, fingerprint))
         )
