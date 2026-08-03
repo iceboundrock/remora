@@ -314,7 +314,7 @@ class TestLoadConfig:
 
     def test_missing_version_rejected(self, tmp_path: Path) -> None:
         config_file = tmp_path / "codegen.toml"
-        config_file.write_text('[generate]\nprotocols = []\nmulti = []\n', encoding="utf-8")
+        config_file.write_text("[generate]\nprotocols = []\nmulti = []\n", encoding="utf-8")
         with pytest.raises(ValueError, match=r"\[tshark\] version"):
             load_config(config_file)
 
@@ -504,8 +504,8 @@ class TestCheckArtifacts:
     def test_drift_produces_readable_diff(self, tmp_path: Path) -> None:
         artifacts, _ = generate_artifacts(_config(), SAMPLE_DUMP)
         self._write_all(tmp_path, artifacts)
-        stale = (tmp_path / "udp.py").read_text(encoding="utf-8").replace(
-            '"FT_UINT16"', '"FT_UINT32"'
+        stale = (
+            (tmp_path / "udp.py").read_text(encoding="utf-8").replace('"FT_UINT16"', '"FT_UINT32"')
         )
         (tmp_path / "udp.py").write_text(stale, encoding="utf-8")
         report = check_artifacts(artifacts, tmp_path)
@@ -587,8 +587,12 @@ def generate_artifacts(
             raise ValueError(f"protocol {abbrev!r} not found in the -G fields dump")
         fields = [field for field in dictionary.fields if field.parent == abbrev]
         module = emit_protocol(protocol, fields, config.multi)
-        artifacts.append(Artifact(f"{module.module_name}.py", add_header(module.py_source, fingerprint)))
-        artifacts.append(Artifact(f"{module.module_name}.pyi", add_header(module.pyi_source, fingerprint)))
+        artifacts.append(
+            Artifact(f"{module.module_name}.py", add_header(module.py_source, fingerprint))
+        )
+        artifacts.append(
+            Artifact(f"{module.module_name}.pyi", add_header(module.pyi_source, fingerprint))
+        )
         warnings.extend(module.warnings)
     return tuple(artifacts), tuple(warnings)
 
@@ -631,12 +635,8 @@ def check_artifacts(artifacts: Sequence[Artifact], proto_dir: Path) -> CheckRepo
 Note: the two `artifacts.append(...)` lines exceed 100 columns as written above — wrap them:
 
 ```python
-        artifacts.append(
-            Artifact(f"{module.module_name}.py", add_header(module.py_source, fingerprint))
-        )
-        artifacts.append(
-            Artifact(f"{module.module_name}.pyi", add_header(module.pyi_source, fingerprint))
-        )
+artifacts.append(Artifact(f"{module.module_name}.py", add_header(module.py_source, fingerprint)))
+artifacts.append(Artifact(f"{module.module_name}.pyi", add_header(module.pyi_source, fingerprint)))
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
@@ -785,10 +785,7 @@ def parse_tshark_version(version_output: str) -> str:
 def find_tshark(explicit: str | None = None) -> str:
     """Resolve tshark: explicit path, then $TSHARK, then PATH, then Homebrew."""
     candidate = (
-        explicit
-        or os.environ.get("TSHARK")
-        or shutil.which("tshark")
-        or "/opt/homebrew/bin/tshark"
+        explicit or os.environ.get("TSHARK") or shutil.which("tshark") or "/opt/homebrew/bin/tshark"
     )
     if not Path(candidate).is_file():
         raise SystemExit(
@@ -802,9 +799,7 @@ def _tshark_environment(tshark: str) -> tuple[str, str, str]:
     """Run tshark once each for version, fields dump, and plugins dump."""
 
     def run(*args: str) -> str:
-        return subprocess.run(
-            [tshark, *args], check=True, capture_output=True, text=True
-        ).stdout
+        return subprocess.run([tshark, *args], check=True, capture_output=True, text=True).stdout
 
     return run("--version"), run("-G", "fields"), run("-G", "plugins")
 
