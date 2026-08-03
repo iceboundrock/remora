@@ -7,9 +7,13 @@ from pathlib import Path
 import pytest
 
 from remora.codegen.fingerprint import (
+    Artifact,
+    CheckReport,
     CodegenConfig,
     Fingerprint,
     add_header,
+    check_artifacts,
+    generate_artifacts,
     load_config,
     make_fingerprint,
     parse_header,
@@ -132,3 +136,98 @@ class TestLoadConfig:
         assert config.tshark_version
         assert config.protocols == ()
         assert config.multi == frozenset()
+
+
+def _config(**overrides: object) -> CodegenConfig:
+    base: dict[str, object] = {
+        "tshark_version": "4.6.6",
+        "protocols": ("udp",),
+        "multi": frozenset(),
+    }
+    base.update(overrides)
+    return CodegenConfig(**base)  # type: ignore[arg-type]
+
+
+class TestGenerateArtifacts:
+    def test_generates_headered_pair_per_protocol(self) -> None:
+        artifacts, warnings = generate_artifacts(_config(), SAMPLE_DUMP)
+        assert warnings == ()
+        assert [a.name for a in artifacts] == ["udp.py", "udp.pyi"]
+        for artifact in artifacts:
+            header = parse_header(artifact.content)
+            assert header is not None
+            assert header.tshark_version == "4.6.6"
+        py = artifacts[0].content
+        assert '"srcport": ("udp.srcport", "FT_UINT16", 0),' in py
+        assert '"stream": ("udp.stream", "FT_UINT32", 0),' in py
+
+    def test_multi_flag_flows_through(self) -> None:
+        artifacts, _ = generate_artifacts(_config(multi=frozenset({"udp.stream"})), SAMPLE_DUMP)
+        assert '"stream": ("udp.stream", "FT_UINT32", 1),' in artifacts[0].content
+        assert "stream: MultiField[int]" in artifacts[1].content
+
+    def test_unknown_protocol_raises(self) -> None:
+        with pytest.raises(ValueError, match="nope"):
+            generate_artifacts(_config(protocols=("nope",)), SAMPLE_DUMP)
+
+    def test_empty_config_generates_nothing(self) -> None:
+        artifacts, warnings = generate_artifacts(_config(protocols=()), SAMPLE_DUMP)
+        assert artifacts == ()
+        assert warnings == ()
+
+    def test_deterministic(self) -> None:
+        assert generate_artifacts(_config(), SAMPLE_DUMP) == generate_artifacts(
+            _config(), SAMPLE_DUMP
+        )
+
+
+class TestCheckArtifacts:
+    def _write_all(self, proto_dir: Path, artifacts: tuple[Artifact, ...]) -> None:
+        proto_dir.mkdir(exist_ok=True)
+        for artifact in artifacts:
+            (proto_dir / artifact.name).write_text(artifact.content, encoding="utf-8")
+
+    def test_in_sync(self, tmp_path: Path) -> None:
+        artifacts, _ = generate_artifacts(_config(), SAMPLE_DUMP)
+        self._write_all(tmp_path, artifacts)
+        report = check_artifacts(artifacts, tmp_path)
+        assert report == CheckReport(ok=True, messages=())
+
+    def test_drift_produces_readable_diff(self, tmp_path: Path) -> None:
+        artifacts, _ = generate_artifacts(_config(), SAMPLE_DUMP)
+        self._write_all(tmp_path, artifacts)
+        stale = (
+            (tmp_path / "udp.py").read_text(encoding="utf-8").replace('"FT_UINT16"', '"FT_UINT32"')
+        )
+        (tmp_path / "udp.py").write_text(stale, encoding="utf-8")
+        report = check_artifacts(artifacts, tmp_path)
+        assert not report.ok
+        joined = "\n".join(report.messages)
+        assert "udp.py" in joined
+        assert "-" in joined and "+" in joined
+        assert "FT_UINT16" in joined and "FT_UINT32" in joined
+
+    def test_missing_file_reported(self, tmp_path: Path) -> None:
+        artifacts, _ = generate_artifacts(_config(), SAMPLE_DUMP)
+        self._write_all(tmp_path, artifacts)
+        (tmp_path / "udp.pyi").unlink()
+        report = check_artifacts(artifacts, tmp_path)
+        assert not report.ok
+        assert any("udp.pyi" in m and "missing" in m for m in report.messages)
+
+    def test_orphan_fingerprinted_file_reported(self, tmp_path: Path) -> None:
+        artifacts, _ = generate_artifacts(_config(), SAMPLE_DUMP)
+        self._write_all(tmp_path, artifacts)
+        orphan = add_header('"""Stale."""\n', fp())
+        (tmp_path / "old.py").write_text(orphan, encoding="utf-8")
+        report = check_artifacts(artifacts, tmp_path)
+        assert not report.ok
+        assert any("old.py" in m and "orphan" in m for m in report.messages)
+
+    def test_headerless_seed_files_ignored(self, tmp_path: Path) -> None:
+        artifacts, _ = generate_artifacts(_config(), SAMPLE_DUMP)
+        self._write_all(tmp_path, artifacts)
+        (tmp_path / "eth.py").write_text('"""Seed, no header."""\n', encoding="utf-8")
+        (tmp_path / "__init__.py").write_text("", encoding="utf-8")
+        report = check_artifacts(artifacts, tmp_path)
+        assert report.ok

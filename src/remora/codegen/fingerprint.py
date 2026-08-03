@@ -19,12 +19,16 @@ dump text, so tests need no tshark binary.
 
 from __future__ import annotations
 
+import difflib
 import hashlib
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 from remora import __version__
+from remora.codegen.emit import EmitWarning, emit_protocol
+from remora.codegen.parse import parse_fields_dump
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -132,3 +136,84 @@ def load_config(path: Path) -> CodegenConfig:
         protocols=_str_list(generate.get("protocols", []), "[generate] protocols"),
         multi=frozenset(_str_list(generate.get("multi", []), "[generate] multi")),
     )
+
+
+@dataclass(frozen=True)
+class Artifact:
+    """One generated file: bare filename under the proto dir, full content."""
+
+    name: str
+    content: str
+
+
+@dataclass(frozen=True)
+class CheckReport:
+    """Outcome of a drift check: ok, or messages (notices and unified diffs)."""
+
+    ok: bool
+    messages: tuple[str, ...]
+
+
+def generate_artifacts(
+    config: CodegenConfig, dump: str, *, plugins_dump: str = ""
+) -> tuple[tuple[Artifact, ...], tuple[EmitWarning, ...]]:
+    """Emit fingerprinted ``.py``/``.pyi`` pairs for every configured protocol.
+
+    Raises ValueError if a configured protocol abbrev is not in the dump.
+    """
+    dictionary = parse_fields_dump(dump)
+    fingerprint = make_fingerprint(
+        dump, tshark_version=config.tshark_version, plugins_dump=plugins_dump
+    )
+    by_abbrev = {protocol.abbrev: protocol for protocol in dictionary.protocols}
+    artifacts: list[Artifact] = []
+    warnings: list[EmitWarning] = []
+    for abbrev in config.protocols:
+        protocol = by_abbrev.get(abbrev)
+        if protocol is None:
+            raise ValueError(f"protocol {abbrev!r} not found in the -G fields dump")
+        fields = [field for field in dictionary.fields if field.parent == abbrev]
+        module = emit_protocol(protocol, fields, config.multi)
+        artifacts.append(
+            Artifact(f"{module.module_name}.py", add_header(module.py_source, fingerprint))
+        )
+        artifacts.append(
+            Artifact(f"{module.module_name}.pyi", add_header(module.pyi_source, fingerprint))
+        )
+        warnings.extend(module.warnings)
+    return tuple(artifacts), tuple(warnings)
+
+
+def check_artifacts(artifacts: Sequence[Artifact], proto_dir: Path) -> CheckReport:
+    """Diff freshly generated artifacts against the committed files in ``proto_dir``.
+
+    Reports missing files, drifted files (as unified diffs), and orphans —
+    fingerprinted files on disk that the current config no longer generates.
+    Files without a fingerprint header (hand-written seeds, ``_meta.py``,
+    ``__init__.py``) are ignored.
+    """
+    messages: list[str] = []
+    expected = {artifact.name for artifact in artifacts}
+    for artifact in artifacts:
+        path = proto_dir / artifact.name
+        if not path.is_file():
+            messages.append(f"{artifact.name}: missing (regenerate with the write command)")
+            continue
+        committed = path.read_text(encoding="utf-8")
+        if committed == artifact.content:
+            continue
+        diff = difflib.unified_diff(
+            committed.splitlines(keepends=True),
+            artifact.content.splitlines(keepends=True),
+            fromfile=f"committed/{artifact.name}",
+            tofile=f"regenerated/{artifact.name}",
+        )
+        messages.append("".join(diff))
+    for path in sorted(proto_dir.iterdir()):
+        if path.suffix not in {".py", ".pyi"} or path.name in expected or not path.is_file():
+            continue
+        if parse_header(path.read_text(encoding="utf-8")) is not None:
+            messages.append(
+                f"{path.name}: orphan fingerprinted artifact not produced by codegen.toml"
+            )
+    return CheckReport(ok=not messages, messages=tuple(messages))
