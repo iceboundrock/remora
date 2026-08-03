@@ -62,6 +62,7 @@ from datetime import timedelta
 from remora.fields import Field, MultiField
 from remora.proto._meta import ProtocolBase
 
+
 class UDP(ProtocolBase):
     srcport: Field[int]
     port: MultiField[int]
@@ -271,6 +272,7 @@ EXPECTED_UDP_PYI = """from datetime import timedelta
 
 from remora.fields import Field, MultiField
 from remora.proto._meta import ProtocolBase
+
 
 class UDP(ProtocolBase):
     srcport: Field[int]
