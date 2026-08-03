@@ -54,14 +54,13 @@ class UDP(ProtocolBase):
     }
 ```
 
-and the emitted **`.pyi`** is exactly:
+and the emitted **`.pyi`** is exactly (note: **one** blank line before the class — stub style, matching the checked-in seed stubs; the fence below is tagged `pyi` so ruff's docs-fence formatter does not rewrite it to `.py` style, which would fail `ruff format --check` on a real `.pyi`):
 
-```python
+```pyi
 from datetime import timedelta
 
 from remora.fields import Field, MultiField
 from remora.proto._meta import ProtocolBase
-
 
 class UDP(ProtocolBase):
     srcport: Field[int]
@@ -272,7 +271,6 @@ EXPECTED_UDP_PYI = """from datetime import timedelta
 
 from remora.fields import Field, MultiField
 from remora.proto._meta import ProtocolBase
-
 
 class UDP(ProtocolBase):
     srcport: Field[int]
