@@ -18,6 +18,20 @@ Policy (deterministic, frozen for generated modules)
    (``6lowpan.class`` -> ``class_``, PEP 8 style). Soft keywords
    (``match``, ``type``, ...) are valid attribute names and are left alone.
 
+Collisions
+----------
+Mangling is **not injective**: dots and hyphens both collapse to ``_``, so
+distinct sibling abbrevs can share one attribute name. Real dumps contain
+such pairs — ``bgp.prefix_length`` and ``bgp.prefix.length`` both mangle to
+``prefix_length`` under parent ``bgp``. Callers building a per-protocol
+attribute table (``_table_``) MUST detect duplicate mangled names within a
+parent and resolve them; an undetected collision silently drops a field.
+This module deliberately stays a pure per-field function and has no view of
+the sibling set.
+
+Mangling protocol abbrevs into module and class names is the emitter's
+(#14) scope, not this module's.
+
 The attribute name is derived once at generation time and stored alongside
 the full tshark name in ``_table_``; nothing at runtime may re-derive one
 from the other.

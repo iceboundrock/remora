@@ -19,6 +19,10 @@ Robustness policy — no line is ever silently dropped:
 The bitmask and blurb columns are currently not modeled (nothing consumes
 them); ``base`` keeps the raw text of the display-base column, which may be
 empty, a ``BASE_*`` name, or a bare integer (boolean field width).
+
+``-G fields`` carries no multiplicity signal at all, so the ``multi`` flag of
+the frozen ``_table_`` format (see :mod:`remora.proto._meta`) must come from
+another source — that is the emitter's (#14) problem, out of scope here.
 """
 
 from __future__ import annotations

@@ -60,6 +60,12 @@ class TestKeywords:
         assert mangle_field("dns.type", "dns") == "type"
 
 
+class TestNonInjectivity:
+    def test_mangling_is_not_injective(self) -> None:
+        # Real 4.6.7 case; #14's emitter must detect duplicates per parent.
+        assert mangle_field("bgp.prefix_length", "bgp") == mangle_field("bgp.prefix.length", "bgp")
+
+
 class TestInvalidInput:
     def test_empty_abbrev_raises(self) -> None:
         with pytest.raises(ValueError, match="empty"):

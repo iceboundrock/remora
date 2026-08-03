@@ -11,6 +11,9 @@ mangling edge cases:
 - iec61883 — digit-leading field segment (``iec61883.4_incorrect_cip_fn``)
 - tpkt     — real duplicate P record (appears twice in tshark 4.6.x)
 
+tshark is located via the ``TSHARK`` environment variable if set, else
+``shutil.which("tshark")``, else the Homebrew default path.
+
 The fixture is checked in and pinned: tests assert exact counts against the
 committed file, so regenerating under a different tshark version may require
 updating the counts in tests/test_codegen_parse.py (a fingerprint/drift
@@ -19,6 +22,8 @@ mechanism is issue #16's scope).
 
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -26,9 +31,20 @@ PROTOCOLS = frozenset({"eth", "ip", "tcp", "udp", "dns", "6lowpan", "acf-can", "
 OUT = Path(__file__).parent / "g_fields_sample.txt"
 
 
+def find_tshark() -> str:
+    """Resolve tshark: $TSHARK, then PATH, then the Homebrew default."""
+    candidate = os.environ.get("TSHARK") or shutil.which("tshark") or "/opt/homebrew/bin/tshark"
+    if not Path(candidate).is_file():
+        raise SystemExit(
+            f"error: tshark not found at {candidate!r}; install tshark "
+            "or point the TSHARK environment variable at the binary"
+        )
+    return candidate
+
+
 def main() -> None:
     dump = subprocess.run(
-        ["tshark", "-G", "fields"], check=True, capture_output=True, text=True
+        [find_tshark(), "-G", "fields"], check=True, capture_output=True, text=True
     ).stdout
     kept: list[str] = []
     for line in dump.splitlines():

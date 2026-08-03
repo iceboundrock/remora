@@ -12,6 +12,7 @@ from remora.codegen.parse import (
     Protocol,
     parse_fields_dump,
 )
+from remora.proto import DNS, ETH, IP, TCP, UDP
 
 P_DNS = "P\tDomain Name System\tdns"
 F_DNS_QRY_NAME = "F\tName\tdns.qry.name\tFT_STRING\tdns\t\t0x0\tQuery Name"
@@ -137,6 +138,17 @@ class TestRealDumpFixture:
         result = parse_fields_dump(FIXTURE.read_text(encoding="utf-8"))
         tpkt = [p for p in result.protocols if p.abbrev == "tpkt"]
         assert tpkt == [Protocol(name="TPKT - ISO on TCP - RFC1006", abbrev="tpkt")]
+
+    def test_mangling_reproduces_m1_seed_tables(self) -> None:
+        # The M2 emitter must regenerate the M1 seeds byte-compatibly; this
+        # pins mangle_field + the fixture to the hand-written tables.
+        result = parse_fields_dump(FIXTURE.read_text(encoding="utf-8"))
+        by_abbrev = {f.abbrev: f for f in result.fields}
+        for cls in (DNS, ETH, IP, TCP, UDP):
+            for attr, (tshark_name, ftype, _multi) in cls._table_.items():
+                field = by_abbrev[tshark_name]
+                assert mangle_field(field.abbrev, field.parent) == attr
+                assert field.ftype == ftype
 
     def test_every_fixture_field_mangles_to_valid_identifier(self) -> None:
         result = parse_fields_dump(FIXTURE.read_text(encoding="utf-8"))
