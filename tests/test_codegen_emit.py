@@ -13,7 +13,8 @@ from conftest import FakePacket
 from remora.codegen.emit import EmittedModule, emit_protocol, mangle_protocol
 from remora.codegen.parse import FieldDef, Protocol
 from remora.proto._meta import ProtocolBase
-from test_proto_seed import SEEDS, TestStubTablePairing, stub_fields
+from test_proto_seed import SEEDS, stub_fields
+from test_proto_seed import TestStubTablePairing as _StubTablePairing
 
 
 class TestMangleProtocol:
@@ -271,7 +272,7 @@ class TestSeedDropInCompatibility:
         emitted = emit_seed(seed_cls)
         generated = load_emitted(emitted, tmp_path)
         generated_cls: type[ProtocolBase] = getattr(generated, emitted.class_name)
-        pairing = TestStubTablePairing()
+        pairing = _StubTablePairing()
         pairing.test_stub_and_table_declare_the_same_attributes(generated, generated_cls)
         pairing.test_multiplicity_matches_descriptor_class(generated, generated_cls)
         pairing.test_stub_inner_type_matches_ftype(generated, generated_cls)
