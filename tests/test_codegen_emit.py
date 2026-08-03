@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import os
+import shutil
+import subprocess
 from pathlib import Path
 from types import ModuleType
 
@@ -306,3 +309,66 @@ class TestSeedDropInCompatibility:
         view = generated_cls(FakePacket({}))
         assert getattr(view, attr) == (() if is_multi else None)
         assert getattr(generated_cls, attr).name == tshark_name
+
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+RUFF = shutil.which("ruff")
+MYPY = shutil.which("mypy")
+
+
+@pytest.mark.skipif(RUFF is None, reason="ruff not on PATH")
+def test_emitted_seed_modules_are_ruff_clean(tmp_path: Path) -> None:
+    assert RUFF is not None
+    paths: list[str] = []
+    for _seed_module, seed_cls in SEEDS:
+        emitted = emit_seed(seed_cls)
+        py_path = tmp_path / f"{emitted.module_name}.py"
+        pyi_path = tmp_path / f"{emitted.module_name}.pyi"
+        py_path.write_text(emitted.py_source)
+        pyi_path.write_text(emitted.pyi_source)
+        paths += [str(py_path), str(pyi_path)]
+    config = str(REPO_ROOT / "pyproject.toml")
+    fmt = subprocess.run(
+        [RUFF, "format", "--check", "--config", config, *paths],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert fmt.returncode == 0, fmt.stdout + fmt.stderr
+    lint = subprocess.run(
+        [RUFF, "check", "--config", config, *paths],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert lint.returncode == 0, lint.stdout + lint.stderr
+
+
+@pytest.mark.skipif(MYPY is None, reason="mypy not on PATH")
+def test_emitted_dns_stub_passes_mypy_strict(tmp_path: Path) -> None:
+    assert MYPY is not None
+    dns_cls = next(cls for _module, cls in SEEDS if cls._proto_ == "dns")
+    emitted = emit_seed(dns_cls)
+    (tmp_path / "dns.py").write_text(emitted.py_source)
+    stub_path = tmp_path / "dns.pyi"
+    stub_path.write_text(emitted.pyi_source)
+    config_path = tmp_path / "mypy.ini"
+    config_path.write_text("[mypy]\n")
+    env = dict(os.environ, MYPYPATH=str(REPO_ROOT / "src"))
+    result = subprocess.run(
+        [
+            MYPY,
+            "--strict",
+            "--config-file",
+            str(config_path),
+            "--cache-dir",
+            str(tmp_path / ".mypy_cache"),
+            str(stub_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=tmp_path,
+        env=env,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
