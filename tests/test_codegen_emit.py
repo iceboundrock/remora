@@ -43,7 +43,7 @@ class TestMangleProtocol:
         assert mangle_protocol("class") == "class_"
 
     def test_empty_abbrev_raises(self) -> None:
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="empty"):
             mangle_protocol("")
 
 
@@ -219,8 +219,13 @@ class TestImportPurity:
     def test_table_is_a_literal_of_constant_tuples(self) -> None:
         tree = ast.parse(emit_udp().py_source)
         class_def = next(node for node in tree.body if isinstance(node, ast.ClassDef))
-        table = next(node for node in class_def.body if isinstance(node, ast.AnnAssign))
-        assert isinstance(table.target, ast.Name) and table.target.id == "_table_"
+        table = next(
+            node
+            for node in class_def.body
+            if isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "_table_"
+        )
         value = table.value
         assert isinstance(value, ast.Dict)
         for key, entry in zip(value.keys, value.values, strict=True):
@@ -333,6 +338,7 @@ def test_emitted_seed_modules_are_ruff_clean(tmp_path: Path) -> None:
         capture_output=True,
         text=True,
         check=False,
+        timeout=120,
     )
     assert fmt.returncode == 0, fmt.stdout + fmt.stderr
     lint = subprocess.run(
@@ -340,8 +346,26 @@ def test_emitted_seed_modules_are_ruff_clean(tmp_path: Path) -> None:
         capture_output=True,
         text=True,
         check=False,
+        timeout=120,
     )
     assert lint.returncode == 0, lint.stdout + lint.stderr
+
+
+def test_long_abbrev_lines_exceed_ruff_limit() -> None:
+    """Documented limitation: long abbrevs/attrs blow past the 100-col ruff limit.
+
+    The seeds above are lint-clean, but arbitrary dumps are not — a table entry
+    is emitted on one line by design (and a ``.pyi`` annotation, being a single
+    attribute annotation, cannot be wrapped at all). Lint policy for generated
+    trees is deferred to issue #19; this test pins the behavior so the deferral
+    stays visible.
+    """
+    abbrev = "longproto." + "sub." * 3 + "x" * 55
+    proto = Protocol(name="Long Proto", abbrev="longproto")
+    emitted = emit_protocol(proto, [make_field(abbrev, "FT_UINT8", "longproto")])
+    assert any(len(line) > 100 for line in emitted.py_source.splitlines())
+    ast.parse(emitted.py_source)
+    ast.parse(emitted.pyi_source)
 
 
 @pytest.mark.skipif(MYPY is None, reason="mypy not on PATH")
@@ -370,5 +394,6 @@ def test_emitted_dns_stub_passes_mypy_strict(tmp_path: Path) -> None:
         check=False,
         cwd=tmp_path,
         env=env,
+        timeout=120,
     )
     assert result.returncode == 0, result.stdout + result.stderr

@@ -18,6 +18,24 @@ Protocol-name mangling policy (frozen, this module's scope per
 
 The module name is the mangled abbrev; the class name is the mangled
 abbrev upper-cased (``udp`` -> ``UDP``, ``acf-can`` -> ``ACF_CAN``).
+
+Protocol mangling, like field mangling, is **not injective**: ``mp2t.af``
+and ``mp2t-af`` both mangle to ``mp2t_af``. :func:`emit_protocol` is a
+per-protocol function with no view of its siblings, so it cannot detect
+module-name collisions; batch callers (#19/#21) MUST dedupe the emitted
+module names across a whole dump.
+
+Line length: emitted lines can exceed the repo's 100-column ruff limit when
+field abbrevs or mangled attr names are long. A ``.py`` table entry line is
+about 20 characters of overhead plus the attr name, the abbrev and the
+ftype; a ``.pyi`` annotation line is a single attribute annotation and
+cannot be wrapped at all. The five seed protocols (eth/ip/tcp/udp/dns) are
+lint-clean, but arbitrary ``tshark -G fields`` dumps are not — roughly a
+quarter of real protocols emit at least one over-long line. Entries stay on
+one line by design; the lint policy for generated trees (per-file E501
+ignores, an exclude, or exploded table entries) is deferred to the
+protocol-shipping issue (#19), where generated modules are actually
+committed.
 """
 
 from __future__ import annotations
@@ -83,6 +101,9 @@ def _resolve_attrs(
     first_by_name: dict[str, str] = {}
     warnings: list[EmitWarning] = []
     for field in fields:
+        # Strip against the module's protocol abbrev, not ``field.parent``: the attribute
+        # namespace belongs to the module. Fields registered under a different parent
+        # (e.g. ``can.len`` under ``acf-can``) keep their full abbrev under either choice.
         attr = mangle_field(field.abbrev, protocol.abbrev)
         prior = first_by_name.get(attr)
         if prior is not None:
@@ -100,10 +121,12 @@ def _resolve_attrs(
 
 def _class_docstring(protocol: Protocol) -> list[str]:
     """Class docstring lines, wrapped so no emitted line exceeds 100 chars."""
-    text = _escape(f"{protocol.name} (tshark layer ``{protocol.abbrev}``).")
-    wrapped = textwrap.wrap(text, width=92)
+    text = f"{protocol.name} (tshark layer ``{protocol.abbrev}``)."
+    # Wrap first, escape after: escaping first lets textwrap split a ``\\`` escape
+    # sequence, leaving a line ending in a lone backslash (a line continuation).
+    wrapped = [_escape(line) for line in textwrap.wrap(text, width=92)]
     if len(wrapped) <= 1:
-        return [f'    """{text}"""']
+        return [f'    """{_escape(text)}"""']
     return [f'    """{wrapped[0]}', *(f"    {line}" for line in wrapped[1:]), '    """']
 
 
