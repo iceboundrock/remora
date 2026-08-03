@@ -301,8 +301,11 @@ class TestMain:
         assert main(self._argv("write", config_file, proto_dir)) == 0
         assert (proto_dir / "udp.py").is_file()
         assert (proto_dir / "udp.pyi").is_file()
+        capsys.readouterr()  # drain the write output so the check assertions cannot alias it
         assert main(self._argv("check", config_file, proto_dir)) == 0
-        assert "2" in capsys.readouterr().out  # "... 2 artifact(s) in sync"
+        checked = capsys.readouterr().out
+        assert "in sync" in checked
+        assert "2 artifact(s)" in checked
 
     def test_check_reports_drift(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
@@ -378,6 +381,16 @@ class TestMain:
         captured = capsys.readouterr()
         assert "error:" in captured.err
         assert "version" in captured.err
+
+    def test_check_missing_proto_dir_exits_2(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        config_file, proto_dir = self._prepare(tmp_path, monkeypatch)
+        missing = proto_dir / "typo"
+        assert main(self._argv("check", config_file, missing)) == 2
+        captured = capsys.readouterr()
+        assert "error:" in captured.err
+        assert str(missing) in captured.err
 
     def test_write_creates_missing_proto_dir(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]

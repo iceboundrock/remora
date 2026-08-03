@@ -330,6 +330,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"wrote {len(artifacts)} artifact(s)")
         return 0
 
+    if not proto_dir.is_dir():
+        print(
+            f"error: proto dir {str(proto_dir)!r} does not exist; pass --proto-dir "
+            "or run from the repository root",
+            file=sys.stderr,
+        )
+        return 2
+
     report = check_artifacts(artifacts, proto_dir)
     if not report.ok:
         for message in report.messages:
