@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import keyword
+from pathlib import Path
+
+from remora.codegen.mangle import mangle_field
 from remora.codegen.parse import (
     FieldDef,
     FieldDictionary,
@@ -98,3 +102,46 @@ class TestDuplicatePolicy:
         assert len(result.protocols) == 1
         assert len(result.fields) == 1
         assert result.warnings == ()
+
+
+FIXTURE = Path(__file__).parent / "data" / "g_fields_sample.txt"
+
+# Exact record counts of the committed fixture (tshark 4.6.7); regenerating
+# the fixture with another tshark version requires updating these.
+FIXTURE_P_RECORDS = 10  # tpkt appears twice -> 9 unique protocols
+FIXTURE_UNIQUE_PROTOCOLS = 9
+FIXTURE_F_RECORDS = 976  # all field abbrevs unique
+
+
+class TestRealDumpFixture:
+    def test_counts_match_fixture(self) -> None:
+        result = parse_fields_dump(FIXTURE.read_text(encoding="utf-8"))
+        assert len(result.protocols) == FIXTURE_UNIQUE_PROTOCOLS
+        assert len(result.fields) == FIXTURE_F_RECORDS
+        # The only warnings are the duplicate tpkt P records.
+        assert len(result.warnings) == FIXTURE_P_RECORDS - FIXTURE_UNIQUE_PROTOCOLS
+        assert all("duplicate protocol abbrev 'tpkt'" in w.message for w in result.warnings)
+
+    def test_known_field_spot_checks(self) -> None:
+        result = parse_fields_dump(FIXTURE.read_text(encoding="utf-8"))
+        by_abbrev = {f.abbrev: f for f in result.fields}
+        ip_src = by_abbrev["ip.src"]
+        assert ip_src == FieldDef(
+            name="Source Address", abbrev="ip.src", ftype="FT_IPv4", parent="ip", base=""
+        )
+        assert by_abbrev["6lowpan.class"].ftype == "FT_UINT8"
+        assert by_abbrev["6lowpan.class"].base == "BASE_HEX"
+        assert by_abbrev["can.len"].parent == "acf-can"
+
+    def test_duplicate_protocol_first_wins_on_real_data(self) -> None:
+        result = parse_fields_dump(FIXTURE.read_text(encoding="utf-8"))
+        tpkt = [p for p in result.protocols if p.abbrev == "tpkt"]
+        assert tpkt == [Protocol(name="TPKT - ISO on TCP - RFC1006", abbrev="tpkt")]
+
+    def test_every_fixture_field_mangles_to_valid_identifier(self) -> None:
+        result = parse_fields_dump(FIXTURE.read_text(encoding="utf-8"))
+        for field in result.fields:
+            attr = mangle_field(field.abbrev, field.parent)
+            assert attr.isidentifier(), (field.abbrev, attr)
+            assert not attr.startswith("_"), (field.abbrev, attr)
+            assert not keyword.iskeyword(attr), (field.abbrev, attr)
