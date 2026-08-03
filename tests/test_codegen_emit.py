@@ -178,3 +178,42 @@ class TestEmitEdgeCases:
         emitted = emit_protocol(proto, [make_field("longproto.x", "FT_UINT8", "longproto")])
         assert all(len(line) <= 100 for line in emitted.py_source.splitlines())
         ast.parse(emitted.py_source)
+
+
+class TestDeterminism:
+    def test_two_runs_are_byte_identical(self) -> None:
+        first = emit_udp()
+        second = emit_protocol(UDP_PROTO, list(UDP_FIELDS), multi={"udp.port"})
+        assert first.py_source == second.py_source
+        assert first.pyi_source == second.pyi_source
+
+    def test_multi_set_type_does_not_affect_output(self) -> None:
+        via_set = emit_protocol(UDP_PROTO, UDP_FIELDS, multi={"udp.port"})
+        via_frozenset = emit_protocol(UDP_PROTO, UDP_FIELDS, multi=frozenset({"udp.port"}))
+        assert via_set.py_source == via_frozenset.py_source
+        assert via_set.pyi_source == via_frozenset.pyi_source
+
+
+class TestImportPurity:
+    """The generated .py must do no per-field work at import: table literal only."""
+
+    def test_py_module_body_shape(self) -> None:
+        tree = ast.parse(emit_udp().py_source)
+        body = tree.body
+        assert isinstance(body[0], ast.Expr)  # module docstring
+        assert all(isinstance(node, ast.ImportFrom) for node in body[1:3])
+        assert isinstance(body[3], ast.Assign)  # __all__
+        assert isinstance(body[4], ast.ClassDef)
+        assert len(body) == 5
+
+    def test_table_is_a_literal_of_constant_tuples(self) -> None:
+        tree = ast.parse(emit_udp().py_source)
+        class_def = next(node for node in tree.body if isinstance(node, ast.ClassDef))
+        table = next(node for node in class_def.body if isinstance(node, ast.AnnAssign))
+        assert isinstance(table.target, ast.Name) and table.target.id == "_table_"
+        value = table.value
+        assert isinstance(value, ast.Dict)
+        for key, entry in zip(value.keys, value.values, strict=True):
+            assert isinstance(key, ast.Constant)
+            assert isinstance(entry, ast.Tuple)
+            assert all(isinstance(element, ast.Constant) for element in entry.elts)
