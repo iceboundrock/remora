@@ -408,3 +408,23 @@ class TestMain:
         assert (fresh / "udp.py").is_file()
         assert (fresh / "udp.pyi").is_file()
         capsys.readouterr()
+
+
+def test_codegen_package_reexports() -> None:
+    import remora.codegen as codegen
+
+    for name in (
+        "Artifact",
+        "CheckReport",
+        "CodegenConfig",
+        "Fingerprint",
+        "add_header",
+        "check_artifacts",
+        "generate_artifacts",
+        "load_config",
+        "make_fingerprint",
+        "parse_header",
+        "render_header",
+    ):
+        assert name in codegen.__all__
+        assert getattr(codegen, name) is not None
