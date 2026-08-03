@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import ast
+import importlib.util
+from pathlib import Path
+from types import ModuleType
 
 import pytest
 
+from conftest import FakePacket
 from remora.codegen.emit import EmittedModule, emit_protocol, mangle_protocol
 from remora.codegen.parse import FieldDef, Protocol
+from remora.proto._meta import ProtocolBase
+from test_proto_seed import SEEDS, TestStubTablePairing, stub_fields
 
 
 class TestMangleProtocol:
@@ -217,3 +223,85 @@ class TestImportPurity:
             assert isinstance(key, ast.Constant)
             assert isinstance(entry, ast.Tuple)
             assert all(isinstance(element, ast.Constant) for element in entry.elts)
+
+
+def emit_seed(cls: type[ProtocolBase]) -> EmittedModule:
+    """Rebuild the emitter's input model from a seed class's frozen table."""
+    fields = [
+        FieldDef(name=attr, abbrev=tshark_name, ftype=ftype, parent=cls._proto_, base="")
+        for attr, (tshark_name, ftype, _multi) in cls._table_.items()
+    ]
+    multi = frozenset(
+        tshark_name for tshark_name, _ftype, is_multi in cls._table_.values() if is_multi
+    )
+    protocol = Protocol(name=cls.__name__, abbrev=cls._proto_)
+    return emit_protocol(protocol, fields, multi)
+
+
+def load_emitted(emitted: EmittedModule, directory: Path) -> ModuleType:
+    """Write the emitted pair into ``directory`` and import the ``.py``."""
+    py_path = directory / f"{emitted.module_name}.py"
+    py_path.write_text(emitted.py_source)
+    (directory / f"{emitted.module_name}.pyi").write_text(emitted.pyi_source)
+    spec = importlib.util.spec_from_file_location(emitted.module_name, py_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+seed_case = pytest.mark.parametrize(
+    ("seed_module", "seed_cls"), SEEDS, ids=[cls.__name__ for _, cls in SEEDS]
+)
+
+
+@seed_case
+class TestSeedDropInCompatibility:
+    """Acceptance: generated eth/ip/tcp/udp/dns are drop-in for the seeds.
+
+    The pairing tests in test_proto_seed.py are the frozen contract; here we
+    regenerate each seed from its own table and (a) run those pairing checks
+    unmodified against the generated pair, (b) assert the generated table and
+    stub are exactly equivalent to the checked-in seed's.
+    """
+
+    def test_generated_pair_passes_pairing_contract(
+        self, seed_module: ModuleType, seed_cls: type[ProtocolBase], tmp_path: Path
+    ) -> None:
+        emitted = emit_seed(seed_cls)
+        generated = load_emitted(emitted, tmp_path)
+        generated_cls: type[ProtocolBase] = getattr(generated, emitted.class_name)
+        pairing = TestStubTablePairing()
+        pairing.test_stub_and_table_declare_the_same_attributes(generated, generated_cls)
+        pairing.test_multiplicity_matches_descriptor_class(generated, generated_cls)
+        pairing.test_stub_inner_type_matches_ftype(generated, generated_cls)
+        pairing.test_every_ftype_is_known(generated, generated_cls)
+        pairing.test_attr_names_follow_seed_naming_convention(generated, generated_cls)
+        pairing.test_proto_matches_module_name(generated, generated_cls)
+
+    def test_generated_table_equals_seed_table(
+        self, seed_module: ModuleType, seed_cls: type[ProtocolBase], tmp_path: Path
+    ) -> None:
+        emitted = emit_seed(seed_cls)
+        generated = load_emitted(emitted, tmp_path)
+        generated_cls: type[ProtocolBase] = getattr(generated, emitted.class_name)
+        assert generated_cls._proto_ == seed_cls._proto_
+        assert generated_cls._table_ == seed_cls._table_
+
+    def test_generated_stub_equals_seed_stub(
+        self, seed_module: ModuleType, seed_cls: type[ProtocolBase], tmp_path: Path
+    ) -> None:
+        emitted = emit_seed(seed_cls)
+        generated = load_emitted(emitted, tmp_path)
+        assert stub_fields(generated) == stub_fields(seed_module)
+
+    def test_generated_class_reads_packets(
+        self, seed_module: ModuleType, seed_cls: type[ProtocolBase], tmp_path: Path
+    ) -> None:
+        emitted = emit_seed(seed_cls)
+        generated = load_emitted(emitted, tmp_path)
+        generated_cls: type[ProtocolBase] = getattr(generated, emitted.class_name)
+        attr, (tshark_name, _ftype, is_multi) = next(iter(seed_cls._table_.items()))
+        view = generated_cls(FakePacket({}))
+        assert getattr(view, attr) == (() if is_multi else None)
+        assert getattr(generated_cls, attr).name == tshark_name
