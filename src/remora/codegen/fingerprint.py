@@ -20,9 +20,16 @@ dump text, so tests need no tshark binary.
 from __future__ import annotations
 
 import hashlib
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 from remora import __version__
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    import tomli as tomllib
 
 GENERATOR = f"remora {__version__}"
 
@@ -94,4 +101,34 @@ def parse_header(source: str) -> Fingerprint | None:
         values.append(line[len(prefix) :])
     return Fingerprint(
         tshark_version=values[0], dump_sha256=values[1], env=values[2], generator=values[3]
+    )
+
+
+@dataclass(frozen=True)
+class CodegenConfig:
+    """Parsed ``codegen.toml``: the one place the generation toolchain is pinned."""
+
+    tshark_version: str
+    protocols: tuple[str, ...]
+    multi: frozenset[str]
+
+
+def _str_list(raw: object, where: str) -> tuple[str, ...]:
+    if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
+        raise ValueError(f"codegen.toml: {where} must be a list of strings")
+    return tuple(raw)
+
+
+def load_config(path: Path) -> CodegenConfig:
+    """Load ``codegen.toml``; raise ValueError with a readable message if invalid."""
+    with path.open("rb") as handle:
+        data = tomllib.load(handle)
+    version = data.get("tshark", {}).get("version")
+    if not isinstance(version, str) or not version:
+        raise ValueError("codegen.toml: [tshark] version must be a non-empty string")
+    generate = data.get("generate", {})
+    return CodegenConfig(
+        tshark_version=version,
+        protocols=_str_list(generate.get("protocols", []), "[generate] protocols"),
+        multi=frozenset(_str_list(generate.get("multi", []), "[generate] multi")),
     )

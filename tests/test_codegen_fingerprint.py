@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
+import pytest
+
 from remora.codegen.fingerprint import (
+    CodegenConfig,
     Fingerprint,
     add_header,
+    load_config,
     make_fingerprint,
     parse_header,
     render_header,
@@ -91,3 +97,38 @@ class TestHeader:
     def test_parse_header_malformed(self) -> None:
         broken = "# remora-fingerprint: v1\n# tshark: 4.6.6\n"
         assert parse_header(broken) is None
+
+
+class TestLoadConfig:
+    def test_load(self, tmp_path: Path) -> None:
+        config_file = tmp_path / "codegen.toml"
+        config_file.write_text(
+            '[tshark]\nversion = "4.6.6"\n\n'
+            '[generate]\nprotocols = ["udp", "dns"]\nmulti = ["dns.qry.name"]\n',
+            encoding="utf-8",
+        )
+        config = load_config(config_file)
+        assert config == CodegenConfig(
+            tshark_version="4.6.6", protocols=("udp", "dns"), multi=frozenset({"dns.qry.name"})
+        )
+
+    def test_missing_version_rejected(self, tmp_path: Path) -> None:
+        config_file = tmp_path / "codegen.toml"
+        config_file.write_text("[generate]\nprotocols = []\nmulti = []\n", encoding="utf-8")
+        with pytest.raises(ValueError, match=r"\[tshark\] version"):
+            load_config(config_file)
+
+    def test_wrong_type_rejected(self, tmp_path: Path) -> None:
+        config_file = tmp_path / "codegen.toml"
+        config_file.write_text(
+            '[tshark]\nversion = "4.6.6"\n[generate]\nprotocols = "udp"\nmulti = []\n',
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="protocols"):
+            load_config(config_file)
+
+    def test_repo_config_is_loadable_and_empty(self) -> None:
+        config = load_config(Path(__file__).parent.parent / "codegen.toml")
+        assert config.tshark_version
+        assert config.protocols == ()
+        assert config.multi == frozenset()
