@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast
+
 import pytest
 
 from remora.codegen.emit import EmittedModule, emit_protocol, mangle_protocol
@@ -123,3 +125,56 @@ class TestEmitHappyPath:
         pyi = emit_protocol(proto, fields, multi=frozenset({"dns.a"})).pyi_source
         assert "from remora.fields import MultiField\n" in pyi
         assert "    a: MultiField[IPv4Address]\n" in pyi
+
+
+class TestEmitEdgeCases:
+    def test_mangle_collision_first_wins_with_warning(self) -> None:
+        proto = Protocol(name="Border Gateway Protocol", abbrev="bgp")
+        fields = [
+            make_field("bgp.prefix_length", "FT_UINT8", "bgp"),
+            make_field("bgp.prefix.length", "FT_UINT8", "bgp"),
+        ]
+        emitted = emit_protocol(proto, fields)
+        assert '"prefix_length": ("bgp.prefix_length", "FT_UINT8", 0),' in emitted.py_source
+        assert "bgp.prefix.length" not in emitted.py_source
+        assert len(emitted.warnings) == 1
+        assert emitted.warnings[0].abbrev == "bgp.prefix.length"
+        assert "prefix_length" in emitted.warnings[0].message
+
+    def test_keyword_field_attr_is_escaped_in_both_sources(self) -> None:
+        proto = Protocol(name="6LoWPAN", abbrev="6lowpan")
+        emitted = emit_protocol(proto, [make_field("6lowpan.class", "FT_UINT8", "6lowpan")])
+        assert emitted.module_name == "p_6lowpan"
+        assert emitted.class_name == "P_6LOWPAN"
+        assert '"class_": ("6lowpan.class", "FT_UINT8", 0),' in emitted.py_source
+        assert "    class_: Field[int]" in emitted.pyi_source
+
+    def test_unknown_ftype_falls_back_to_str(self) -> None:
+        proto = Protocol(name="Example", abbrev="ex")
+        emitted = emit_protocol(proto, [make_field("ex.blob", "FT_SOME_FUTURE_TYPE", "ex")])
+        assert '"blob": ("ex.blob", "FT_SOME_FUTURE_TYPE", 0),' in emitted.py_source
+        assert "    blob: Field[str]" in emitted.pyi_source
+
+    def test_empty_protocol_emits_valid_pair(self) -> None:
+        proto = Protocol(name="Empty", abbrev="empty")
+        emitted = emit_protocol(proto, [])
+        assert "    _table_: ClassVar[FieldTable] = {}" in emitted.py_source
+        assert "class EMPTY(ProtocolBase): ..." in emitted.pyi_source
+        assert "from remora.fields import" not in emitted.pyi_source
+        ast.parse(emitted.py_source)
+        ast.parse(emitted.pyi_source)
+
+    def test_display_name_with_quotes_and_backslashes_is_escaped(self) -> None:
+        proto = Protocol(name='Weird "Proto" C:\\path', abbrev="weird")
+        emitted = emit_protocol(proto, [make_field("weird.x", "FT_UINT8", "weird")])
+        tree = ast.parse(emitted.py_source)
+        class_def = next(node for node in tree.body if isinstance(node, ast.ClassDef))
+        docstring = ast.get_docstring(class_def)
+        assert docstring is not None
+        assert 'Weird "Proto" C:\\path' in docstring
+
+    def test_long_display_name_wraps_under_line_limit(self) -> None:
+        proto = Protocol(name="X" * 150, abbrev="longproto")
+        emitted = emit_protocol(proto, [make_field("longproto.x", "FT_UINT8", "longproto")])
+        assert all(len(line) <= 100 for line in emitted.py_source.splitlines())
+        ast.parse(emitted.py_source)
