@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import remora.codegen.fingerprint as fingerprint_module
 from remora.codegen.fingerprint import (
     Artifact,
     CheckReport,
@@ -15,8 +16,10 @@ from remora.codegen.fingerprint import (
     check_artifacts,
     generate_artifacts,
     load_config,
+    main,
     make_fingerprint,
     parse_header,
+    parse_tshark_version,
     render_header,
     summarize_env,
 )
@@ -247,3 +250,87 @@ class TestCheckArtifacts:
         (tmp_path / "__init__.py").write_text("", encoding="utf-8")
         report = check_artifacts(artifacts, tmp_path)
         assert report.ok
+
+
+class TestParseTsharkVersion:
+    def test_release_line(self) -> None:
+        line = "TShark (Wireshark) 4.6.6 (Git commit b439fb7b47a9)."
+        assert parse_tshark_version(line) == "4.6.6"
+
+    def test_distro_line(self) -> None:
+        line = "TShark (Wireshark) 4.2.2 (Git v4.2.2 packaged as 4.2.2-1.1build3).\nmore"
+        assert parse_tshark_version(line) == "4.2.2"
+
+    def test_garbage_raises(self) -> None:
+        with pytest.raises(ValueError, match="version"):
+            parse_tshark_version("not tshark output")
+
+
+class TestMain:
+    def _prepare(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        reported_version: str = "4.6.6",
+        dump: str = SAMPLE_DUMP,
+    ) -> tuple[Path, Path]:
+        config_file = tmp_path / "codegen.toml"
+        config_file.write_text(
+            '[tshark]\nversion = "4.6.6"\n[generate]\nprotocols = ["udp"]\nmulti = []\n',
+            encoding="utf-8",
+        )
+        proto_dir = tmp_path / "proto"
+        proto_dir.mkdir()
+        monkeypatch.setattr(
+            fingerprint_module,
+            "_tshark_environment",
+            lambda tshark: (f"TShark (Wireshark) {reported_version} (Git).", dump, ""),
+        )
+        monkeypatch.setenv("TSHARK", "/usr/bin/true")
+        return config_file, proto_dir
+
+    def _argv(self, command: str, config_file: Path, proto_dir: Path) -> list[str]:
+        return [command, "--config", str(config_file), "--proto-dir", str(proto_dir)]
+
+    def test_write_then_check_in_sync(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        config_file, proto_dir = self._prepare(tmp_path, monkeypatch)
+        assert main(self._argv("write", config_file, proto_dir)) == 0
+        assert (proto_dir / "udp.py").is_file()
+        assert (proto_dir / "udp.pyi").is_file()
+        assert main(self._argv("check", config_file, proto_dir)) == 0
+        assert "2" in capsys.readouterr().out  # "... 2 artifact(s) in sync"
+
+    def test_check_reports_drift(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        config_file, proto_dir = self._prepare(tmp_path, monkeypatch)
+        assert main(self._argv("write", config_file, proto_dir)) == 0
+        stale = (proto_dir / "udp.py").read_text(encoding="utf-8") + "# stale\n"
+        (proto_dir / "udp.py").write_text(stale, encoding="utf-8")
+        assert main(self._argv("check", config_file, proto_dir)) == 1
+        captured = capsys.readouterr()
+        assert "udp.py" in captured.err
+        assert "# stale" in captured.err
+
+    def test_version_mismatch_exits_2(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        config_file, proto_dir = self._prepare(tmp_path, monkeypatch, reported_version="4.6.7")
+        assert main(self._argv("check", config_file, proto_dir)) == 2
+        captured = capsys.readouterr()
+        assert "4.6.7" in captured.err
+        assert "4.6.6" in captured.err
+
+    def test_empty_config_passes_trivially(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        config_file, proto_dir = self._prepare(tmp_path, monkeypatch)
+        config_file.write_text(
+            '[tshark]\nversion = "4.6.6"\n[generate]\nprotocols = []\nmulti = []\n',
+            encoding="utf-8",
+        )
+        assert main(self._argv("check", config_file, proto_dir)) == 0
+        assert "0" in capsys.readouterr().out

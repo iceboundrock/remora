@@ -19,8 +19,13 @@ dump text, so tests need no tshark binary.
 
 from __future__ import annotations
 
+import argparse
 import difflib
 import hashlib
+import os
+import re
+import shutil
+import subprocess
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -226,3 +231,100 @@ def check_artifacts(artifacts: Sequence[Artifact], proto_dir: Path) -> CheckRepo
                 f"{path.name}: orphan fingerprinted artifact not produced by codegen.toml"
             )
     return CheckReport(ok=not messages, messages=tuple(messages))
+
+
+_VERSION_RE = re.compile(r"^TShark \(Wireshark\) (\d+\.\d+\.\d+)", re.MULTILINE)
+
+
+def parse_tshark_version(version_output: str) -> str:
+    """Extract ``X.Y.Z`` from ``tshark --version`` output; ValueError if absent."""
+    match = _VERSION_RE.search(version_output)
+    if match is None:
+        raise ValueError(f"cannot find a tshark version in: {version_output.splitlines()[:1]!r}")
+    return match.group(1)
+
+
+def find_tshark(explicit: str | None = None) -> str:
+    """Resolve tshark: explicit path, then $TSHARK, then PATH, then Homebrew."""
+    candidate = (
+        explicit or os.environ.get("TSHARK") or shutil.which("tshark") or "/opt/homebrew/bin/tshark"
+    )
+    if not Path(candidate).is_file():
+        raise SystemExit(
+            f"error: tshark not found at {candidate!r}; install tshark "
+            "or point the TSHARK environment variable at the binary"
+        )
+    return candidate
+
+
+def _tshark_environment(tshark: str) -> tuple[str, str, str]:
+    """Run tshark once each for version, fields dump, and plugins dump."""
+
+    def run(*args: str) -> str:
+        return subprocess.run([tshark, *args], check=True, capture_output=True, text=True).stdout
+
+    return run("--version"), run("-G", "fields"), run("-G", "plugins")
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Entry point for ``python -m remora.codegen.fingerprint`` (see module docs)."""
+    parser = argparse.ArgumentParser(
+        prog="python -m remora.codegen.fingerprint",
+        description="Check or regenerate fingerprinted protocol artifacts.",
+    )
+    parser.add_argument("command", choices=("check", "write"))
+    parser.add_argument("--config", default="codegen.toml", help="path to codegen.toml")
+    parser.add_argument("--proto-dir", default="src/remora/proto", help="artifact directory")
+    parser.add_argument("--tshark", default=None, help="path to the tshark binary")
+    options = parser.parse_args(argv)
+
+    try:
+        config = load_config(Path(options.config))
+    except (OSError, ValueError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+
+    version_output, fields_dump, plugins_dump = _tshark_environment(find_tshark(options.tshark))
+    installed = parse_tshark_version(version_output)
+    if installed != config.tshark_version:
+        print(
+            f"error: installed tshark {installed} does not match the pinned "
+            f"{config.tshark_version} in {options.config}; install the pinned version "
+            "or update the pin and regenerate every artifact",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        artifacts, warnings = generate_artifacts(config, fields_dump, plugins_dump=plugins_dump)
+    except ValueError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+    for warning in warnings:
+        print(f"warning: {warning.abbrev}: {warning.message}", file=sys.stderr)
+
+    proto_dir = Path(options.proto_dir)
+    if options.command == "write":
+        for artifact in artifacts:
+            (proto_dir / artifact.name).write_text(artifact.content, encoding="utf-8")
+            print(f"wrote {proto_dir / artifact.name}")
+        print(f"wrote {len(artifacts)} artifact(s)")
+        return 0
+
+    report = check_artifacts(artifacts, proto_dir)
+    if not report.ok:
+        for message in report.messages:
+            print(message, file=sys.stderr)
+        print(
+            f"error: {len(report.messages)} artifact problem(s); regenerate with "
+            f"`uv run python -m remora.codegen.fingerprint write` under tshark "
+            f"{config.tshark_version}",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"codegen artifacts in sync ({len(artifacts)} artifact(s) checked)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
