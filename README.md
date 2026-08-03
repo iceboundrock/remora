@@ -57,7 +57,7 @@ Milestones: [M1 可用内核](https://github.com/iceboundrock/remora/milestone/1
 
 ## Generated artifacts & drift check
 
-Generated protocol modules under `src/remora/proto/` carry a fingerprint header recording the tshark version, a hash of the `tshark -G fields` dump, the plugin environment, and the generator version. The generation toolchain is pinned in **`codegen.toml`** at the repo root — the pinned tshark version lives there and nowhere else; CI and this document both defer to it. That file also lists which protocols are generated and committed; it is still empty while the M1 seeds are hand-written ([#19](https://github.com/iceboundrock/remora/issues/19) populates it).
+Generated protocol modules under `src/remora/proto/` carry a fingerprint header recording the tshark version, a hash of the `tshark -G fields` dump, the plugin environment, and the generator version. The generation toolchain is pinned in **`codegen.toml`** at the repo root — the pinned tshark version lives there and nowhere else; CI and this document both defer to it. That file also lists which protocols are generated and committed; that list is still empty while the M1 seeds are hand-written ([#19](https://github.com/iceboundrock/remora/issues/19) populates it).
 
 Verify the committed artifacts against a fresh regeneration:
 
@@ -67,4 +67,4 @@ The command exits non-zero with a unified diff when any committed artifact drift
 
     uv run python -m remora.codegen.fingerprint write
 
-CI is meant to run the same check on every push and pull request; that job lands with the generated modules.
+CI runs the same check on every push and pull request.

@@ -5,7 +5,7 @@ plugins, and Lua scripts. Generated artifacts are committed to VCS, so every
 generated file carries a provenance header:
 
     # remora-fingerprint: v1
-    # tshark: 4.6.6
+    # tshark: <version>
     # dump-sha256: <sha256 of the ``tshark -G fields`` dump, 64 hex>
     # env: plugins=none | plugins=sha256:<12 hex of the -G plugins dump>
     # generator: remora <version>
