@@ -1,0 +1,986 @@
+P	IEC 61883 Protocol	iec61883
+F	Media Clock Restart	iec61883.mrfield	FT_BOOLEAN	iec61883	8	0x8	
+F	Gateway Info Valid	iec61883.gvfield	FT_BOOLEAN	iec61883	8	0x2	
+F	Timestamp Valid	iec61883.tvfield	FT_BOOLEAN	iec61883	8	0x1	
+F	Sequence Number	iec61883.seqnum	FT_UINT8	iec61883	BASE_HEX	0x0	
+F	Timestamp Uncertain	iec61883.tufield	FT_BOOLEAN	iec61883	8	0x1	
+F	Stream ID	iec61883.stream_id	FT_UINT64	iec61883	BASE_HEX	0x0	
+F	AVTP Timestamp	iec61883.avtp_timestamp	FT_UINT32	iec61883	BASE_HEX	0x0	
+F	Gateway Info	iec61883.gateway_info	FT_UINT32	iec61883	BASE_HEX	0x0	
+F	1394 Stream Data Length	iec61883.stream_data_len	FT_UINT16	iec61883	BASE_DEC	0x0	
+F	1394 Packet Format Tag	iec61883.tag	FT_UINT8	iec61883	BASE_HEX	0xc0	
+F	1394 Packet Channel	iec61883.channel	FT_UINT8	iec61883	BASE_DEC	0x3f	
+F	1394 Packet Tcode	iec61883.tcode	FT_UINT8	iec61883	BASE_HEX	0xf0	
+F	1394 App-specific Control	iec61883.sy	FT_UINT8	iec61883	BASE_HEX	0xf	
+F	CIP Quadlet Indicator 1	iec61883.qi1	FT_UINT8	iec61883	BASE_HEX	0xc0	
+F	CIP Source ID	iec61883.sid	FT_UINT8	iec61883	BASE_DEC	0x3f	
+F	CIP Data Block Size	iec61883.dbs	FT_UINT8	iec61883	BASE_HEX	0x0	
+F	CIP Fraction Number	iec61883.fn	FT_UINT8	iec61883	BASE_HEX	0xc0	
+F	CIP Quadlet Padding Count	iec61883.qpc	FT_UINT8	iec61883	BASE_HEX	0x38	
+F	CIP Source Packet Header	iec61883.sph	FT_BOOLEAN	iec61883	8	0x4	
+F	CIP Data Block Continuity	iec61883.dbc	FT_UINT8	iec61883	BASE_HEX	0x0	
+F	CIP Quadlet Indicator 2	iec61883.qi2	FT_UINT8	iec61883	BASE_HEX	0xc0	
+F	CIP Format ID	iec61883.fmt	FT_UINT8	iec61883	BASE_HEX	0x3f	
+F	CIP Format Dependent Field	iec61883.fdf_no_syt	FT_UINT24	iec61883	BASE_HEX	0x0	
+F	Time shift flag	iec61883.fdf_tsf	FT_BOOLEAN	iec61883	8	0x80	
+F	CIP Format Dependent Field	iec61883.fdf	FT_UINT8	iec61883	BASE_HEX	0xff	
+F	CIP SYT	iec61883.syt	FT_UINT16	iec61883	BASE_HEX	0x0	
+F	Audio Data	iec61883.audiodata	FT_BYTES	iec61883		0x0	
+F	Label	iec61883.audiodata.sample.label	FT_UINT8	iec61883	BASE_HEX	0x0	
+F	Sample	iec61883.audiodata.sample.sampledata	FT_BYTES	iec61883		0x0	
+F	Video Data	iec61883.videodata	FT_BYTES	iec61883		0x0	
+F	Source Packet Header Timestamp	iec61883.spht	FT_UINT32	iec61883	BASE_HEX	0x0	
+F	Incorrect tag field, only 0x00 and 0x01 supported for AVTP	iec61883.incorrect_tag	FT_NONE	iec61883		0x0	
+F	Incorrect tcode, talker shall set this field to 0x0A	iec61883.incorrect_tcode	FT_NONE	iec61883		0x0	
+F	Incorrect quadlet indicator 1 field, talker shall set this field to 0x00	iec61883.incorrect_qi1	FT_NONE	iec61883		0x0	
+F	Incorrect quadlet padding count field, shall be set to 0	iec61883.incorrect_qpc	FT_NONE	iec61883		0x0	
+F	Incorrect quadlet indicator 2 field, talker shall set this field to 0x02	iec61883.incorrect_qi2	FT_NONE	iec61883		0x0	
+F	IEC 61883 format not dissected yet	iec61883.unknown_format	FT_NONE	iec61883		0x0	
+F	1394 Packet Channel and Source ID don`t match	iec61883.incorrect_channel_sid	FT_NONE	iec61883		0x0	
+F	Incorrect stream data length field, must be multiple of 192 plus 8 bytes CIP header	iec61883.incorrect_datalen	FT_NONE	iec61883		0x0	
+F	Incorrect fraction number, shall be 8 for IEC 61883-4	iec61883.4_incorrect_cip_fn	FT_NONE	iec61883		0x0	
+F	Incorrect data block size, shall be 6 for IEC 61883-4	iec61883.4_incorrect_cip_dbs	FT_NONE	iec61883		0x0	
+F	Incorrect source packet header value, shall be 1 for IEC 61883-4	iec61883.4_incorrect_cip_sph	FT_NONE	iec61883		0x0	
+F	Incorrect fraction number, shall be 0 for IEC 61883-6	iec61883.6_incorrect_cip_fn	FT_NONE	iec61883		0x0	
+F	Incorrect source packet header value, shall be 0 for IEC 61883-6	iec61883.6_incorrect_cip_sph	FT_NONE	iec61883		0x0	
+F	Incorrect frame dependent field value, shall be 0	iec61883.6_incorrect_cip_fdf	FT_NONE	iec61883		0x0	
+P	ACF CAN	acf-can
+F	Flags	acf-can.flags	FT_UINT8	acf-can	BASE_HEX	0x0	
+F	Padding Length	acf-can.flags.pad	FT_UINT8	acf-can	BASE_DEC	0xc0	
+F	Frame-Length	can.len	FT_UINT8	acf-can	BASE_DEC	0x0	
+F	Message Timestamp Valid	acf-can.flags.mtv	FT_BOOLEAN	acf-can	8	0x20	
+F	CAN Flexible Data-rate Format	acf-can.flags.fdf	FT_BOOLEAN	acf-can	8	0x2	
+F	Remote Transmission Request Flag	can.flags.rtr	FT_BOOLEAN	acf-can	8	0x10	
+F	Extended Flag	can.flags.xtd	FT_BOOLEAN	acf-can	8	0x8	
+F	Bit Rate Setting	canfd.flags.brs	FT_BOOLEAN	acf-can	8	0x4	
+F	Error Message Flag	canfd.flags.esi	FT_BOOLEAN	acf-can	8	0x1	
+F	Reserved Bits	acf-can.rsv1	FT_UINT8	acf-can	BASE_HEX	0xe0	
+F	CAN Bus Identifier	acf-can.bus_id	FT_UINT8	acf-can	BASE_DEC	0x1f	
+F	Message Timestamp	acf-can.message_timestamp	FT_UINT64	acf-can	BASE_HEX	0x0	
+F	Reserved	acf-can.rsv2	FT_UINT32	acf-can	BASE_HEX	0xe0000000	
+F	CAN Message Identifier	can.id	FT_UINT32	acf-can	BASE_HEX	0x1fffffff	
+F	Padding	can.padding	FT_BYTES	acf-can		0x0	
+F	Message is cropped, no space for header	acf-can.expert.header_cropped	FT_NONE	acf-can		0x0	
+F	Incorrect msg id, shall be 0..1FF when EFF flag is not set	acf-can.expert.incorrect_can_id	FT_NONE	acf-can		0x0	
+F	Incorrect payload length, shall be [0..8] when FDF flag is not set	acf-can.expert.incorrect_datalen	FT_NONE	acf-can		0x0	
+F	Incorrect FD payload length, shall be [0..8, 12, 16, 20, 32, 48, 64] when FDF flag is set	acf-can.expert.incorrect_fd_datalen	FT_NONE	acf-can		0x0	
+P	IPv6 over Low power Wireless Personal Area Networks	6lowpan
+F	Pattern	6lowpan.pattern	FT_UINT8	6lowpan	BASE_HEX	0x0	
+F	Pattern	6lowpan.nhc.pattern	FT_UINT8	6lowpan	BASE_HEX	0x0	
+F	Padding	6lowpan.padding	FT_UINT8	6lowpan	BASE_HEX	0x0	
+F	HC1 Encoding	6lowpan.hc1.encoding	FT_UINT8	6lowpan	BASE_HEX	0x0	
+F	Source prefix	6lowpan.hc1.src_prefix	FT_BOOLEAN	6lowpan	8	0x80	
+F	Source interface	6lowpan.hc1.src_ifc	FT_BOOLEAN	6lowpan	8	0x40	
+F	Destination prefix	6lowpan.hc1.dst_prefix	FT_BOOLEAN	6lowpan	8	0x20	
+F	Destination interface	6lowpan.hc1.dst_ifc	FT_BOOLEAN	6lowpan	8	0x10	
+F	Traffic class and flow label	6lowpan.hc1.class	FT_BOOLEAN	6lowpan	8	0x8	
+F	Next header	6lowpan.hc1.next	FT_UINT8	6lowpan	BASE_HEX	0x6	
+F	More HC bits	6lowpan.hc1.more	FT_BOOLEAN	6lowpan	8	0x1	
+F	HC_UDP Encoding	6lowpan.hc2.udp.encoding	FT_UINT8	6lowpan	BASE_HEX	0x0	
+F	Source port	6lowpan.hc2.udp.src	FT_BOOLEAN	6lowpan	8	0x80	
+F	Destination port	6lowpan.hc2.udp.dst	FT_BOOLEAN	6lowpan	8	0x40	
+F	Length	6lowpan.hc2.udp.length	FT_BOOLEAN	6lowpan	8	0x20	
+F	Traffic class and flow label	6lowpan.iphc.tf	FT_UINT16	6lowpan	BASE_HEX	0x1800	traffic class and flow control encoding
+F	Next header	6lowpan.iphc.nh	FT_BOOLEAN	6lowpan	16	0x400	
+F	Hop limit	6lowpan.iphc.hlim	FT_UINT16	6lowpan	BASE_HEX	0x300	
+F	Context identifier extension	6lowpan.iphc.cid	FT_BOOLEAN	6lowpan	16	0x80	
+F	Source address compression	6lowpan.iphc.sac	FT_BOOLEAN	6lowpan	16	0x40	
+F	Source address mode	6lowpan.iphc.sam	FT_UINT16	6lowpan	BASE_HEX	0x30	
+F	Multicast address compression	6lowpan.iphc.m	FT_BOOLEAN	6lowpan	16	0x8	
+F	Destination address compression	6lowpan.iphc.dac	FT_BOOLEAN	6lowpan	16	0x4	
+F	Destination address mode	6lowpan.iphc.dam	FT_UINT16	6lowpan	BASE_HEX	0x3	
+F	Source context identifier	6lowpan.iphc.sci	FT_UINT8	6lowpan	BASE_HEX	0xf0	
+F	Destination context identifier	6lowpan.iphc.dci	FT_UINT8	6lowpan	BASE_HEX	0xf	
+F	Source context	6lowpan.iphc.sctx.prefix	FT_IPv6	6lowpan		0x0	
+F	Origin	6lowpan.iphc.sctx.origin	FT_FRAMENUM	6lowpan		0x0	
+F	Destination context	6lowpan.iphc.dctx.prefix	FT_IPv6	6lowpan		0x0	
+F	Origin	6lowpan.iphc.dctx.origin	FT_FRAMENUM	6lowpan		0x0	
+F	Header ID	6lowpan.nhc.ext.eid	FT_UINT8	6lowpan	BASE_HEX	0xe	
+F	Next header	6lowpan.nhc.ext.nh	FT_BOOLEAN	6lowpan	8	0x1	
+F	Next header	6lowpan.nhc.ext.next	FT_UINT8	6lowpan	BASE_HEX	0x0	
+F	Header length	6lowpan.nhc.ext.length	FT_UINT8	6lowpan	BASE_DEC	0x0	
+F	Reserved octet	6lowpan.nhc.ext.reserved	FT_UINT8	6lowpan	BASE_HEX	0x0	
+F	Checksum	6lowpan.nhc.udp.checksum	FT_BOOLEAN	6lowpan	8	0x4	
+F	Ports	6lowpan.nhc.udp.ports	FT_UINT8	6lowpan	BASE_DEC	0x3	
+F	Traffic class	6lowpan.class	FT_UINT8	6lowpan	BASE_HEX	0x0	
+F	Flow label	6lowpan.flow	FT_UINT24	6lowpan	BASE_HEX	0x0	
+F	ECN	6lowpan.ecn	FT_UINT8	6lowpan	BASE_DEC	0x0	
+F	DSCP	6lowpan.dscp	FT_UINT8	6lowpan	BASE_DEC	0x0	
+F	Next header	6lowpan.next	FT_UINT8	6lowpan	BASE_HEX	0x0	
+F	Hop limit	6lowpan.hops	FT_UINT8	6lowpan	BASE_DEC	0x0	
+F	Source	6lowpan.src	FT_IPv6	6lowpan		0x0	Source IPv6 address
+F	Destination	6lowpan.dst	FT_IPv6	6lowpan		0x0	Destination IPv6 address
+F	Source port	6lowpan.udp.src	FT_UINT16	6lowpan	BASE_PT_UDP	0x0	
+F	Destination port	6lowpan.udp.dst	FT_UINT16	6lowpan	BASE_PT_UDP	0x0	
+F	UDP length	6lowpan.udp.length	FT_UINT16	6lowpan	BASE_DEC	0x0	
+F	UDP checksum	6lowpan.udp.checksum	FT_UINT16	6lowpan	BASE_HEX	0x0	
+F	Sequence number	6lowpan.bcast.seqnum	FT_UINT8	6lowpan	BASE_DEC	0x0	
+F	V	6lowpan.mesh.v	FT_BOOLEAN	6lowpan	8	0x20	short originator address present
+F	D	6lowpan.mesh.f	FT_BOOLEAN	6lowpan	8	0x10	short destination address present
+F	Hops left	6lowpan.mesh.hops	FT_UINT8	6lowpan	BASE_DEC	0xf	
+F	Deep Hops left (Flags.Hops left == 15)	6lowpan.mesh.hops8	FT_UINT8	6lowpan	BASE_DEC	0x0	
+F	Originator	6lowpan.mesh.orig16	FT_UINT16	6lowpan	BASE_HEX	0x0	
+F	Originator	6lowpan.mesh.orig64	FT_UINT64	6lowpan	BASE_HEX	0x0	
+F	Destination	6lowpan.mesh.dest16	FT_UINT16	6lowpan	BASE_HEX	0x0	
+F	Destination	6lowpan.mesh.dest64	FT_UINT64	6lowpan	BASE_HEX	0x0	
+F	Datagram size	6lowpan.frag.size	FT_UINT16	6lowpan	BASE_DEC	0x0	
+F	Datagram tag	6lowpan.frag.tag	FT_UINT16	6lowpan	BASE_HEX	0x0	
+F	Datagram offset	6lowpan.frag.offset	FT_UINT8	6lowpan	BASE_DEC	0x0	
+F	Congestion	6lowpan.rfrag.congestion	FT_BOOLEAN	6lowpan	8	0x1	
+F	Ack requested	6lowpan.rfrag.ack_requested	FT_BOOLEAN	6lowpan	16	0x8000	
+F	Datagram tag	6lowpan.rfrag.tag	FT_UINT8	6lowpan	BASE_DEC	0x0	
+F	Fragment sequence	6lowpan.rfrag.sequence	FT_UINT16	6lowpan	BASE_DEC	0x7c00	
+F	Fragment size	6lowpan.rfrag.size	FT_UINT16	6lowpan	BASE_DEC	0x3ff	
+F	Datagram size	6lowpan.rfrag.datagram_size	FT_UINT16	6lowpan	BASE_DEC	0x0	
+F	Fragment offset	6lowpan.rfrag.offset	FT_UINT16	6lowpan	BASE_DEC	0x0	
+F	Fragment ACK bitmask	6lowpan.rfrag.ack_bitmask	FT_UINT32	6lowpan	BASE_HEX	0x0	
+F	Message fragments	6lowpan.fragments	FT_NONE	6lowpan		0x0	
+F	Message fragment	6lowpan.fragment	FT_FRAMENUM	6lowpan		0x0	
+F	Message fragment overlap	6lowpan.fragment.overlap	FT_BOOLEAN	6lowpan	0	0x0	
+F	Message fragment overlapping with conflicting data	6lowpan.fragment.overlap.conflicts	FT_BOOLEAN	6lowpan	0	0x0	
+F	Message has multiple tail fragments	6lowpan.fragment.multiple_tails	FT_BOOLEAN	6lowpan	0	0x0	
+F	Message fragment too long	6lowpan.fragment.too_long_fragment	FT_BOOLEAN	6lowpan	0	0x0	
+F	Message defragmentation error	6lowpan.fragment.error	FT_FRAMENUM	6lowpan		0x0	
+F	Message fragment count	6lowpan.fragment.count	FT_UINT32	6lowpan	BASE_DEC	0x0	
+F	Reassembled in	6lowpan.reassembled.in	FT_FRAMENUM	6lowpan		0x0	
+F	Reassembled 6LoWPAN length	6lowpan.reassembled.length	FT_UINT32	6lowpan	BASE_DEC	0x0	
+F	Sender Rank	6lowpan.sender.rank	FT_UINT8	6lowpan	BASE_HEX	0x0	
+F	RPL Instance	6lowpan.rpl.instance	FT_UINT8	6lowpan	BASE_HEX	0x0	
+F	Packet direction (bit O)	6lowpan.6loRH.bitO	FT_BOOLEAN	6lowpan	16	0x1000	
+F	Rank-Error (bit R)	6lowpan.6loRH.bitR	FT_BOOLEAN	6lowpan	16	0x800	
+F	Forwarding-Error (bit F)	6lowpan.6loRH.bitF	FT_BOOLEAN	6lowpan	16	0x400	
+F	RPL Instance (bit I)	6lowpan.6loRH.bitI	FT_BOOLEAN	6lowpan	16	0x200	
+F	Sender Rank Compression size (bit K)	6lowpan.6loRH.bitK	FT_BOOLEAN	6lowpan	16	0x100	
+F	6loRH Hop Limit	6lowpan.rhhop.limit	FT_UINT8	6lowpan	BASE_HEX	0x0	
+F	6loRH BIER Bitmap	6lowpan.bitmap	FT_UINT32	6lowpan	BASE_HEX	0x0	
+F	6loRH Type	6lowpan.rhtype	FT_UINT16	6lowpan	BASE_HEX	0xff	
+F	6loRH Hop Number-1	6lowpan.HopNuevo	FT_UINT16	6lowpan	BASE_HEX	0x1f00	
+F	6loRH Bitmap Word Number-1	6lowpan.WordNuevo	FT_UINT16	6lowpan	BASE_HEX	0x1f00	
+F	6loRH Elective Length	6lowpan.rhElength	FT_UINT16	6lowpan	BASE_DEC	0x1f00	
+F	Routing Header 6lo	6lowpan.routingheader	FT_UINT8	6lowpan	BASE_HEX	0x0	
+F	Page Number	6lowpan.pagenb	FT_UINT16	6lowpan	BASE_HEX	0x0	
+F	HC1 more bits expected for illegal next header type.	6lowpan.hc1_more_bits	FT_NONE	6lowpan		0x0	
+F	Illegal destination address mode	6lowpan.illegal_dest_addr_mode	FT_NONE	6lowpan		0x0	
+F	Length is less than IPv6 header length	6lowpan.bad_ipv6_header_length	FT_NONE	6lowpan		0x0	
+F	Extension header not 8-octet aligned	6lowpan.bad_ext_header_length	FT_NONE	6lowpan		0x0	
+P	Domain Name System	dns
+F	Length	dns.length	FT_UINT16	dns	BASE_DEC	0x0	Length of DNS-over-TCP request or response
+F	Flags	dns.flags	FT_UINT16	dns	BASE_HEX	0x0	
+F	Response	dns.flags.response	FT_BOOLEAN	dns	16	0x8000	Is the message a response?
+F	Opcode	dns.flags.opcode	FT_UINT16	dns	BASE_DEC	0x7800	Operation code
+F	Authoritative	dns.flags.authoritative	FT_BOOLEAN	dns	16	0x400	Is the server is an authority for the domain?
+F	Conflict	dns.flags.conflict	FT_BOOLEAN	dns	16	0x400	Did we receive multiple responses to a query?
+F	Truncated	dns.flags.truncated	FT_BOOLEAN	dns	16	0x200	Is the message truncated?
+F	Recursion desired	dns.flags.recdesired	FT_BOOLEAN	dns	16	0x100	Do query recursively?
+F	Tentative	dns.flags.tentative	FT_BOOLEAN	dns	16	0x100	Is the responder authoritative for the name, but not yet verified the uniqueness?
+F	Recursion available	dns.flags.recavail	FT_BOOLEAN	dns	16	0x80	Can the server do recursive queries?
+F	Z	dns.flags.z	FT_BOOLEAN	dns	16	0x40	Z flag
+F	Answer authenticated	dns.flags.authenticated	FT_BOOLEAN	dns	16	0x20	Was the reply data authenticated by the server?
+F	AD bit	dns.flags.ad	FT_BOOLEAN	dns	16	0x20	
+F	Non-authenticated data	dns.flags.checkdisable	FT_BOOLEAN	dns	16	0x10	Is non-authenticated data acceptable?
+F	Reply code	dns.flags.rcode	FT_UINT16	dns	BASE_DEC	0xf	
+F	Transaction ID	dns.id	FT_UINT16	dns	BASE_HEX	0x0	Identification of transaction
+F	Type	dns.qry.type	FT_UINT16	dns	BASE_DEC	0x0	Query Type
+F	Class	dns.qry.class	FT_UINT16	dns	BASE_HEX	0x0	Query Class
+F	"QU" question	dns.qry.qu	FT_BOOLEAN	dns	16	0x8000	QU flag
+F	Name	dns.qry.name	FT_STRING	dns		0x0	Query Name
+F	Name Length	dns.qry.name.len	FT_UINT16	dns	BASE_DEC	0x0	Query Name Len
+F	Label Count	dns.count.labels	FT_UINT16	dns	BASE_DEC	0x0	Query Label Count
+F	Type	dns.resp.type	FT_UINT16	dns	BASE_DEC	0x0	Response Type
+F	Class	dns.resp.class	FT_UINT16	dns	BASE_HEX	0x0	Response Class
+F	Cache flush	dns.resp.cache_flush	FT_BOOLEAN	dns	16	0x8000	Cache flush flag
+F	Higher bits in extended RCODE	dns.resp.ext_rcode	FT_UINT8	dns	BASE_HEX	0x0	
+F	EDNS0 version	dns.resp.edns0_version	FT_UINT8	dns	BASE_DEC	0x0	
+F	Z	dns.resp.z	FT_UINT16	dns	BASE_HEX	0x0	
+F	DO bit	dns.resp.z.do	FT_BOOLEAN	dns	16	0x8000	DNSSEC OK
+F	Reserved	dns.resp.z.reserved	FT_UINT16	dns	BASE_HEX	0x7fff	
+F	Instance	dns.srv.instance	FT_STRING	dns		0x0	Desired service instance
+F	Service	dns.srv.service	FT_STRING	dns		0x0	Desired service
+F	Protocol	dns.srv.proto	FT_STRING	dns		0x0	Desired protocol
+F	Name	dns.srv.name	FT_STRING	dns		0x0	Domain this resource record refers to
+F	Priority	dns.srv.priority	FT_UINT16	dns	BASE_DEC	0x0	
+F	Weight	dns.srv.weight	FT_UINT16	dns	BASE_DEC	0x0	
+F	Port	dns.srv.port	FT_UINT16	dns	BASE_DEC	0x0	
+F	Target	dns.srv.target	FT_STRING	dns		0x0	
+F	Order	dns.naptr.order	FT_UINT16	dns	BASE_DEC	0x0	
+F	Preference	dns.naptr.preference	FT_UINT16	dns	BASE_DEC	0x0	
+F	Flags Length	dns.naptr.flags_length	FT_UINT8	dns	BASE_DEC	0x0	
+F	Flags	dns.naptr.flags	FT_STRING	dns		0x0	
+F	Service Length	dns.naptr.service_length	FT_UINT8	dns	BASE_DEC	0x0	
+F	Service	dns.naptr.service	FT_STRING	dns		0x0	
+F	Regex Length	dns.naptr.regex_length	FT_UINT8	dns	BASE_DEC	0x0	
+F	Regex	dns.naptr.regex	FT_STRING	dns		0x0	
+F	Replacement Length	dns.naptr.replacement_length	FT_UINT8	dns	BASE_DEC	0x0	
+F	Replacement	dns.naptr.replacement	FT_STRING	dns		0x0	
+F	Name	dns.resp.name	FT_STRING	dns		0x0	Response Name
+F	Time to live	dns.resp.ttl	FT_UINT32	dns	BASE_DEC	0x0	Response TTL
+F	Data length	dns.resp.len	FT_UINT16	dns	BASE_DEC	0x0	Response Length
+F	Address	dns.a	FT_IPv4	dns		0x0	Response IPv4 Address
+F	Chaos Domain	dns.a.ch.domain	FT_STRING	dns		0x0	Response Chaos Domain
+F	Chaos Address	dns.a.ch.addr	FT_UINT16	dns	BASE_OCT	0x0	Response Chaos Address
+F	Mail Destination	dns.md	FT_STRING	dns		0x0	
+F	Mail Forwarder	dns.mf	FT_STRING	dns		0x0	
+F	MailBox Domain	dns.mb	FT_STRING	dns		0x0	
+F	Mail Group member	dns.mg	FT_STRING	dns		0x0	
+F	Mail Rename domain	dns.mr	FT_STRING	dns		0x0	
+F	Null (data)	dns.null	FT_BYTES	dns		0x0	
+F	AAAA Address	dns.aaaa	FT_IPv6	dns		0x0	AAAA Response Address
+F	CNAME	dns.cname	FT_STRING	dns		0x0	Response Primary Name
+F	UDP payload size	dns.rr.udp_payload_size	FT_UINT16	dns	BASE_HEX	0x7fff	
+F	Primary name server	dns.soa.mname	FT_STRING	dns		0x0	
+F	Responsible authority's mailbox	dns.soa.rname	FT_STRING	dns		0x0	
+F	Responsible authority's mailbox name	dns.soa.rname.name	FT_STRING	dns		0x0	
+F	Serial Number	dns.soa.serial_number	FT_UINT32	dns	BASE_DEC	0x0	
+F	Refresh Interval	dns.soa.refresh_interval	FT_UINT32	dns	BASE_DEC	0x0	
+F	Retry Interval	dns.soa.retry_interval	FT_UINT32	dns	BASE_DEC	0x0	
+F	Expire limit	dns.soa.expire_limit	FT_UINT32	dns	BASE_DEC	0x0	
+F	Minimum TTL	dns.soa.minimum_ttl	FT_UINT32	dns	BASE_DEC	0x0	
+F	Domain Name	dns.ptr.domain_name	FT_STRING	dns		0x0	
+F	Address	dns.wks.address	FT_IPv4	dns		0x0	
+F	Protocol	dns.wks.protocol	FT_UINT8	dns	BASE_DEC	0x0	
+F	Bits	dns.wks.bits	FT_UINT8	dns	BASE_HEX	0x0	
+F	CPU Length	dns.hinfo.cpu_length	FT_UINT8	dns	BASE_DEC	0x0	
+F	CPU	dns.hinfo.cpu	FT_STRING	dns		0x0	
+F	OS Length	dns.hinfo.os_length	FT_UINT8	dns	BASE_DEC	0x0	
+F	OS	dns.hinfo.os	FT_STRING	dns		0x0	
+F	Responsible Mailbox	dns.minfo.r	FT_STRING	dns		0x0	
+F	Error Mailbox	dns.minfo.e	FT_STRING	dns		0x0	
+F	Preference	dns.mx.preference	FT_UINT16	dns	BASE_DEC	0x0	
+F	Mail Exchange	dns.mx.mail_exchange	FT_STRING	dns		0x0	
+F	TXT Length	dns.txt.length	FT_UINT8	dns	BASE_DEC	0x0	
+F	TXT	dns.txt	FT_STRING	dns		0x0	
+F	OpenPGP Key	dns.openpgpkey	FT_STRING	dns		0x0	
+F	SOA	dns.csync.soa	FT_UINT32	dns	BASE_DEC	0x0	
+F	Flags	dns.csync.flags	FT_UINT16	dns	BASE_HEX	0x0	
+F	immediate	dns.csync.flags.immediate	FT_BOOLEAN	dns	16	0x1	
+F	soaminimum	dns.csync.flags.soaminimum	FT_BOOLEAN	dns	16	0x2	
+F	Type Bitmap	dns.csync.type_bitmap	FT_BYTES	dns		0x0	
+F	Serial	dns.zonemd.serial	FT_UINT32	dns	BASE_DEC	0x0	
+F	Scheme	dns.zonemd.scheme	FT_UINT8	dns	BASE_DEC	0x0	
+F	Hash Algorithm	dns.zonemd.hash_algo	FT_UINT8	dns	BASE_DEC	0x0	
+F	Digest	dns.zonemd.digest	FT_BYTES	dns		0x0	
+F	SvcPriority	dns.svcb.svcpriority	FT_UINT16	dns	BASE_DEC	0x0	
+F	TargetName	dns.svcb.targetname	FT_STRING	dns		0x0	
+F	SvcParamKey	dns.svcb.svcparam.key	FT_UINT16	dns	BASE_DEC	0x0	
+F	SvcParamValue length	dns.svcb.svcparam.value.length	FT_UINT16	dns	BASE_DEC	0x0	
+F	SvcParamValue	dns.svcb.svcparam.value	FT_BYTES	dns		0x0	
+F	SvcParam	dns.svcb.svcparam	FT_NONE	dns		0x0	
+F	Mandatory key	dns.svcb.svcparam.mandatory.key	FT_UINT16	dns	BASE_DEC	0x0	Mandatory keys in this RR
+F	ALPN length	dns.svcb.svcparam.alpn.length	FT_UINT8	dns	BASE_DEC	0x0	
+F	ALPN	dns.svcb.svcparam.alpn	FT_STRING	dns		0x0	Additional supported protocols
+F	Port	dns.svcb.svcparam.port	FT_UINT16	dns	BASE_DEC	0x0	Port for alternative endpoint
+F	IP	dns.svcb.svcparam.ipv4hint.ip	FT_IPv4	dns		0x0	IPv4 address hints
+F	IP	dns.svcb.svcparam.ipv6hint.ip	FT_IPv6	dns		0x0	IPv6 address hints
+F	DoH path	dns.svcb.svcparam.dohpath	FT_STRING	dns		0x0	DoH URI template
+F	ODoHConfig	dns.svcb.svcparam.odohconfig	FT_BYTES	dns		0x0	Oblivious DoH keys
+F	RR Type	dns.dsync.type	FT_UINT16	dns	BASE_DEC	0x0	
+F	Scheme	dns.dsync.scheme	FT_UINT8	dns	BASE_DEC	0x0	
+F	Target Port	dns.dsync.target.port	FT_UINT16	dns	BASE_DEC	0x0	
+F	Target Domain Name	dns.dsync.target.name	FT_STRING	dns		0x0	
+F	SPF Length	dns.spf.length	FT_UINT8	dns	BASE_DEC	0x0	
+F	SPF	dns.spf	FT_STRING	dns		0x0	
+F	Preference	dns.ilnp.nid.preference	FT_UINT16	dns	BASE_DEC	0x0	
+F	NodeID	dns.ilnp.nid	FT_BYTES	dns		0x0	
+F	Preference	dns.ilnp.l32.preference	FT_UINT16	dns	BASE_DEC	0x0	
+F	Locator32	dns.ilnp.l32	FT_IPv4	dns		0x0	
+F	Preference	dns.ilnp.l64.preference	FT_UINT16	dns	BASE_DEC	0x0	
+F	Locator64	dns.ilnp.l64	FT_BYTES	dns		0x0	
+F	Preference	dns.ilnp.lp.preference	FT_UINT16	dns	BASE_DEC	0x0	
+F	Locator FQDN	dns.ilnp.lp	FT_STRING	dns		0x0	
+F	EUI48 Address	dns.eui48	FT_ETHER	dns		0x0	
+F	EUI64 Address	dns.eui64	FT_EUI64	dns		0x0	
+F	Type Covered	dns.rrsig.type_covered	FT_UINT16	dns	BASE_DEC	0x0	Identifies the type of the RRset that is covered by this RRSIG record
+F	Algorithm	dns.rrsig.algorithm	FT_UINT8	dns	BASE_DEC	0x0	Identifies the cryptographic algorithm used to create the signature
+F	Labels	dns.rrsig.labels	FT_UINT8	dns	BASE_DEC	0x0	Specifies the number of labels in the original RRSIG RR owner name
+F	Original TTL	dns.rrsig.original_ttl	FT_UINT32	dns	BASE_DEC	0x0	Specifies the TTL of the covered RRset as it appears in the authoritative zone
+F	Signature Expiration	dns.rrsig.signature_expiration	FT_ABSOLUTE_TIME	dns		0x0	Specify a validity period for the signature
+F	Signature Inception	dns.rrsig.signature_inception	FT_ABSOLUTE_TIME	dns		0x0	Specify a validity period for the signature
+F	Key Tag	dns.rrsig.key_tag	FT_UINT16	dns	BASE_DEC	0x0	Contains the key tag value of the DNSKEY RR that validates this signature
+F	Signer's name	dns.rrsig.signers_name	FT_STRING	dns		0x0	Identifies the owner name of the DNSKEY RR that a validator is supposed to use to validate this signature
+F	Signature	dns.rrsig.signature	FT_BYTES	dns		0x0	Contains the cryptographic signature that covers the RRSIG RDATA
+F	Flags	dns.dnskey.flags	FT_UINT16	dns	BASE_HEX	0x0	
+F	Zone Key	dns.dnskey.flags.zone_key	FT_BOOLEAN	dns	16	0x100	
+F	Key Revoked	dns.dnskey.flags.key_revoked	FT_BOOLEAN	dns	16	0x80	
+F	Secure Entry Point	dns.dnskey.flags.secure_entry_point	FT_BOOLEAN	dns	16	0x1	
+F	Reserved	dns.dnskey.flags.reserved	FT_UINT16	dns	BASE_HEX	0xfe7e	Must be zero
+F	Protocol	dns.dnskey.protocol	FT_UINT8	dns	BASE_DEC	0x0	Must be 3
+F	Algorithm	dns.dnskey.algorithm	FT_UINT8	dns	BASE_DEC	0x0	Identifies the public key's cryptographic algorithm and determines the format of the Public Key field
+F	Key id	dns.dnskey.key_id	FT_UINT16	dns	BASE_DEC	0x0	
+F	Public Key	dns.dnskey.public_key	FT_BYTES	dns		0x0	
+F	Flags	dns.key.flags	FT_UINT16	dns	BASE_HEX	0x0	
+F	Key allowed for authentication	dns.key.flags.authentication	FT_BOOLEAN	dns	16	0x8000	
+F	Key allowed for confidentiality	dns.key.flags.confidentiality	FT_BOOLEAN	dns	16	0x4000	
+F	Key required	dns.key.flags.required	FT_BOOLEAN	dns	16	0x2000	
+F	Key is associated with a user	dns.key.flags.associated_user	FT_BOOLEAN	dns	16	0x400	
+F	Key is associated with the named entity	dns.key.flags.associated_named_entity	FT_BOOLEAN	dns	16	0x200	
+F	Key use with IPSEC	dns.key.flags.ipsec	FT_BOOLEAN	dns	16	0x80	
+F	Key use with MIME security multiparts	dns.key.flags.mime	FT_BOOLEAN	dns	16	0x40	
+F	Signatory	dns.key.flags.signatory	FT_UINT16	dns	BASE_DEC	0xf	
+F	Protocol	dns.key.protocol	FT_UINT8	dns	BASE_DEC	0x0	
+F	Algorithm	dns.key.algorithm	FT_UINT8	dns	BASE_DEC	0x0	
+F	Key ID	dns.key.key_id	FT_UINT16	dns	BASE_DEC	0x0	
+F	Public Key	dns.key.public_key	FT_BYTES	dns		0x0	
+F	Preference	dns.px.preference	FT_UINT16	dns	BASE_DEC	0x0	
+F	MAP822	dns.px.map822	FT_STRING	dns		0x0	
+F	MAPX400	dns.px.map400	FT_STRING	dns		0x0	
+F	Algorithm name	dns.tkey.algo_name	FT_STRING	dns		0x0	
+F	Signature Expiration	dns.tkey.signature_expiration	FT_ABSOLUTE_TIME	dns		0x0	Specify a validity period for the signature
+F	Signature Inception	dns.tkey.signature_inception	FT_ABSOLUTE_TIME	dns		0x0	Specify a validity period for the signature
+F	Mode	dns.tkey.mode	FT_UINT16	dns	BASE_DEC	0x0	
+F	Error	dns.tkey.error	FT_UINT16	dns	BASE_DEC	0x0	
+F	Key Size	dns.tkey.key_size	FT_UINT16	dns	BASE_DEC	0x0	
+F	Key Data	dns.tkey.key_data	FT_BYTES	dns		0x0	
+F	Other Size	dns.tkey.other_size	FT_UINT16	dns	BASE_DEC	0x0	
+F	Other Data	dns.tkey.other_data	FT_BYTES	dns		0x0	
+F	Gateway Precedence	dns.ipseckey.gateway_precedence	FT_UINT8	dns	BASE_DEC	0x0	
+F	Gateway Algorithm	dns.ipseckey.gateway_algorithm	FT_UINT8	dns	BASE_DEC	0x0	
+F	Gateway Type	dns.ipseckey.gateway_type	FT_UINT8	dns	BASE_DEC	0x0	
+F	IPv4 Gateway	dns.ipseckey.gateway_ipv4	FT_IPv4	dns		0x0	
+F	IPv6 Gateway	dns.ipseckey.gateway_ipv6	FT_IPv6	dns		0x0	
+F	DNS Gateway	dns.ipseckey.gateway_dns	FT_STRING	dns		0x0	
+F	Public Key	dns.ipseckey.public_key	FT_BYTES	dns		0x0	
+F	IP Version	dns.xpf.ip_version	FT_UINT16	dns	BASE_DEC	0x0	
+F	Protocol	dns.xpf.protocol	FT_UINT8	dns	BASE_DEC	0x0	
+F	IPv4 Source	dns.xpf.source_ipv4	FT_IPv4	dns		0x0	
+F	IPv4 Destination	dns.xpf.destination_ipv4	FT_IPv4	dns		0x0	
+F	IPv6 Source	dns.xpf.source_ipv6	FT_IPv6	dns		0x0	
+F	IPv6 Destination	dns.xpf.destination_ipv6	FT_IPv6	dns		0x0	
+F	Source port	dns.xpf.sport	FT_UINT16	dns	BASE_DEC	0x0	
+F	Destination port	dns.xpf.dport	FT_UINT16	dns	BASE_DEC	0x0	
+F	Prefix len	dns.a6.prefix_len	FT_UINT8	dns	BASE_DEC	0x0	
+F	Address Suffix	dns.a6.address_suffix	FT_IPv6	dns		0x0	
+F	Prefix name	dns.a6.prefix_name	FT_STRING	dns		0x0	
+F	Dname	dns.dname	FT_STRING	dns		0x0	
+F	Version	dns.loc.version	FT_UINT8	dns	BASE_DEC	0x0	
+F	Size	dns.loc.size	FT_UINT8	dns	BASE_DEC	0x0	
+F	Horizontal Precision	dns.loc.horizontal_precision	FT_UINT8	dns	BASE_DEC	0x0	
+F	Vertical Precision	dns.loc.vertical_precision	FT_UINT8	dns	BASE_DEC	0x0	
+F	Latitude	dns.loc.latitude	FT_UINT32	dns	BASE_DEC	0x0	
+F	Longitude	dns.loc.longitude	FT_UINT32	dns	BASE_DEC	0x0	
+F	Altitude	dns.loc.altitude	FT_UINT32	dns	BASE_DEC	0x0	
+F	Unknown data	dns.loc.unknown_data	FT_BYTES	dns		0x0	
+F	Next Domain Name	dns.nxt.next_domain_name	FT_STRING	dns		0x0	
+F	Preference	dns.kx.preference	FT_UINT16	dns	BASE_DEC	0x0	
+F	Key Exchange	dns.kx.key_exchange	FT_STRING	dns		0x0	
+F	Type	dns.cert.type	FT_UINT16	dns	BASE_DEC	0x0	
+F	Key Tag	dns.cert.key_tag	FT_UINT16	dns	BASE_HEX	0x0	
+F	Algorithm	dns.cert.algorithm	FT_UINT8	dns	BASE_DEC	0x0	
+F	Certificate (or CRL)	dns.cert.certificate	FT_BYTES	dns		0x0	
+F	Next Domain Name	dns.nsec.next_domain_name	FT_STRING	dns		0x0	
+F	Name Server	dns.ns	FT_STRING	dns		0x0	
+F	Option	dns.opt	FT_NONE	dns		0x0	
+F	Option Code	dns.opt.code	FT_UINT16	dns	BASE_DEC	0x0	
+F	Option Length	dns.opt.len	FT_UINT16	dns	BASE_DEC	0x0	
+F	Option Data	dns.opt.data	FT_BYTES	dns		0x0	
+F	DAU	dns.opt.dau	FT_UINT8	dns	BASE_DEC	0x0	DNSSEC Algorithm Understood
+F	DHU	dns.opt.dhu	FT_UINT8	dns	BASE_DEC	0x0	DS Hash Understood
+F	N3U	dns.opt.n3u	FT_UINT8	dns	BASE_DEC	0x0	NSEC3 Hash Understood
+F	Family	dns.opt.client.family	FT_UINT16	dns	BASE_DEC	0x0	
+F	Source Netmask	dns.opt.client.netmask	FT_UINT8	dns	BASE_DEC	0x0	
+F	Scope Netmask	dns.opt.client.scope	FT_UINT8	dns	BASE_DEC	0x0	
+F	Client Subnet	dns.opt.client.addr	FT_BYTES	dns		0x0	
+F	Client Subnet	dns.opt.client.addr4	FT_IPv4	dns		0x0	
+F	Client Subnet	dns.opt.client.addr6	FT_IPv6	dns		0x0	
+F	Client Cookie	dns.opt.cookie.client	FT_BYTES	dns		0x0	
+F	Server Cookie	dns.opt.cookie.server	FT_BYTES	dns		0x0	
+F	Timeout	dns.opt.edns_tcp_keepalive.timeout	FT_UINT16	dns	BASE_DEC	0x0	an idle timeout value for the TCP connection, specified in units of 100 milliseconds
+F	Padding	dns.opt.padding	FT_BYTES	dns		0x0	The PADDING octets SHOULD be set to 0x00
+F	Closest Trust Point	dns.opt.chain.fqdn	FT_STRING	dns		0x0	A variable length Fully Qualified Domain Name (FQDN) in DNS wire format of the requested start point of the chain
+F	Info Code	dns.opt.ext_error.info_code	FT_UINT16	dns	BASE_DEC	0x0	
+F	Extra Text	dns.opt.ext_error.extra_text	FT_STRING	dns		0x0	
+F	Agent Domain	dns.opt.agent_domain	FT_STRING	dns		0x0	
+F	Labelcount	dns.opt.zoneversion.labelcount	FT_UINT8	dns	BASE_DEC	0x0	
+F	Type	dns.opt.zoneversion.type	FT_UINT8	dns	BASE_DEC	0x0	
+F	SOA-SERIAL	dns.opt.zoneversion.soa	FT_UINT32	dns	BASE_DEC	0x0	
+F	Version	dns.opt.zoneversion.version	FT_BYTES	dns		0x0	
+F	Questions	dns.count.queries	FT_UINT16	dns	BASE_DEC	0x0	Number of queries in packet
+F	Zones	dns.count.zones	FT_UINT16	dns	BASE_DEC	0x0	Number of zones in packet
+F	Answer RRs	dns.count.answers	FT_UINT16	dns	BASE_DEC	0x0	Number of answers in packet
+F	Prerequisites	dns.count.prerequisites	FT_UINT16	dns	BASE_DEC	0x0	Number of prerequisites in packet
+F	Authority RRs	dns.count.auth_rr	FT_UINT16	dns	BASE_DEC	0x0	Number of authoritative records in packet
+F	Updates	dns.count.updates	FT_UINT16	dns	BASE_DEC	0x0	Number of updates records in packet
+F	Hash algorithm	dns.nsec3.algo	FT_UINT8	dns	BASE_DEC	0x0	
+F	NSEC3 flags	dns.nsec3.flags	FT_UINT8	dns	BASE_DEC	0x0	
+F	NSEC3 Opt-out flag	dns.nsec3.flags.opt_out	FT_BOOLEAN	dns	8	0x1	
+F	NSEC3 iterations	dns.nsec3.iterations	FT_UINT16	dns	BASE_DEC	0x0	Number of hashing iterations
+F	Salt length	dns.nsec3.salt_length	FT_UINT8	dns	BASE_DEC	0x0	Length of salt in bytes
+F	Salt value	dns.nsec3.salt_value	FT_BYTES	dns		0x0	
+F	Hash length	dns.nsec3.hash_length	FT_UINT8	dns	BASE_DEC	0x0	Length in bytes of next hashed owner
+F	Next hashed owner	dns.nsec3.hash_value	FT_STRING	dns		0x0	
+F	Certificate Usage	dns.tlsa.certificate_usage	FT_UINT8	dns	BASE_DEC	0x0	Specifies the provided association that will be used to match the certificate presented in the TLS handshake
+F	Selector	dns.tlsa.selector	FT_UINT8	dns	BASE_DEC	0x0	Specifies which part of the TLS certificate presented by the server will be matched against the association data
+F	Matching Type	dns.tlsa.matching_type	FT_UINT8	dns	BASE_DEC	0x0	Specifies how the certificate association is presented
+F	Certificate Association Data	dns.tlsa.certificate_association_data	FT_BYTES	dns		0x0	The data refers to the certificate in the association
+F	Algorithm Name	dns.tsig.algorithm_name	FT_STRING	dns		0x0	Name of algorithm used for the MAC
+F	Time Signed	dns.tsig.time_signed	FT_ABSOLUTE_TIME	dns		0x0	
+F	Original Id	dns.tsig.original_id	FT_UINT16	dns	BASE_DEC	0x0	
+F	Error	dns.tsig.error	FT_UINT16	dns	BASE_DEC	0x0	Expanded RCODE for TSIG
+F	Fudge	dns.tsig.fudge	FT_UINT16	dns	BASE_DEC	0x0	Number of bytes for the MAC
+F	MAC Size	dns.tsig.mac_size	FT_UINT16	dns	BASE_DEC	0x0	Number of bytes for the MAC
+F	Other Len	dns.tsig.other_len	FT_UINT16	dns	BASE_DEC	0x0	Number of bytes for Other Data
+F	MAC	dns.tsig.mac	FT_NONE	dns		0x0	
+F	Other Data	dns.tsig.other_data	FT_BYTES	dns		0x0	
+F	Response In	dns.response_in	FT_FRAMENUM	dns		0x0	The response to this DNS query is in this frame
+F	Request In	dns.response_to	FT_FRAMENUM	dns		0x0	This is a response to the DNS query in this frame
+F	Retransmission	dns.retransmission	FT_BOOLEAN	dns	0	0x0	This is a retransmission
+F	Retransmitted request. Original request in	dns.retransmit_request_in	FT_FRAMENUM	dns		0x0	This is a retransmitted DNS query
+F	Retransmitted response. Original response in	dns.retransmit_response_in	FT_FRAMENUM	dns		0x0	This is a retransmitted DNS response
+F	Time	dns.time	FT_RELATIVE_TIME	dns		0x0	The time between the Query and the Response
+F	Unsolicited	dns.unsolicited	FT_BOOLEAN	dns	0	0x0	This is an unsolicited response
+F	Additional RRs	dns.count.add_rr	FT_UINT16	dns	BASE_DEC	0x0	Number of additional records in packet
+F	Algorithm	dns.sshfp.algorithm	FT_UINT8	dns	BASE_DEC	0x0	
+F	Fingerprint type	dns.sshfp.fingerprint.type	FT_UINT8	dns	BASE_DEC	0x0	
+F	Fingerprint	dns.sshfp.fingerprint	FT_BYTES	dns		0x0	
+F	HIT length	dns.hip.hit.length	FT_UINT8	dns	BASE_DEC	0x0	
+F	PK algorithm	dns.hip.hit.pk.algo	FT_UINT8	dns	BASE_DEC	0x0	
+F	PK length	dns.hip.pk.length	FT_UINT16	dns	BASE_DEC	0x0	
+F	Host Identity Tag	dns.hip.hit	FT_BYTES	dns		0x0	
+F	HIP Public Key	dns.hip.pk	FT_BYTES	dns		0x0	
+F	Rendezvous Server	dns.hip.rendezvous_server	FT_STRING	dns		0x0	
+F	DHCID Data	dns.dhcid.rdata	FT_BYTES	dns		0x0	
+F	Key id	dns.ds.key_id	FT_UINT16	dns	BASE_HEX	0x0	
+F	Algorithm	dns.ds.algorithm	FT_UINT8	dns	BASE_DEC	0x0	
+F	Digest Type	dns.ds.digest_type	FT_UINT8	dns	BASE_DEC	0x0	
+F	Digest	dns.ds.digest	FT_BYTES	dns		0x0	
+F	Address Family	dns.apl.address_family	FT_UINT16	dns	BASE_DEC	0x0	
+F	Prefix Length	dns.apl.coded_prefix	FT_UINT8	dns	BASE_DEC	0x0	
+F	Negation Flag	dns.apl.negation	FT_BOOLEAN	dns	8	0x80	
+F	Address Length	dns.apl.afdlength	FT_UINT8	dns	BASE_DEC	0x7f	in octets
+F	Address	dns.apl.afdpart.ipv4	FT_IPv4	dns		0x0	
+F	Address	dns.apl.afdpart.ipv6	FT_IPv6	dns		0x0	
+F	Address	dns.apl.afdpart.data	FT_BYTES	dns		0x0	
+F	Longitude length	dns.gpos.longitude_length	FT_UINT8	dns	BASE_DEC	0x0	
+F	Longitude	dns.gpos.longitude	FT_STRING	dns		0x0	
+F	Latitude length	dns.gpos.latitude_length	FT_UINT8	dns	BASE_DEC	0x0	
+F	Latitude	dns.gpos.latitude	FT_STRING	dns		0x0	
+F	Altitude length	dns.gpos.altitude_length	FT_UINT8	dns	BASE_DEC	0x0	
+F	Altitude	dns.gpos.altitude	FT_STRING	dns		0x0	
+F	Mailbox	dns.rp.mailbox	FT_STRING	dns		0x0	
+F	TXT RR	dns.rp.txt_rr	FT_STRING	dns		0x0	
+F	Subtype	dns.afsdb.subtype	FT_UINT16	dns	BASE_DEC	0x0	
+F	Hostname	dns.afsdb.hostname	FT_STRING	dns		0x0	
+F	Length	dns.x25.length	FT_UINT8	dns	BASE_DEC	0x0	
+F	PSDN-Address	dns.x25.psdn_address	FT_STRING	dns		0x0	
+F	Length	dns.idsn.length	FT_UINT8	dns	BASE_DEC	0x0	
+F	ISDN Address	dns.idsn.address	FT_STRING	dns		0x0	
+F	Length	dns.idsn.sa.length	FT_UINT8	dns	BASE_DEC	0x0	
+F	Sub Address	dns.idsn.sa.address	FT_STRING	dns		0x0	
+F	Preference	dns.rt.subtype	FT_UINT16	dns	BASE_DEC	0x0	
+F	Intermediate Hostname	dns.rt.intermediate_host	FT_STRING	dns		0x0	
+F	NSAP Data	dns.nsap.rdata	FT_BYTES	dns		0x0	
+F	Owner	dns.nsap_ptr.owner	FT_STRING	dns		0x0	
+F	CAA Flags	dns.caa.flags	FT_UINT8	dns	BASE_HEX	0x0	
+F	Issuer Critical	dns.caa.flags.issuer_critical	FT_BOOLEAN	dns	8	0x80	Other CAs must not issue certificates
+F	Issue	dns.caa.issue	FT_STRING	dns		0x0	CA which is allowed to issue certificates
+F	Issue Wildcard	dns.caa.issuewild	FT_STRING	dns		0x0	CA which is allowed to issue wildcard certificates
+F	Report URL	dns.caa.iodef	FT_STRING	dns		0x0	URL or email address for certificate issue requests and violation reports
+F	Unknown tag	dns.caa.unknown	FT_STRING	dns		0x0	
+F	Tag length	dns.caa.tag_length	FT_UINT8	dns	BASE_DEC	0x0	
+F	Tag	dns.caa.tag	FT_STRING	dns		0x0	
+F	Value	dns.caa.value	FT_STRING	dns		0x0	
+F	Extraneous Data Bytes	dns.extraneous.data	FT_BYTES	dns		0x0	
+F	Extraneous Data Length	dns.extraneous.length	FT_INT32	dns	BASE_DEC	0x0	
+F	Local Flag	dns.wins.local_flag	FT_BOOLEAN	dns	32	0x1	
+F	Lookup timeout	dns.wins.lookup_timeout	FT_UINT32	dns	BASE_DEC	0x0	In seconds
+F	Cache timeout	dns.wins.cache_timeout	FT_UINT32	dns	BASE_DEC	0x0	In seconds
+F	Number of WINS servers	dns.wins.nb_wins_servers	FT_UINT32	dns	BASE_DEC	0x0	
+F	WINS Server Address	dns.wins.wins_server	FT_IPv4	dns		0x0	
+F	Local Flag	dns.winsr.local_flag	FT_BOOLEAN	dns	32	0x1	
+F	Lookup timeout	dns.winsr.lookup_timeout	FT_UINT32	dns	BASE_DEC	0x0	In seconds
+F	Cache timeout	dns.winsr.cache_timeout	FT_UINT32	dns	BASE_DEC	0x0	In seconds
+F	Name Result Domain	dns.winsr.name_result_domain	FT_STRING	dns		0x0	
+F	Data	dns.data	FT_BYTES	dns		0x0	
+F	DNS Stateful Operation	dns.dso	FT_NONE	dns		0x0	
+F	DSO TLV	dns.dso.tlv	FT_NONE	dns		0x0	
+F	Type	dns.dso.tlv.type	FT_UINT16	dns	BASE_DEC	0x0	
+F	Length	dns.dso.tlv.length	FT_UINT16	dns	BASE_DEC	0x0	
+F	Data	dns.dso.tlv.data	FT_BYTES	dns		0x0	
+F	Inactivity Timeout	dns.dso.tlv.keepalive.inactivity	FT_UINT32	dns	BASE_DEC	0x0	Inactivity Timeout (ms)
+F	Keepalive Interval	dns.dso.tlv.keepalive.interval	FT_UINT32	dns	BASE_DEC	0x0	Keepalive Interval (ms)
+F	Retry Delay	dns.dso.tlv.retrydelay.retrydelay	FT_UINT32	dns	BASE_DEC	0x0	Retry Delay (ms)
+F	Padding	dns.dso.tlv.encpad.padding	FT_BYTES	dns		0x0	
+F	DNSCrypt	dns.dnscrypt	FT_NONE	dns		0x0	
+F	Magic	dns.dnscrypt.magic	FT_STRING	dns		0x0	
+F	ES Version	dns.dnscrypt.esversion	FT_UINT16	dns	BASE_HEX	0x0	
+F	Protocol Version	dns.dnscrypt.protocol_version	FT_UINT16	dns	BASE_HEX	0x0	
+F	Signature	dns.dnscrypt.signature	FT_BYTES	dns		0x0	
+F	Resolver PK	dns.dnscrypt.resolver_public_key	FT_BYTES	dns		0x0	
+F	Client Magic	dns.dnscrypt.client_magic	FT_BYTES	dns		0x0	
+F	Serial Number	dns.dnscrypt.serial_number	FT_BYTES	dns		0x0	
+F	Valid From	dns.dnscrypt.valid_from	FT_ABSOLUTE_TIME	dns		0x0	
+F	Valid To	dns.dnscrypt.valid_to	FT_ABSOLUTE_TIME	dns		0x0	
+F	Undecoded class	dns.a.class.undecoded	FT_NONE	dns		0x0	
+F	Length too long for any type of IP address.	dns.rr.opt.bad_length	FT_NONE	dns		0x0	
+F	Undecoded option	dns.undecoded.type	FT_NONE	dns		0x0	
+F	Deprecated opcode	dns.depr.opc	FT_NONE	dns		0x0	
+F	The uppermost bit of the TTL is set (RFC 2181, section 8)	dns.ttl.high_bit_set	FT_NONE	dns		0x0	
+F	No dissector for algorithm	dns.tsig.noalg	FT_NONE	dns		0x0	
+F	Buffer too short to compute a key id	dns.key_id_buffer_too_short	FT_NONE	dns		0x0	
+F	DNS query retransmission	dns.retransmit_request	FT_NONE	dns		0x0	
+F	DNS response retransmission	dns.retransmit_response	FT_NONE	dns		0x0	
+F	Extraneous data	dns.extraneous	FT_NONE	dns		0x0	
+F	DNS response missing	dns.response_missing	FT_NONE	dns		0x0	
+P	Ethernet	eth
+F	Destination	eth.dst	FT_ETHER	eth		0x0	Destination Hardware Address
+F	Destination (resolved)	eth.dst_resolved	FT_STRING	eth		0x0	Destination Hardware Address (resolved)
+F	Destination OUI	eth.dst.oui	FT_UINT24	eth	BASE_OUI	0x0	Destination Organizationally Unique Identifier
+F	Destination OUI (resolved)	eth.dst.oui_resolved	FT_STRING	eth		0x0	Destination Organizationally Unique Identifier (resolved)
+F	Source	eth.src	FT_ETHER	eth		0x0	Source Hardware Address
+F	Source (resolved)	eth.src_resolved	FT_STRING	eth		0x0	Source Hardware Address (resolved)
+F	Source OUI	eth.src.oui	FT_UINT24	eth	BASE_OUI	0x0	Source Organizationally Unique Identifier
+F	Source OUI (resolved)	eth.src.oui_resolved	FT_STRING	eth		0x0	Source Organizationally Unique Identifier (resolved)
+F	Length	eth.len	FT_UINT16	eth	BASE_DEC	0x0	
+F	Type	eth.type	FT_UINT16	eth	BASE_HEX	0x0	
+F	Invalid length/type	eth.invalid_lentype	FT_UINT16	eth	BASE_HEX_DEC	0x0	
+F	Address	eth.addr	FT_ETHER	eth		0x0	Source or Destination Hardware Address
+F	Address (resolved)	eth.addr_resolved	FT_STRING	eth		0x0	Source or Destination Hardware Address (resolved)
+F	Address OUI	eth.addr.oui	FT_UINT24	eth	BASE_OUI	0x0	Address Organizationally Unique Identifier
+F	Address OUI (resolved)	eth.addr.oui_resolved	FT_STRING	eth		0x0	Address Organizationally Unique Identifier (resolved)
+F	Padding	eth.padding	FT_BYTES	eth		0x0	Ethernet Padding
+F	Trailer	eth.trailer	FT_BYTES	eth		0x0	Ethernet Trailer or Checksum
+F	Frame check sequence	eth.fcs	FT_UINT32	eth	BASE_HEX	0x0	Ethernet checksum
+F	FCS Status	eth.fcs.status	FT_UINT8	eth	BASE_NONE	0x0	
+F	LG bit	eth.dst.lg	FT_BOOLEAN	eth	24	0x20000	Specifies if this is a locally administered or globally unique (IEEE assigned) address
+F	IG bit	eth.dst.ig	FT_BOOLEAN	eth	24	0x10000	Specifies if this is an individual (unicast) or group (broadcast/multicast) address
+F	LG bit	eth.src.lg	FT_BOOLEAN	eth	24	0x20000	Specifies if this is a locally administered or globally unique (IEEE assigned) address
+F	IG bit	eth.src.ig	FT_BOOLEAN	eth	24	0x10000	Specifies if this is an individual (unicast) or group (broadcast/multicast) address
+F	LG bit	eth.lg	FT_BOOLEAN	eth	24	0x20000	Specifies if this is a locally administered or globally unique (IEEE assigned) address
+F	IG bit	eth.ig	FT_BOOLEAN	eth	24	0x10000	Specifies if this is an individual (unicast) or group (broadcast/multicast) address
+F	Stream index	eth.stream	FT_UINT32	eth	BASE_DEC	0x0	
+F	Invalid length/type	eth.invalid_lentype.expert	FT_NONE	eth		0x0	
+F	Source MAC must not be a group address: IEEE 802.3-2002, Section 3.2.3(b)	eth.src_not_group	FT_NONE	eth		0x0	
+F	Bad checksum	eth.fcs_bad	FT_NONE	eth		0x0	
+F	Length field value goes past the end of the payload	eth.len.past_end	FT_NONE	eth		0x0	
+F	Padding identification may be inaccurate and impact trailer dissector	eth.padding_bad	FT_NONE	eth		0x0	
+P	Internet Protocol Version 4	ip
+F	Version	ip.version	FT_UINT8	ip	BASE_DEC	0x0	
+F	Header Length	ip.hdr_len	FT_UINT8	ip	BASE_DEC	0x0	Header length in 32-bit words
+F	Differentiated Services Field	ip.dsfield	FT_UINT8	ip	BASE_HEX	0x0	
+F	Differentiated Services Codepoint	ip.dsfield.dscp	FT_UINT8	ip	BASE_DEC	0xfc	
+F	Explicit Congestion Notification	ip.dsfield.ecn	FT_UINT8	ip	BASE_DEC	0x3	
+F	Type of Service	ip.tos	FT_UINT8	ip	BASE_DEC	0x0	
+F	Precedence	ip.tos.precedence	FT_UINT8	ip	BASE_DEC	0xe0	
+F	Delay	ip.tos.delay	FT_BOOLEAN	ip	8	0x10	
+F	Throughput	ip.tos.throughput	FT_BOOLEAN	ip	8	0x8	
+F	Reliability	ip.tos.reliability	FT_BOOLEAN	ip	8	0x4	
+F	Cost	ip.tos.cost	FT_BOOLEAN	ip	8	0x2	
+F	Total Length	ip.len	FT_UINT16	ip	BASE_DEC	0x0	
+F	Identification	ip.id	FT_UINT16	ip	BASE_HEX_DEC	0x0	
+F	Destination Address	ip.dst	FT_IPv4	ip		0x0	
+F	Destination Host	ip.dst_host	FT_STRING	ip		0x0	
+F	Source Address	ip.src	FT_IPv4	ip		0x0	
+F	Source Host	ip.src_host	FT_STRING	ip		0x0	
+F	Source or Destination Address	ip.addr	FT_IPv4	ip		0x0	
+F	Source or Destination Host	ip.host	FT_STRING	ip		0x0	
+F	Stream index	ip.stream	FT_UINT32	ip	BASE_DEC	0x0	
+F	Source or Destination GeoIP Country	ip.geoip.country	FT_STRING	ip		0x0	
+F	Source or Destination GeoIP ISO Two Letter Country Code	ip.geoip.country_iso	FT_STRING	ip		0x0	
+F	Source or Destination GeoIP City	ip.geoip.city	FT_STRING	ip		0x0	
+F	Source or Destination GeoIP AS Number	ip.geoip.asnum	FT_UINT32	ip	BASE_DEC	0x0	
+F	Source or Destination GeoIP AS Organization	ip.geoip.org	FT_STRING	ip		0x0	
+F	Source or Destination GeoIP Latitude	ip.geoip.lat	FT_DOUBLE	ip		0x0	
+F	Source or Destination GeoIP Longitude	ip.geoip.lon	FT_DOUBLE	ip		0x0	
+F	Source GeoIP	ip.geoip.src_summary	FT_STRING	ip		0x0	
+F	Source GeoIP Country	ip.geoip.src_country	FT_STRING	ip		0x0	
+F	Source GeoIP ISO Two Letter Country Code	ip.geoip.src_country_iso	FT_STRING	ip		0x0	
+F	Source GeoIP City	ip.geoip.src_city	FT_STRING	ip		0x0	
+F	Source GeoIP AS Number	ip.geoip.src_asnum	FT_UINT32	ip	BASE_DEC	0x0	
+F	Source GeoIP AS Organization	ip.geoip.src_org	FT_STRING	ip		0x0	
+F	Source GeoIP Latitude	ip.geoip.src_lat	FT_DOUBLE	ip		0x0	
+F	Source GeoIP Longitude	ip.geoip.src_lon	FT_DOUBLE	ip		0x0	
+F	Destination GeoIP	ip.geoip.dst_summary	FT_STRING	ip		0x0	
+F	Destination GeoIP Country	ip.geoip.dst_country	FT_STRING	ip		0x0	
+F	Destination GeoIP ISO Two Letter Country Code	ip.geoip.dst_country_iso	FT_STRING	ip		0x0	
+F	Destination GeoIP City	ip.geoip.dst_city	FT_STRING	ip		0x0	
+F	Destination GeoIP AS Number	ip.geoip.dst_asnum	FT_UINT32	ip	BASE_DEC	0x0	
+F	Destination GeoIP AS Organization	ip.geoip.dst_org	FT_STRING	ip		0x0	
+F	Destination GeoIP Latitude	ip.geoip.dst_lat	FT_DOUBLE	ip		0x0	
+F	Destination GeoIP Longitude	ip.geoip.dst_lon	FT_DOUBLE	ip		0x0	
+F	Flags	ip.flags	FT_UINT8	ip	BASE_HEX	0xe0	
+F	Security flag	ip.flags.sf	FT_BOOLEAN	ip	8	0x80	Security flag (RFC 3514)
+F	Reserved bit	ip.flags.rb	FT_BOOLEAN	ip	8	0x80	
+F	Don't fragment	ip.flags.df	FT_BOOLEAN	ip	8	0x40	
+F	More fragments	ip.flags.mf	FT_BOOLEAN	ip	8	0x20	
+F	Fragment Offset	ip.frag_offset	FT_UINT16	ip	BASE_DEC	0x1fff	
+F	Time to Live	ip.ttl	FT_UINT8	ip	BASE_DEC	0x0	
+F	Protocol	ip.proto	FT_UINT8	ip	BASE_DEC	0x0	
+F	Header Checksum	ip.checksum	FT_UINT16	ip	BASE_HEX	0x0	
+F	Calculated Checksum	ip.checksum_calculated	FT_UINT16	ip	BASE_HEX	0x0	The expected IP checksum field as calculated from the IP datagram
+F	Header checksum status	ip.checksum.status	FT_UINT8	ip	BASE_NONE	0x0	
+F	Type	ip.opt.type	FT_UINT8	ip	BASE_DEC	0x0	
+F	Copy on fragmentation	ip.opt.type.copy	FT_BOOLEAN	ip	8	0x80	
+F	Class	ip.opt.type.class	FT_UINT8	ip	BASE_DEC	0x60	
+F	Number	ip.opt.type.number	FT_UINT8	ip	BASE_DEC	0x1f	
+F	Length	ip.opt.len	FT_UINT8	ip	BASE_DEC	0x0	
+F	Data	ip.opt.data	FT_BYTES	ip		0x0	
+F	Pointer	ip.opt.ptr	FT_UINT8	ip	BASE_DEC	0x0	
+F	Stream Identifier	ip.opt.sid	FT_UINT16	ip	BASE_DEC	0x0	SATNET stream identifier
+F	MTU	ip.opt.mtu	FT_UINT16	ip	BASE_DEC	0x0	
+F	ID Number	ip.opt.id_number	FT_UINT16	ip	BASE_DEC	0x0	
+F	Outbound Hop Count	ip.opt.ohc	FT_UINT16	ip	BASE_DEC	0x0	
+F	Return Hop Count	ip.opt.rhc	FT_UINT16	ip	BASE_DEC	0x0	
+F	Originator IP Address	ip.opt.originator	FT_IPv4	ip		0x0	
+F	Router Alert	ip.opt.ra	FT_UINT16	ip	BASE_DEC	0x0	
+F	IP Address	ip.opt.addr	FT_IPv4	ip		0x0	
+F	Padding	ip.opt.padding	FT_BYTES	ip		0x0	
+F	Function	ip.opt.qs_func	FT_UINT8	ip	BASE_DEC	0xf0	
+F	Rate	ip.opt.qs_rate	FT_UINT8	ip	BASE_DEC	0xf	
+F	QS TTL	ip.opt.qs_ttl	FT_UINT8	ip	BASE_DEC	0x0	
+F	TTL Diff	ip.opt.qs_ttl_diff	FT_UINT8	ip	BASE_DEC	0x0	
+F	Not Used	ip.opt.qs_unused	FT_UINT8	ip	BASE_DEC	0x0	
+F	QS Nonce	ip.opt.qs_nonce	FT_UINT32	ip	BASE_HEX	0xfffffffc	
+F	Reserved	ip.opt.qs_reserved	FT_UINT32	ip	BASE_HEX	0x3	
+F	Security	ip.opt.sec_rfc791_sec	FT_UINT16	ip	BASE_HEX	0x0	
+F	Compartments	ip.opt.sec_rfc791_comp	FT_UINT16	ip	BASE_DEC	0x0	
+F	Handling Restrictions	ip.opt.sec_rfc791_hr	FT_STRING	ip		0x0	
+F	Transmission Control Code	ip.opt.sec_rfc791_tcc	FT_STRING	ip		0x0	
+F	Classification Level	ip.opt.sec_cl	FT_UINT8	ip	BASE_HEX	0x0	
+F	Protection Authority Flags	ip.opt.sec_prot_auth_flags	FT_UINT8	ip	BASE_HEX	0x0	
+F	GENSER	ip.opt.sec_prot_auth_genser	FT_BOOLEAN	ip	8	0x80	
+F	SIOP-ESI	ip.opt.sec_prot_auth_siop_esi	FT_BOOLEAN	ip	8	0x40	
+F	SCI	ip.opt.sec_prot_auth_sci	FT_BOOLEAN	ip	8	0x20	
+F	NSA	ip.opt.sec_prot_auth_nsa	FT_BOOLEAN	ip	8	0x10	
+F	DOE	ip.opt.sec_prot_auth_doe	FT_BOOLEAN	ip	8	0x8	
+F	Unassigned	ip.opt.sec_prot_auth_unassigned	FT_UINT8	ip	BASE_HEX	0x6	
+F	Field Termination Indicator	ip.opt.sec_prot_auth_fti	FT_BOOLEAN	ip	8	0x1	
+F	Additional Security Info Format Code	ip.opt.ext_sec_add_sec_info_format_code	FT_UINT8	ip	BASE_HEX	0x0	
+F	Additional Security Info	ip.opt.ext_sec_add_sec_info	FT_BYTES	ip		0x0	
+F	Service Port	ip.opt.dsr.cilium.service_port	FT_UINT16	ip	BASE_DEC	0x0	
+F	Service IPv4	ip.opt.dsr.cilium.service_ip	FT_IPv4	ip		0x0	
+F	Recorded Route	ip.rec_rt	FT_IPv4	ip		0x0	
+F	Recorded Route Host	ip.rec_rt_host	FT_STRING	ip		0x0	
+F	Current Route	ip.cur_rt	FT_IPv4	ip		0x0	
+F	Current Route Host	ip.cur_rt_host	FT_STRING	ip		0x0	
+F	Source Route	ip.src_rt	FT_IPv4	ip		0x0	
+F	Source Route Host	ip.src_rt_host	FT_STRING	ip		0x0	
+F	Empty Route	ip.empty_rt	FT_IPv4	ip		0x0	
+F	Empty Route Host	ip.empty_rt_host	FT_STRING	ip		0x0	
+F	Tag Type	ip.cipso.tag_type	FT_UINT8	ip	BASE_DEC	0x0	
+F	Fragment overlap	ip.fragment.overlap	FT_BOOLEAN	ip	0	0x0	Fragment overlaps with other fragments
+F	Conflicting data in fragment overlap	ip.fragment.overlap.conflict	FT_BOOLEAN	ip	0	0x0	Overlapping fragments contained conflicting data
+F	Multiple tail fragments found	ip.fragment.multipletails	FT_BOOLEAN	ip	0	0x0	Several tails were found when defragmenting the packet
+F	Fragment too long	ip.fragment.toolongfragment	FT_BOOLEAN	ip	0	0x0	Fragment contained data past end of packet
+F	Defragmentation error	ip.fragment.error	FT_FRAMENUM	ip		0x0	Defragmentation error due to illegal fragments
+F	Fragment count	ip.fragment.count	FT_UINT32	ip	BASE_DEC	0x0	
+F	IPv4 Fragment	ip.fragment	FT_FRAMENUM	ip		0x0	
+F	IPv4 Fragments	ip.fragments	FT_BYTES	ip		0x0	
+F	Reassembled IPv4 in frame	ip.reassembled_in	FT_FRAMENUM	ip		0x0	This IPv4 packet is reassembled in this frame
+F	Reassembled IPv4 length	ip.reassembled.length	FT_UINT32	ip	BASE_DEC	0x0	The total length of the reassembled payload
+F	Reassembled IPv4 data	ip.reassembled.data	FT_BYTES	ip		0x0	The reassembled payload
+F	DOI	ip.cipso.doi	FT_UINT32	ip	BASE_DEC	0x0	
+F	Sensitivity Level	ip.cipso.sensitivity_level	FT_UINT8	ip	BASE_DEC	0x0	
+F	Categories	ip.cipso.categories	FT_STRING	ip		0x0	
+F	Tag data	ip.cipso.tag_data	FT_BYTES	ip		0x0	
+F	Overflow	ip.opt.overflow	FT_UINT8	ip	BASE_DEC	0xf0	
+F	Flag	ip.opt.flag	FT_UINT8	ip	BASE_HEX	0xf	
+F	Time stamp	ip.opt.time_stamp	FT_UINT32	ip	BASE_DEC	0x0	
+F	Address	ip.opt.time_stamp_addr	FT_IPv4	ip		0x0	
+F	Invalid length for option	ip.opt.len.invalid	FT_NONE	ip		0x0	
+F	Option type is deprecated	ip.opt.deprecated	FT_NONE	ip		0x0	
+F	Field Termination Indicator set to 1 for last byte of option	ip.opt.fti_1_last_byte	FT_NONE	ip		0x0	
+F	Extraneous data in option	ip.opt.len.extra_found	FT_NONE	ip		0x0	
+F	Pointer points before first address	ip.opt.ptr.before_address	FT_NONE	ip		0x0	
+F	Pointer points to middle of address	ip.opt.ptr.middle_address	FT_NONE	ip		0x0	
+F	Suboption would go past end of option	ip.subopt_too_long	FT_NONE	ip		0x0	
+F	4 NOP in a row - a router may have removed some options	ip.nop	FT_NONE	ip		0x0	
+F	Bogus IP length	ip.bogus_ip_length	FT_NONE	ip		0x0	
+F	Packet has evil intent	ip.evil_packet	FT_NONE	ip		0x0	
+F	Bad checksum	ip.checksum_bad.expert	FT_NONE	ip		0x0	
+F	Time To Live	ip.ttl.lncb	FT_NONE	ip		0x0	
+F	Time To Live too small	ip.ttl.too_small	FT_NONE	ip		0x0	
+F	Malformed CIPSO tag	ip.cipso.malformed	FT_NONE	ip		0x0	
+F	Bogus IP version	ip.bogus_ip_version	FT_NONE	ip		0x0	
+F	Bogus IP header length	ip.bogus_header_length	FT_NONE	ip		0x0	
+P	Transmission Control Protocol	tcp
+F	Source Port	tcp.srcport	FT_UINT16	tcp	BASE_PT_TCP	0x0	
+F	Destination Port	tcp.dstport	FT_UINT16	tcp	BASE_PT_TCP	0x0	
+F	Source or Destination Port	tcp.port	FT_UINT16	tcp	BASE_PT_TCP	0x0	
+F	Stream index	tcp.stream	FT_UINT32	tcp	BASE_DEC	0x0	
+F	Stream Packet Number	tcp.stream.pnum	FT_UINT32	tcp	BASE_DEC	0x0	Relative packet number in this TCP stream
+F	Conversation completeness	tcp.completeness	FT_UINT8	tcp	BASE_CUSTOM	0x0	The completeness of the conversation capture
+F	SYN	tcp.completeness.syn	FT_BOOLEAN	tcp	8	0x1	Conversation has a SYN packet
+F	SYN-ACK	tcp.completeness.syn-ack	FT_BOOLEAN	tcp	8	0x2	Conversation has a SYN-ACK packet
+F	ACK	tcp.completeness.ack	FT_BOOLEAN	tcp	8	0x4	Conversation has an ACK packet
+F	Data	tcp.completeness.data	FT_BOOLEAN	tcp	8	0x8	Conversation has payload DATA
+F	FIN	tcp.completeness.fin	FT_BOOLEAN	tcp	8	0x10	Conversation has a FIN packet
+F	RST	tcp.completeness.rst	FT_BOOLEAN	tcp	8	0x20	Conversation has a RST packet
+F	Completeness Flags	tcp.completeness.str	FT_STRING	tcp		0x0	
+F	Sequence Number	tcp.seq	FT_UINT32	tcp	BASE_DEC	0x0	
+F	Sequence Number (raw)	tcp.seq_raw	FT_UINT32	tcp	BASE_DEC	0x0	This shows the raw value of the sequence number
+F	Next Sequence Number	tcp.nxtseq	FT_UINT32	tcp	BASE_DEC	0x0	
+F	Acknowledgment Number	tcp.ack	FT_UINT32	tcp	BASE_DEC	0x0	
+F	Acknowledgment number (raw)	tcp.ack_raw	FT_UINT32	tcp	BASE_DEC	0x0	This shows the raw value of the acknowledgment number
+F	Header Length	tcp.hdr_len	FT_UINT8	tcp	BASE_DEC	0x0	Data offset in 32-bit words
+F	Flags	tcp.flags	FT_UINT16	tcp	BASE_HEX	0xfff	
+F	Reserved	tcp.flags.res	FT_BOOLEAN	tcp	12	0xe00	Three reserved bits (must be zero)
+F	Accurate ECN	tcp.flags.ae	FT_BOOLEAN	tcp	12	0x100	
+F	Congestion Window Reduced	tcp.flags.cwr	FT_BOOLEAN	tcp	12	0x80	
+F	ECN-Echo	tcp.flags.ece	FT_BOOLEAN	tcp	12	0x40	
+F	ACE	tcp.flags.ace	FT_UINT8	tcp	BASE_DEC	0x0	
+F	Urgent	tcp.flags.urg	FT_BOOLEAN	tcp	12	0x20	
+F	Acknowledgment	tcp.flags.ack	FT_BOOLEAN	tcp	12	0x10	
+F	Push	tcp.flags.push	FT_BOOLEAN	tcp	12	0x8	
+F	Reset	tcp.flags.reset	FT_BOOLEAN	tcp	12	0x4	
+F	Syn	tcp.flags.syn	FT_BOOLEAN	tcp	12	0x2	
+F	Fin	tcp.flags.fin	FT_BOOLEAN	tcp	12	0x1	
+F	TCP Flags	tcp.flags.str	FT_STRING	tcp		0x0	
+F	Window	tcp.window_size_value	FT_UINT16	tcp	BASE_DEC	0x0	The window size value from the TCP header
+F	Calculated window size	tcp.window_size	FT_UINT32	tcp	BASE_DEC	0x0	The scaled window size (if scaling has been used)
+F	Window size scaling factor	tcp.window_size_scalefactor	FT_INT32	tcp	BASE_DEC	0x0	The window size scaling factor (-1 when unknown, -2 when no scaling is used)
+F	Checksum	tcp.checksum	FT_UINT16	tcp	BASE_HEX	0x0	Details at: https://www.wireshark.org/docs/wsug_html_chunked/ChAdvChecksums.html
+F	Checksum Status	tcp.checksum.status	FT_UINT8	tcp	BASE_NONE	0x0	
+F	Calculated Checksum	tcp.checksum_calculated	FT_UINT16	tcp	BASE_HEX	0x0	The expected TCP checksum field as calculated from the TCP segment
+F	SEQ/ACK analysis	tcp.analysis	FT_NONE	tcp		0x0	This frame has some of the TCP analysis shown
+F	TCP Analysis Flags	tcp.analysis.flags	FT_NONE	tcp		0x0	This frame has some of the TCP analysis flags set
+F	Duplicate ACK	tcp.analysis.duplicate_ack	FT_NONE	tcp		0x0	This is a duplicate ACK
+F	Duplicate ACK #	tcp.analysis.duplicate_ack_num	FT_UINT32	tcp	BASE_DEC	0x0	This is duplicate ACK number #
+F	Duplicate to the ACK in frame	tcp.analysis.duplicate_ack_frame	FT_FRAMENUM	tcp		0x0	This is a duplicate to the ACK in frame #
+F	This is a continuation to the PDU in frame	tcp.continuation_to	FT_FRAMENUM	tcp		0x0	This is a continuation to the PDU in frame #
+F	TCP Segment Len	tcp.len	FT_UINT32	tcp	BASE_DEC	0x0	
+F	This is an ACK to the segment in frame	tcp.analysis.acks_frame	FT_FRAMENUM	tcp		0x0	Which previous segment is this an ACK for
+F	Bytes in flight	tcp.analysis.bytes_in_flight	FT_UINT32	tcp	BASE_DEC	0x0	How many bytes are now in flight for this connection
+F	Bytes sent since last PSH flag	tcp.analysis.push_bytes_sent	FT_UINT32	tcp	BASE_DEC	0x0	How many bytes have been sent since the last PSH flag
+F	The RTT to ACK the segment was	tcp.analysis.ack_rtt	FT_RELATIVE_TIME	tcp		0x0	How long time it took to ACK the segment (RTT)
+F	iRTT	tcp.analysis.initial_rtt	FT_RELATIVE_TIME	tcp		0x0	How long it took for the SYN to ACK handshake (iRTT)
+F	The RTO for this segment was	tcp.analysis.rto	FT_RELATIVE_TIME	tcp		0x0	How long transmission was delayed before this segment was retransmitted (RTO)
+F	RTO based on delta from frame	tcp.analysis.rto_frame	FT_FRAMENUM	tcp		0x0	This is the frame we measure the RTO from
+F	Urgent Pointer	tcp.urgent_pointer	FT_UINT16	tcp	BASE_DEC	0x0	
+F	Segment overlap	tcp.segment.overlap	FT_BOOLEAN	tcp	0	0x0	Segment overlaps with other segments
+F	Conflicting data in segment overlap	tcp.segment.overlap.conflict	FT_BOOLEAN	tcp	0	0x0	Overlapping segments contained conflicting data
+F	Multiple tail segments found	tcp.segment.multipletails	FT_BOOLEAN	tcp	0	0x0	Several tails were found when reassembling the pdu
+F	Segment too long	tcp.segment.toolongfragment	FT_BOOLEAN	tcp	0	0x0	Segment contained data past end of the pdu
+F	Reassembling error	tcp.segment.error	FT_FRAMENUM	tcp		0x0	Reassembling error due to illegal segments
+F	Segment count	tcp.segment.count	FT_UINT32	tcp	BASE_DEC	0x0	
+F	TCP Segment	tcp.segment	FT_FRAMENUM	tcp		0x0	
+F	Reassembled TCP Segments	tcp.segments	FT_NONE	tcp		0x0	
+F	Reassembled PDU in frame	tcp.reassembled_in	FT_FRAMENUM	tcp		0x0	The PDU that doesn't end in this segment is reassembled in this frame
+F	Reassembled TCP length	tcp.reassembled.length	FT_UINT32	tcp	BASE_DEC	0x0	The total length of the reassembled payload
+F	Reassembled TCP Data	tcp.reassembled.data	FT_BYTES	tcp		0x0	The reassembled payload
+F	Kind	tcp.option_kind	FT_UINT8	tcp	BASE_DEC	0x0	This TCP option's kind
+F	Length	tcp.option_len	FT_UINT8	tcp	BASE_DEC	0x0	Length of this TCP option in bytes (including kind and length fields)
+F	TCP Options	tcp.options	FT_BYTES	tcp		0x0	
+F	MSS Value	tcp.options.mss_val	FT_UINT16	tcp	BASE_DEC	0x0	
+F	Shift count	tcp.options.wscale.shift	FT_UINT8	tcp	BASE_DEC	0x0	Logarithmically encoded power of 2 scale factor
+F	Multiplier	tcp.options.wscale.multiplier	FT_UINT16	tcp	BASE_DEC	0x0	Multiply segment window size by this for scaled window size
+F	Data	tcp.options.experimental.data	FT_BYTES	tcp		0x0	
+F	Experiment Identifier	tcp.options.experimental.exid	FT_UINT16	tcp	BASE_HEX	0x0	
+F	Payload	tcp.options.unknown.payload	FT_BYTES	tcp		0x0	
+F	TCP SACK Left Edge	tcp.options.sack_le	FT_UINT32	tcp	BASE_DEC	0x0	
+F	TCP SACK Right Edge	tcp.options.sack_re	FT_UINT32	tcp	BASE_DEC	0x0	
+F	TCP SACK Count	tcp.options.sack.count	FT_UINT8	tcp	BASE_DEC	0x0	
+F	TCP D-SACK Left Edge	tcp.options.sack.dsack_le	FT_UINT32	tcp	BASE_DEC	0x0	Duplicate SACK Left Edge
+F	TCP D-SACK Right Edge	tcp.options.sack.dsack_re	FT_UINT32	tcp	BASE_DEC	0x0	Duplicate SACK Right Edge
+F	TCP Echo Option	tcp.options.echo_value	FT_UINT32	tcp	BASE_DEC	0x0	TCP Sack Echo
+F	Timestamp value	tcp.options.timestamp.tsval	FT_UINT32	tcp	BASE_DEC	0x0	Value of sending machine's timestamp clock
+F	Timestamp echo reply	tcp.options.timestamp.tsecr	FT_UINT32	tcp	BASE_DEC	0x0	Echoed timestamp from remote machine
+F	Multipath TCP subtype	tcp.options.mptcp.subtype	FT_UINT8	tcp	BASE_DEC	0xf0	
+F	Multipath TCP version	tcp.options.mptcp.version	FT_UINT8	tcp	BASE_DEC	0xf	
+F	Reserved	tcp.options.mptcp.reserved	FT_UINT16	tcp	BASE_HEX	0xfff	
+F	Multipath TCP flags	tcp.options.mptcp.flags	FT_UINT8	tcp	BASE_HEX	0x0	
+F	Backup flag	tcp.options.mptcp.backup.flag	FT_UINT8	tcp	BASE_DEC	0x1	
+F	Checksum required	tcp.options.mptcp.checksumreq.flags	FT_UINT8	tcp	BASE_DEC	0x80	
+F	Extensibility	tcp.options.mptcp.extensibility.flag	FT_UINT8	tcp	BASE_DEC	0x40	
+F	Do not attempt to establish new subflows to this address and port	tcp.options.mptcp.nomoresubflows.flag	FT_UINT8	tcp	BASE_DEC	0x20	
+F	Use HMAC-SHA1	tcp.options.mptcp.sha1.flag	FT_UINT8	tcp	BASE_DEC	0x1	
+F	Use HMAC-SHA256	tcp.options.mptcp.sha256.flag	FT_UINT8	tcp	BASE_DEC	0x1	
+F	DATA_FIN	tcp.options.mptcp.datafin.flag	FT_UINT8	tcp	BASE_DEC	0x10	
+F	Data Sequence Number is 8 octets	tcp.options.mptcp.dseqn8.flag	FT_UINT8	tcp	BASE_DEC	0x8	
+F	Data Sequence Number, Subflow Sequence Number, Data-level Length, Checksum present	tcp.options.mptcp.dseqnpresent.flag	FT_UINT8	tcp	BASE_DEC	0x4	
+F	Data ACK is 8 octets	tcp.options.mptcp.dataack8.flag	FT_UINT8	tcp	BASE_DEC	0x2	
+F	Data ACK is present	tcp.options.mptcp.dataackpresent.flag	FT_UINT8	tcp	BASE_DEC	0x1	
+F	Reserved	tcp.options.mptcp.reserved.flag	FT_UINT8	tcp	BASE_HEX	0x3e	
+F	Flag U	tcp.options.mptcp.flag_U.flag	FT_BOOLEAN	tcp	4	0x8	
+F	Flag V	tcp.options.mptcp.flag_V.flag	FT_BOOLEAN	tcp	4	0x4	
+F	Flag W	tcp.options.mptcp.flag_W.flag	FT_BOOLEAN	tcp	4	0x2	
+F	Transient	tcp.options.mptcp.flag_T.flag	FT_BOOLEAN	tcp	4	0x1	
+F	TCPRST Reason	tcp.options.mptcp.rst_reason	FT_UINT8	tcp	BASE_HEX	0x0	Multipath TCPRST Reason Code
+F	Address ID	tcp.options.mptcp.addrid	FT_UINT8	tcp	BASE_DEC	0x0	
+F	Sender's Key	tcp.options.mptcp.sendkey	FT_UINT64	tcp	BASE_DEC	0x0	
+F	Receiver's Key	tcp.options.mptcp.recvkey	FT_UINT64	tcp	BASE_DEC	0x0	
+F	Receiver's Token	tcp.options.mptcp.recvtok	FT_UINT32	tcp	BASE_DEC	0x0	
+F	Sender's Random Number	tcp.options.mptcp.sendrand	FT_UINT32	tcp	BASE_DEC	0x0	
+F	Sender's Truncated HMAC	tcp.options.mptcp.sendtrunchmac	FT_UINT64	tcp	BASE_DEC	0x0	
+F	Sender's HMAC	tcp.options.mptcp.sendhmac	FT_BYTES	tcp		0x0	
+F	Truncated HMAC	tcp.options.mptcp.addaddrtrunchmac	FT_UINT64	tcp	BASE_DEC	0x0	
+F	Original MPTCP Data ACK	tcp.options.mptcp.rawdataack	FT_UINT64	tcp	BASE_DEC	0x0	
+F	Data Sequence Number	tcp.options.mptcp.rawdataseqno	FT_UINT64	tcp	BASE_DEC	0x0	
+F	Subflow Sequence Number	tcp.options.mptcp.subflowseqno	FT_UINT32	tcp	BASE_DEC	0x0	
+F	Data-level Length	tcp.options.mptcp.datalvllen	FT_UINT16	tcp	BASE_DEC	0x0	
+F	Checksum	tcp.options.mptcp.checksum	FT_UINT16	tcp	BASE_HEX	0x0	
+F	IP version	tcp.options.mptcp.ipver	FT_UINT8	tcp	BASE_DEC	0xf	
+F	Echo	tcp.options.mptcp.echo	FT_UINT8	tcp	BASE_DEC	0x1	
+F	Advertised IPv4 Address	tcp.options.mptcp.ipv4	FT_IPv4	tcp		0x0	
+F	Advertised IPv6 Address	tcp.options.mptcp.ipv6	FT_IPv6	tcp		0x0	
+F	Advertised port	tcp.options.mptcp.port	FT_UINT16	tcp	BASE_DEC	0x0	
+F	TCP CC Option	tcp.options.cc_value	FT_UINT32	tcp	BASE_DEC	0x0	
+F	MD5 digest	tcp.options.md5.digest	FT_BYTES	tcp		0x0	
+F	AO KeyID	tcp.options.ao.keyid	FT_UINT8	tcp	BASE_DEC	0x0	
+F	AO RNextKeyID	tcp.options.ao.rnextkeyid	FT_UINT8	tcp	BASE_DEC	0x0	
+F	AO MAC	tcp.options.ao.mac	FT_BYTES	tcp		0x0	
+F	QS Rate	tcp.options.qs.rate	FT_UINT8	tcp	BASE_DEC	0xf	
+F	QS Rate	tcp.options.qs.ttl_diff	FT_UINT8	tcp	BASE_DEC	0x0	
+F	TARR Rate	tcp.options.tarr.rate	FT_UINT8	tcp	BASE_DEC	0xfe	
+F	TARR Reserved	tcp.options.tar.reserved	FT_UINT8	tcp	BASE_DEC	0x1	
+F	Accurate ECN Echo ECT(0) Byte Counter	tcp.options.acc_ecn.ee0b	FT_UINT24	tcp	BASE_DEC	0x0	
+F	Accurate ECN Echo CE Byte Counter	tcp.options.acc_ecn.eceb	FT_UINT24	tcp	BASE_DEC	0x0	
+F	Accurate ECN Echo ECT(1) Byte Counter	tcp.options.acc_ecn.ee1b	FT_UINT24	tcp	BASE_DEC	0x0	
+F	TCP SCPS Capabilities Vector	tcp.options.scps.vector	FT_UINT8	tcp	BASE_HEX	0x0	
+F	Binding Space (Community) ID	tcp.options.scps.binding.id	FT_UINT8	tcp	BASE_DEC	0x0	TCP SCPS Extended Binding Space (Community) ID
+F	Extended Capability Length	tcp.options.scps.binding.len	FT_UINT8	tcp	BASE_DEC	0x0	TCP SCPS Extended Capability Length in bytes
+F	TCP SNACK Offset	tcp.options.snack.offset	FT_UINT16	tcp	BASE_DEC	0x0	
+F	TCP SNACK Size	tcp.options.snack.size	FT_UINT16	tcp	BASE_DEC	0x0	
+F	TCP SNACK Left Edge	tcp.options.snack.le	FT_UINT16	tcp	BASE_DEC	0x0	
+F	TCP SNACK Right Edge	tcp.options.snack.re	FT_UINT16	tcp	BASE_DEC	0x0	
+F	Partial Reliability Capable (BETS)	tcp.options.scpsflags.bets	FT_BOOLEAN	tcp	8	0x80	
+F	Short Form SNACK Capable (SNACK1)	tcp.options.scpsflags.snack1	FT_BOOLEAN	tcp	8	0x40	
+F	Long Form SNACK Capable (SNACK2)	tcp.options.scpsflags.snack2	FT_BOOLEAN	tcp	8	0x20	
+F	Lossless Header Compression (COMP)	tcp.options.scpsflags.compress	FT_BOOLEAN	tcp	8	0x10	
+F	Network Layer Timestamp (NLTS)	tcp.options.scpsflags.nlts	FT_BOOLEAN	tcp	8	0x8	
+F	Reserved	tcp.options.scpsflags.reserved	FT_UINT8	tcp	BASE_DEC	0x7	
+F	Connection ID	tcp.options.scps.binding	FT_UINT8	tcp	BASE_DEC	0x0	TCP SCPS Connection ID
+F	Granularity	tcp.options.user_to_granularity	FT_BOOLEAN	tcp	16	0x8000	TCP User Timeout Granularity
+F	User Timeout	tcp.options.user_to_val	FT_UINT16	tcp	BASE_DEC	0x7fff	TCP User Timeout Value
+F	Type	tcp.options.rvbd.probe.type1	FT_UINT8	tcp	BASE_DEC	0xf0	
+F	Type	tcp.options.rvbd.probe.type2	FT_UINT8	tcp	BASE_DEC	0xfe	
+F	Version	tcp.options.rvbd.probe.version	FT_UINT8	tcp	BASE_DEC	0xf	
+F	Version	tcp.options.rvbd.probe.version_raw	FT_UINT8	tcp	BASE_DEC	0x1	Version 2 Raw Value
+F	CSH IP	tcp.options.rvbd.probe.prober	FT_IPv4	tcp		0x0	
+F	SSH IP	tcp.options.rvbd.probe.proxy.ip	FT_IPv4	tcp		0x0	
+F	SSH Port	tcp.options.rvbd.probe.proxy.port	FT_UINT16	tcp	BASE_DEC	0x0	
+F	Application Version	tcp.options.rvbd.probe.appli_ver	FT_UINT16	tcp	BASE_DEC	0x0	
+F	Client IP	tcp.options.rvbd.probe.client.ip	FT_IPv4	tcp		0x0	
+F	CFE Store ID	tcp.options.rvbd.probe.storeid	FT_UINT32	tcp	BASE_DEC	0x0	
+F	Probe Flags	tcp.options.rvbd.probe.flags	FT_UINT8	tcp	BASE_HEX	0x0	
+F	Not CFE	tcp.options.rvbd.probe.flags.notcfe	FT_BOOLEAN	tcp	8	0x4	
+F	Last Notify	tcp.options.rvbd.probe.flags.last	FT_BOOLEAN	tcp	8	0x1	
+F	Disable Probe Cache on CSH	tcp.options.rvbd.probe.flags.probe	FT_BOOLEAN	tcp	8	0x10	
+F	SSL Enabled	tcp.options.rvbd.probe.flags.ssl	FT_BOOLEAN	tcp	8	0x2	
+F	SSH outer to server established	tcp.options.rvbd.probe.flags.server	FT_BOOLEAN	tcp	8	0x1	
+F	Transparency Options	tcp.options.rvbd.trpy.flags	FT_UINT16	tcp	BASE_HEX	0x0	
+F	Enable FW traversal feature	tcp.options.rvbd.trpy.flags.fw_rst_probe	FT_BOOLEAN	tcp	16	0x400	Reset state created by probe on the nexthop firewall
+F	Enable Inner FW feature on All FWs	tcp.options.rvbd.trpy.flags.fw_rst_inner	FT_BOOLEAN	tcp	16	0x200	Reset state created by transparent inner on all firewalls before passing connection through
+F	Enable Transparency FW feature on All FWs	tcp.options.rvbd.trpy.flags.fw_rst	FT_BOOLEAN	tcp	16	0x100	Reset state created by probe on all firewalls before establishing transparent inner connection
+F	Reserved	tcp.options.rvbd.trpy.flags.chksum	FT_BOOLEAN	tcp	16	0x4	
+F	Out of band connection	tcp.options.rvbd.trpy.flags.oob	FT_BOOLEAN	tcp	16	0x2	
+F	Transparency Mode	tcp.options.rvbd.trpy.flags.mode	FT_BOOLEAN	tcp	16	0x1	
+F	Src SH IP Addr	tcp.options.rvbd.trpy.src.ip	FT_IPv4	tcp		0x0	
+F	Dst SH IP Addr	tcp.options.rvbd.trpy.dst.ip	FT_IPv4	tcp		0x0	
+F	Src SH Inner Port	tcp.options.rvbd.trpy.src.port	FT_UINT16	tcp	BASE_DEC	0x0	
+F	Dst SH Inner Port	tcp.options.rvbd.trpy.dst.port	FT_UINT16	tcp	BASE_DEC	0x0	
+F	Out of band connection Client Port	tcp.options.rvbd.trpy.client.port	FT_UINT16	tcp	BASE_DEC	0x0	
+F	Fast Open Cookie Request	tcp.options.tfo.request	FT_NONE	tcp		0x0	
+F	Fast Open Cookie	tcp.options.tfo.cookie	FT_BYTES	tcp		0x0	
+F	Time until the last segment of this PDU	tcp.pdu.time	FT_RELATIVE_TIME	tcp		0x0	How long time has passed until the last frame of this PDU
+F	PDU Size	tcp.pdu.size	FT_UINT32	tcp	BASE_DEC	0x0	The size of this PDU
+F	Last frame of this PDU	tcp.pdu.last_frame	FT_FRAMENUM	tcp		0x0	This is the last frame of the PDU starting in this segment
+F	Time since first frame in this TCP stream	tcp.time_relative	FT_RELATIVE_TIME	tcp		0x0	Time relative to first frame in this TCP stream
+F	Time since previous frame in this TCP stream	tcp.time_delta	FT_RELATIVE_TIME	tcp		0x0	Time delta from previous frame in this TCP stream
+F	Source process user ID	tcp.proc.srcuid	FT_UINT32	tcp	BASE_DEC	0x0	
+F	Source process ID	tcp.proc.srcpid	FT_UINT32	tcp	BASE_DEC	0x0	
+F	Source process user name	tcp.proc.srcuname	FT_STRING	tcp		0x0	
+F	Source process name	tcp.proc.srccmd	FT_STRING	tcp		0x0	Source process command name
+F	Destination process user ID	tcp.proc.dstuid	FT_UINT32	tcp	BASE_DEC	0x0	
+F	Destination process ID	tcp.proc.dstpid	FT_UINT32	tcp	BASE_DEC	0x0	
+F	Destination process user name	tcp.proc.dstuname	FT_STRING	tcp		0x0	
+F	Destination process name	tcp.proc.dstcmd	FT_STRING	tcp		0x0	Destination process command name
+F	TCP segment data	tcp.segment_data	FT_BYTES	tcp		0x0	A data segment used in reassembly of an upper-layer protocol (ULP)
+F	TCP payload	tcp.payload	FT_BYTES	tcp		0x0	The TCP payload of this packet
+F	Binding Space Data	tcp.options.scps.binding.data	FT_BYTES	tcp		0x0	
+F	Reserved	tcp.options.rvbd.probe.reserved	FT_UINT8	tcp	BASE_HEX	0x0	
+F	Retransmission of FIN from frame	tcp.fin_retransmission	FT_FRAMENUM	tcp		0x0	
+F	Reset cause	tcp.reset_cause	FT_STRING	tcp		0x0	
+F	SYN Cookie Time	tcp.syncookie.time	FT_UINT8	tcp	BASE_DEC	0x0	
+F	SYN Cookie Maximum Segment Size	tcp.syncookie.mss	FT_UINT8	tcp	BASE_DEC	0x0	
+F	SYN Cookie hash	tcp.syncookie.hash	FT_UINT24	tcp	BASE_HEX	0x0	
+F	SYN Cookie Timestamp	tcp.options.timestamp.tsval.syncookie.timestamp	FT_UINT32	tcp	BASE_DEC	0x0	
+F	SYN Cookie ECN	tcp.options.timestamp.tsval.syncookie.ecn	FT_BOOLEAN	tcp	0	0x0	
+F	SYN Cookie SACK	tcp.options.timestamp.tsval.syncookie.sack	FT_BOOLEAN	tcp	0	0x0	
+F	SYN Cookie WScale	tcp.options.timestamp.tsval.syncookie.wscale	FT_UINT8	tcp	BASE_DEC	0x0	
+F	NetScaler TCP Reset Window Error Code	tcp.nstrace.rst.window_error_code	FT_STRING	tcp		0x0	
+F	Client Contiguous Streams	tcp.stream.client.contiguity_count	FT_UINT32	tcp	BASE_DEC	0x0	Number of contiguous streams for the client flow once all TCP packets are parsed
+F	Server Contiguous Streams	tcp.stream.server.contiguity_count	FT_UINT32	tcp	BASE_DEC	0x0	Number of contiguous streams for the server flow once all TCP packets are parsed
+F	Invalid length for option	tcp.option.len.invalid	FT_NONE	tcp		0x0	
+F	This frame is a (suspected) retransmission	tcp.analysis.retransmission	FT_NONE	tcp		0x0	
+F	This frame is a (suspected) fast retransmission	tcp.analysis.fast_retransmission	FT_NONE	tcp		0x0	
+F	This frame is a (suspected) spurious retransmission	tcp.analysis.spurious_retransmission	FT_NONE	tcp		0x0	
+F	This frame is a (suspected) out-of-order segment	tcp.analysis.out_of_order	FT_NONE	tcp		0x0	
+F	A new tcp session is started with the same ports as an earlier session in this trace	tcp.analysis.reused_ports	FT_NONE	tcp		0x0	
+F	Previous segment(s) not captured (common at capture start)	tcp.analysis.lost_segment	FT_NONE	tcp		0x0	
+F	ACKed segment that wasn't captured (common at capture start)	tcp.analysis.ack_lost_segment	FT_NONE	tcp		0x0	
+F	TCP window update	tcp.analysis.window_update	FT_NONE	tcp		0x0	
+F	TCP window specified by the receiver is now completely full	tcp.analysis.window_full	FT_NONE	tcp		0x0	
+F	TCP keep-alive segment	tcp.analysis.keep_alive	FT_NONE	tcp		0x0	
+F	ACK to a TCP keep-alive segment	tcp.analysis.keep_alive_ack	FT_NONE	tcp		0x0	
+F	TCP Zero Window Probe	tcp.analysis.zero_window_probe	FT_NONE	tcp		0x0	
+F	TCP Zero Window segment	tcp.analysis.zero_window	FT_NONE	tcp		0x0	
+F	ACK to a TCP Zero Window Probe	tcp.analysis.zero_window_probe_ack	FT_NONE	tcp		0x0	
+F	TCP SYN with TFO Cookie	tcp.analysis.tfo_syn	FT_NONE	tcp		0x0	
+F	TCP SYN-ACK accepting TFO data	tcp.analysis.tfo_ack	FT_NONE	tcp		0x0	
+F	TCP SYN-ACK ignoring TFO data	tcp.analysis.tfo_ignored	FT_NONE	tcp		0x0	
+F	Partial Acknowledgement of a segment	tcp.analysis.partial_ack	FT_NONE	tcp		0x0	
+F	Ambiguous ACK following Karn's definition	tcp.analysis.ambiguous_ack	FT_NONE	tcp		0x0	
+F	This frame initiates the connection closing	tcp.connection.fin_active	FT_NONE	tcp		0x0	
+F	This frame undergoes the connection closing	tcp.connection.fin_passive	FT_NONE	tcp		0x0	
+F	Connection establish acknowledge (SYN+ACK): SCPS Capabilities Negotiated	tcp.analysis.scps_capable	FT_NONE	tcp		0x0	
+F	D-SACK Sequence	tcp.options.sack.dsack	FT_NONE	tcp		0x0	
+F	SNACK Sequence	tcp.options.snack.sequence	FT_NONE	tcp		0x0	
+F	Window scale shift exceeds 14	tcp.options.wscale.shift.invalid	FT_NONE	tcp		0x0	
+F	The SYN packet does not contain a MSS option	tcp.options.mss.absent	FT_NONE	tcp		0x0	
+F	The non-SYN packet does contain a MSS option	tcp.options.mss.present	FT_NONE	tcp		0x0	
+F	This packet's length exceeds MSS (common with TSO or incomplete conversations)	tcp.options.mss.exceeded	FT_NONE	tcp		0x0	
+F	The SYN packet does not contain a SACK PERM option	tcp.options.sack_perm.absent	FT_NONE	tcp		0x0	
+F	The non-SYN packet does contain a SACK PERM option	tcp.options.sack_perm.present	FT_NONE	tcp		0x0	
+F	Short segment	tcp.short_segment	FT_NONE	tcp		0x0	
+F	The acknowledgment number field is nonzero while the ACK flag is not set	tcp.ack.nonzero	FT_NONE	tcp		0x0	
+F	Connection establish acknowledge (SYN+ACK)	tcp.connection.synack	FT_NONE	tcp		0x0	
+F	Connection establish request (SYN)	tcp.connection.syn	FT_NONE	tcp		0x0	
+F	Connection finish (FIN)	tcp.connection.fin	FT_NONE	tcp		0x0	
+F	Connection reset (RST)	tcp.connection.rst	FT_NONE	tcp		0x0	
+F	TCP Checksum 0xffff instead of 0x0000 (see RFC 1624)	tcp.checksum.ffff	FT_NONE	tcp		0x0	
+F	Partial (pseudo header) checksum (likely caused by "TCP checksum offload")	tcp.checksum.partial	FT_NONE	tcp		0x0	
+F	Bad checksum	tcp.checksum_bad.expert	FT_NONE	tcp		0x0	
+F	The urgent pointer field is nonzero while the URG flag is not set	tcp.urgent_pointer.non_zero	FT_NONE	tcp		0x0	
+F	suboption would go past end of option	tcp.suboption_malformed	FT_NONE	tcp		0x0	
+F	4 NOP in a row - a router may have removed some options	tcp.nop	FT_NONE	tcp		0x0	
+F	Non zero bytes in option space after EOL option	tcp.non_zero_bytes_after_eol	FT_NONE	tcp		0x0	
+F	Bogus TCP Header length	tcp.bogus_header_length	FT_NONE	tcp		0x0	
+F	The echoed key in the ACK of the MPTCP handshake does not match the key of the SYN/ACK	mptcp.connection.echoed_key_mismatch	FT_NONE	tcp		0x0	
+F	No crypto algorithm specified	mptcp.connection.missing_algorithm	FT_NONE	tcp		0x0	
+F	Unsupported algorithm	mptcp.connection.unsupported_algorithm	FT_NONE	tcp		0x0	
+F	Fallback to infinite mapping	mptcp.dss.infinite_mapping	FT_NONE	tcp		0x0	
+F	No mapping available	mptcp.dss.missing_mapping	FT_NONE	tcp		0x0	
+P	TPKT - ISO on TCP - RFC1006	tpkt
+F	Version	tpkt.version	FT_UINT16	tpkt	BASE_DEC	0x0	Version, only version 3 is defined
+F	Reserved	tpkt.reserved	FT_UINT8	tpkt	BASE_DEC	0x0	Reserved, should be 0
+F	Length	tpkt.length	FT_UINT16	tpkt	BASE_DEC	0x0	Length of data unit, including this header
+F	Continuation data	tpkt.continuation_data	FT_BYTES	tpkt		0x0	
+P	TPKT Heuristic (for RDP)	tpkt
+P	User Datagram Protocol	udp
+F	Source Port	udp.srcport	FT_UINT16	udp	BASE_PT_UDP	0x0	
+F	Destination Port	udp.dstport	FT_UINT16	udp	BASE_PT_UDP	0x0	
+F	Source or Destination Port	udp.port	FT_UINT16	udp	BASE_PT_UDP	0x0	
+F	Stream index	udp.stream	FT_UINT32	udp	BASE_DEC	0x0	
+F	Stream Packet Number	udp.stream.pnum	FT_UINT32	udp	BASE_DEC	0x0	Relative packet number in this UDP stream
+F	Length	udp.length	FT_UINT16	udp	BASE_DEC	0x0	Length in octets including this header and the data
+F	Checksum	udp.checksum	FT_UINT16	udp	BASE_HEX	0x0	Details at: https://www.wireshark.org/docs/wsug_html_chunked/ChAdvChecksums.html
+F	Calculated Checksum	udp.checksum_calculated	FT_UINT16	udp	BASE_HEX	0x0	The expected UDP checksum field as calculated from the UDP packet
+F	Checksum Status	udp.checksum.status	FT_UINT8	udp	BASE_NONE	0x0	
+F	Source process user ID	udp.proc.srcuid	FT_UINT32	udp	BASE_DEC	0x0	
+F	Source process ID	udp.proc.srcpid	FT_UINT32	udp	BASE_DEC	0x0	
+F	Source process user name	udp.proc.srcuname	FT_STRING	udp		0x0	
+F	Source process name	udp.proc.srccmd	FT_STRING	udp		0x0	Source process command name
+F	Destination process user ID	udp.proc.dstuid	FT_UINT32	udp	BASE_DEC	0x0	
+F	Destination process ID	udp.proc.dstpid	FT_UINT32	udp	BASE_DEC	0x0	
+F	Destination process user name	udp.proc.dstuname	FT_STRING	udp		0x0	
+F	Destination process name	udp.proc.dstcmd	FT_STRING	udp		0x0	Destination process command name
+F	PDU Size	udp.pdu.size	FT_UINT32	udp	BASE_DEC	0x0	The size of this PDU
+F	Time since first frame	udp.time_relative	FT_RELATIVE_TIME	udp		0x0	Time relative to first frame in this UDP stream
+F	Time since previous frame	udp.time_delta	FT_RELATIVE_TIME	udp		0x0	Time delta from previous frame in this UDP stream
+F	Payload	udp.payload	FT_BYTES	udp		0x0	
+F	Possible traceroute	udp.possible_traceroute	FT_NONE	udp		0x0	
+F	Bad length value	udp.length.bad	FT_NONE	udp		0x0	
+F	Bad checksum coverage length value	udplite.checksum_coverage.bad	FT_NONE	udp		0x0	
+F	Illegal checksum value (0)	udp.checksum.zero	FT_NONE	udp		0x0	
+F	Partial (pseudo header) checksum (likely caused by "UDP checksum offload")	udp.checksum.partial	FT_NONE	udp		0x0	
+F	Bad checksum	udp.checksum.bad	FT_NONE	udp		0x0	
+F	Length is zero but payload < 65536	udp.length.bad_zero	FT_NONE	udp		0x0	
