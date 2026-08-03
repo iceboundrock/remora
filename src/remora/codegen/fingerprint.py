@@ -245,13 +245,17 @@ def parse_tshark_version(version_output: str) -> str:
 
 
 def find_tshark(explicit: str | None = None) -> str:
-    """Resolve tshark: explicit path, then $TSHARK, then PATH, then Homebrew."""
+    """Resolve tshark: explicit path, then $TSHARK, then PATH, then Homebrew.
+
+    Raises FileNotFoundError (an OSError, so :func:`main` reports it as an
+    environment error) if the resolved candidate is not an existing file.
+    """
     candidate = (
         explicit or os.environ.get("TSHARK") or shutil.which("tshark") or "/opt/homebrew/bin/tshark"
     )
     if not Path(candidate).is_file():
-        raise SystemExit(
-            f"error: tshark not found at {candidate!r}; install tshark "
+        raise FileNotFoundError(
+            f"tshark not found at {candidate!r}; install tshark "
             "or point the TSHARK environment variable at the binary"
         )
     return candidate
@@ -264,6 +268,16 @@ def _tshark_environment(tshark: str) -> tuple[str, str, str]:
         return subprocess.run([tshark, *args], check=True, capture_output=True, text=True).stdout
 
     return run("--version"), run("-G", "fields"), run("-G", "plugins")
+
+
+def _environment_error_message(error: Exception) -> str:
+    """Render an environment failure as one diagnosable line (no traceback)."""
+    if isinstance(error, subprocess.CalledProcessError):
+        command = error.cmd if isinstance(error.cmd, str) else " ".join(str(a) for a in error.cmd)
+        stderr_lines = (error.stderr or "").strip().splitlines()
+        detail = stderr_lines[-1] if stderr_lines else "no stderr output"
+        return f"`{command}` failed with exit {error.returncode}: {detail}"
+    return str(error)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -284,8 +298,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"error: {error}", file=sys.stderr)
         return 2
 
-    version_output, fields_dump, plugins_dump = _tshark_environment(find_tshark(options.tshark))
-    installed = parse_tshark_version(version_output)
+    try:
+        version_output, fields_dump, plugins_dump = _tshark_environment(find_tshark(options.tshark))
+        installed = parse_tshark_version(version_output)
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        print(f"error: {_environment_error_message(error)}", file=sys.stderr)
+        return 2
     if installed != config.tshark_version:
         print(
             f"error: installed tshark {installed} does not match the pinned "
@@ -305,6 +323,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     proto_dir = Path(options.proto_dir)
     if options.command == "write":
+        proto_dir.mkdir(parents=True, exist_ok=True)
         for artifact in artifacts:
             (proto_dir / artifact.name).write_text(artifact.content, encoding="utf-8")
             print(f"wrote {proto_dir / artifact.name}")

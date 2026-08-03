@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -334,3 +335,63 @@ class TestMain:
         )
         assert main(self._argv("check", config_file, proto_dir)) == 0
         assert "0" in capsys.readouterr().out
+
+    def test_missing_tshark_exits_2(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        config_file, proto_dir = self._prepare(tmp_path, monkeypatch)
+        missing = str(tmp_path / "nonexistent" / "tshark")
+        argv = [*self._argv("check", config_file, proto_dir), "--tshark", missing]
+        assert main(argv) == 2
+        captured = capsys.readouterr()
+        assert "error:" in captured.err
+        assert "tshark not found" in captured.err
+        assert missing in captured.err
+
+    def test_failing_tshark_exits_2(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        config_file, proto_dir = self._prepare(tmp_path, monkeypatch)
+
+        def explode(tshark: str) -> tuple[str, str, str]:
+            raise subprocess.CalledProcessError(
+                2, [tshark, "-G", "fields"], output="", stderr="tshark: bad dissector\n"
+            )
+
+        monkeypatch.setattr(fingerprint_module, "_tshark_environment", explode)
+        assert main(self._argv("check", config_file, proto_dir)) == 2
+        captured = capsys.readouterr()
+        assert "error:" in captured.err
+        assert "-G fields" in captured.err
+        assert "bad dissector" in captured.err
+
+    def test_unparsable_version_exits_2(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        config_file, proto_dir = self._prepare(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            fingerprint_module,
+            "_tshark_environment",
+            lambda tshark: ("not tshark output at all\n", SAMPLE_DUMP, ""),
+        )
+        assert main(self._argv("check", config_file, proto_dir)) == 2
+        captured = capsys.readouterr()
+        assert "error:" in captured.err
+        assert "version" in captured.err
+
+    def test_write_creates_missing_proto_dir(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        config_file, proto_dir = self._prepare(tmp_path, monkeypatch)
+        fresh = proto_dir / "nested" / "generated"
+        argv = [
+            "write",
+            "--config",
+            str(config_file),
+            "--proto-dir",
+            str(fresh),
+        ]
+        assert main(argv) == 0
+        assert (fresh / "udp.py").is_file()
+        assert (fresh / "udp.pyi").is_file()
+        capsys.readouterr()
