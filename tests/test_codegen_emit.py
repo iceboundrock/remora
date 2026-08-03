@@ -189,6 +189,26 @@ class TestEmitEdgeCases:
         assert all(len(line) <= 100 for line in emitted.py_source.splitlines())
         ast.parse(emitted.py_source)
 
+    def test_backslash_heavy_name_stays_within_line_limit(self) -> None:
+        proto = Protocol(name="\\" * 100, abbrev="bs")
+        emitted = emit_protocol(proto, [make_field("bs.x", "FT_UINT8", "bs")])
+        assert all(len(line) <= 100 for line in emitted.py_source.splitlines())
+        tree = ast.parse(emitted.py_source)
+        class_def = next(node for node in tree.body if isinstance(node, ast.ClassDef))
+        docstring = ast.get_docstring(class_def)
+        assert docstring is not None
+        assert docstring.replace("\n", "").replace(" ", "").startswith("\\" * 100)
+
+    def test_quote_heavy_name_stays_within_line_limit(self) -> None:
+        proto = Protocol(name='"' * 95, abbrev="qq")
+        emitted = emit_protocol(proto, [make_field("qq.x", "FT_UINT8", "qq")])
+        assert all(len(line) <= 100 for line in emitted.py_source.splitlines())
+        tree = ast.parse(emitted.py_source)
+        class_def = next(node for node in tree.body if isinstance(node, ast.ClassDef))
+        docstring = ast.get_docstring(class_def)
+        assert docstring is not None
+        assert '"' * 95 in docstring.replace("\n", "").replace(" ", "")
+
 
 class TestDeterminism:
     def test_two_runs_are_byte_identical(self) -> None:

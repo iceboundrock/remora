@@ -41,7 +41,6 @@ committed.
 from __future__ import annotations
 
 import keyword
-import textwrap
 from collections.abc import Sequence, Set
 from dataclasses import dataclass
 
@@ -119,14 +118,45 @@ def _resolve_attrs(
     return attrs, warnings
 
 
+def _wrap_escaped(text: str, width: int) -> list[str]:
+    """Greedy word-wrap of ``text``, measured on the *escaped* width.
+
+    Lines are assembled from atomic per-character escape units, so a
+    ``\\\\`` / ``\\"`` escape pair is never split across lines; a word whose
+    escaped form exceeds ``width`` is broken at unit boundaries. Runs of
+    whitespace collapse to single spaces (as ``textwrap.wrap`` did).
+    """
+    lines: list[str] = []
+    line = ""
+    for word in text.split():
+        escaped = _escape(word)
+        candidate = f"{line} {escaped}" if line else escaped
+        if len(candidate) <= width:
+            line = candidate
+            continue
+        if line:
+            lines.append(line)
+        line = ""
+        if len(escaped) <= width:
+            line = escaped
+            continue
+        for ch in word:
+            unit = _escape(ch)
+            if len(line) + len(unit) > width:
+                lines.append(line)
+                line = ""
+            line += unit
+    if line:
+        lines.append(line)
+    return lines
+
+
 def _class_docstring(protocol: Protocol) -> list[str]:
-    """Class docstring lines, wrapped so no emitted line exceeds 100 chars."""
+    """Class docstring lines; width is budgeted on the emitted, escaped text."""
     text = f"{protocol.name} (tshark layer ``{protocol.abbrev}``)."
-    # Wrap first, escape after: escaping first lets textwrap split a ``\\`` escape
-    # sequence, leaving a line ending in a lone backslash (a line continuation).
-    wrapped = [_escape(line) for line in textwrap.wrap(text, width=92)]
-    if len(wrapped) <= 1:
-        return [f'    """{_escape(text)}"""']
+    wrapped = _wrap_escaped(text, width=92)
+    if len(wrapped) == 1 and len(wrapped[0]) <= 90:
+        return [f'    """{wrapped[0]}"""']
     return [f'    """{wrapped[0]}', *(f"    {line}" for line in wrapped[1:]), '    """']
 
 
