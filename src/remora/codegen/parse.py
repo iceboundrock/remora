@@ -14,7 +14,7 @@ Robustness policy — no line is ever silently dropped:
   *first* occurrence wins; every later duplicate is skipped and recorded as
   a warning. Input line order makes this deterministic. Real dumps contain
   duplicate protocol abbrevs (e.g. ``tpkt`` in tshark 4.6.x).
-- Blank lines are skipped silently.
+- Blank lines (empty or whitespace-only) are skipped silently.
 
 The bitmask and blurb columns are currently not modeled (nothing consumes
 them); ``base`` keeps the raw text of the display-base column, which may be
@@ -81,7 +81,7 @@ def parse_fields_dump(text: str) -> FieldDictionary:
     seen_fields: set[str] = set()
 
     for line_no, line in enumerate(text.splitlines(), start=1):
-        if not line:
+        if not line.strip():
             continue
         columns = line.split("\t")
         tag = columns[0]

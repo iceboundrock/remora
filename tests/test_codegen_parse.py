@@ -51,6 +51,13 @@ class TestRecordParsing:
         assert len(result.protocols) == 1
         assert result.warnings == ()
 
+    def test_whitespace_only_lines_skipped_silently(self) -> None:
+        # Regression: "   " used to be parsed as tag "   " and warned as an
+        # unknown record type; blank means empty OR whitespace-only.
+        result = parse_fields_dump("   \n\t\n \t \n" + P_DNS + "\n")
+        assert len(result.protocols) == 1
+        assert result.warnings == ()
+
 
 class TestWarnings:
     def test_unknown_record_type_collected_not_dropped(self) -> None:
