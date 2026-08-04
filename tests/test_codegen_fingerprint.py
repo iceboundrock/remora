@@ -159,8 +159,9 @@ class TestLoadConfig:
     def test_repo_config_is_loadable_and_empty(self) -> None:
         config = load_config(Path(__file__).parent.parent / "codegen.toml")
         assert config.tshark_version
-        assert config.protocols == ()
-        assert config.multi == frozenset()
+        # Issue #19 core protocol set: 30 protocols, 22 multi fields (M1 seed set + ipv6.addr + sctp.port)
+        assert len(config.protocols) == 30
+        assert len(config.multi) == 22
 
 
 def _config(**overrides: object) -> CodegenConfig:
