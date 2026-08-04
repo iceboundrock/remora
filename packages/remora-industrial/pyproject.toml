@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "remora-industrial"
+version = "0.1.0"
+description = "Industrial-protocol tables for remora (modbus, mbtcp, dnp3, …)"
+requires-python = ">=3.10"
+authors = [{ name = "Ruoshi Li", email = "iceboundrock@gmail.com" }]
+dependencies = ["remora==0.1.0"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/remora"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/remora"]
+
+[tool.uv.sources]
+remora = { workspace = true }

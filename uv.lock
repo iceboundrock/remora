@@ -6,6 +6,14 @@ resolution-markers = [
     "python_full_version < '3.15'",
 ]
 
+[manifest]
+members = [
+    "remora",
+    "remora-industrial",
+    "remora-telecom",
+    "remora-wireless",
+]
+
 [[package]]
 name = "ast-serialize"
 version = "0.6.0"
@@ -295,26 +303,90 @@ dependencies = [
     { name = "tomli", marker = "python_full_version < '3.11'" },
 ]
 
+[package.optional-dependencies]
+all = [
+    { name = "remora-industrial" },
+    { name = "remora-telecom" },
+    { name = "remora-wireless" },
+]
+industrial = [
+    { name = "remora-industrial" },
+]
+telecom = [
+    { name = "remora-telecom" },
+]
+wireless = [
+    { name = "remora-wireless" },
+]
+
 [package.dev-dependencies]
 dev = [
     { name = "mypy" },
     { name = "pytest" },
+    { name = "remora-industrial" },
+    { name = "remora-telecom" },
+    { name = "remora-wireless" },
     { name = "ruff" },
     { name = "tomli" },
     { name = "typing-extensions" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "tomli", marker = "python_full_version < '3.11'", specifier = ">=2.0" }]
+requires-dist = [
+    { name = "remora-industrial", marker = "extra == 'all'", editable = "packages/remora-industrial" },
+    { name = "remora-industrial", marker = "extra == 'industrial'", editable = "packages/remora-industrial" },
+    { name = "remora-telecom", marker = "extra == 'all'", editable = "packages/remora-telecom" },
+    { name = "remora-telecom", marker = "extra == 'telecom'", editable = "packages/remora-telecom" },
+    { name = "remora-wireless", marker = "extra == 'all'", editable = "packages/remora-wireless" },
+    { name = "remora-wireless", marker = "extra == 'wireless'", editable = "packages/remora-wireless" },
+    { name = "tomli", marker = "python_full_version < '3.11'", specifier = ">=2.0" },
+]
+provides-extras = ["wireless", "industrial", "telecom", "all"]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "mypy", specifier = ">=1.14" },
     { name = "pytest", specifier = ">=8.0" },
+    { name = "remora-industrial", editable = "packages/remora-industrial" },
+    { name = "remora-telecom", editable = "packages/remora-telecom" },
+    { name = "remora-wireless", editable = "packages/remora-wireless" },
     { name = "ruff", specifier = ">=0.9" },
     { name = "tomli", specifier = ">=2.0" },
     { name = "typing-extensions", specifier = ">=4.4" },
 ]
+
+[[package]]
+name = "remora-industrial"
+version = "0.1.0"
+source = { editable = "packages/remora-industrial" }
+dependencies = [
+    { name = "remora" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "remora", editable = "." }]
+
+[[package]]
+name = "remora-telecom"
+version = "0.1.0"
+source = { editable = "packages/remora-telecom" }
+dependencies = [
+    { name = "remora" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "remora", editable = "." }]
+
+[[package]]
+name = "remora-wireless"
+version = "0.1.0"
+source = { editable = "packages/remora-wireless" }
+dependencies = [
+    { name = "remora" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "remora", editable = "." }]
 
 [[package]]
 name = "ruff"

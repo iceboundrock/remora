@@ -30,6 +30,16 @@ classifiers = [
 Homepage = "https://github.com/iceboundrock/remora"
 Issues = "https://github.com/iceboundrock/remora/issues"
 
+[project.optional-dependencies]
+wireless = ["remora-wireless==0.1.0"]
+industrial = ["remora-industrial==0.1.0"]
+telecom = ["remora-telecom==0.1.0"]
+all = [
+    "remora-wireless==0.1.0",
+    "remora-industrial==0.1.0",
+    "remora-telecom==0.1.0",
+]
+
 [project.scripts]
 psdsl = "remora.codegen.cli:main"
 
@@ -40,7 +50,18 @@ dev = [
     "ruff>=0.9",
     "tomli>=2.0",
     "typing-extensions>=4.4",
+    "remora-wireless",
+    "remora-industrial",
+    "remora-telecom",
 ]
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv.sources]
+remora-wireless = { workspace = true }
+remora-industrial = { workspace = true }
+remora-telecom = { workspace = true }
 
 [tool.ruff]
 line-length = 100

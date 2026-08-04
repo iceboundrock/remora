@@ -12,6 +12,20 @@ import pytest
 
 import remora.proto
 from remora.proto._extras import EXTRAS_MODULES
+from remora.proto._meta import ProtocolBase
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    import tomli as tomllib
+
+REPO = Path(__file__).resolve().parents[1]
+EXTRA_NAMES = ("wireless", "industrial", "telecom")
+
+
+def _toml(path: Path) -> dict[str, object]:
+    with path.open("rb") as handle:
+        return tomllib.load(handle)
 
 
 def test_extras_map_has_the_seed_assignments() -> None:
@@ -64,3 +78,42 @@ def test_extras_merge_when_packages_src_on_path() -> None:
         env=env,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_codegen_extras_match_fixed_extra_names() -> None:
+    config = _toml(REPO / "codegen.toml")
+    extras = config["extras"]
+    assert isinstance(extras, dict)
+    assert tuple(extras) == EXTRA_NAMES
+
+
+def test_optional_dependencies_cover_every_extra_and_all_is_the_union() -> None:
+    project = _toml(REPO / "pyproject.toml")["project"]
+    assert isinstance(project, dict)
+    version = project["version"]
+    optional = project["optional-dependencies"]
+    assert isinstance(optional, dict)
+    assert set(optional) == {*EXTRA_NAMES, "all"}
+    for extra in EXTRA_NAMES:
+        assert optional[extra] == [f"remora-{extra}=={version}"]
+    assert sorted(optional["all"]) == sorted(f"remora-{extra}=={version}" for extra in EXTRA_NAMES)
+
+
+def test_extras_dists_pin_core_and_share_its_version() -> None:
+    core = _toml(REPO / "pyproject.toml")["project"]
+    assert isinstance(core, dict)
+    version = core["version"]
+    for extra in EXTRA_NAMES:
+        project = _toml(REPO / "packages" / f"remora-{extra}" / "pyproject.toml")["project"]
+        assert isinstance(project, dict)
+        assert project["name"] == f"remora-{extra}"
+        assert project["version"] == version
+        assert project["dependencies"] == [f"remora=={version}"]
+
+
+def test_installed_extra_resolves_through_proto_getattr() -> None:
+    """The dev environment installs the extras, so ``WLAN`` resolves for real."""
+    wlan_cls = remora.proto.WLAN
+    assert isinstance(wlan_cls, type)
+    assert issubclass(wlan_cls, ProtocolBase)
+    assert wlan_cls._proto_ == "wlan"
