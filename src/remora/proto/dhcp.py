@@ -270,7 +270,7 @@ class DHCP(ProtocolBase):
         "option_isns_administrative_flags_management_scns": ("dhcp.option.isns.administrative_flags.management_scns", "FT_BOOLEAN", 0),
         "option_rfc3825_map_datum": ("dhcp.option.rfc3825.map_datum", "FT_UINT8", 0),
         "option_mask_supplier": ("dhcp.option.mask_supplier", "FT_BOOLEAN", 0),
-        "option_classless_static_route": ("dhcp.option.classless_static.route", "FT_NONE", 0),
+        "option_classless_static_route": ("dhcp.option.classless_static_route", "FT_BYTES", 0),
         "option_dhcp_max_message_size": ("dhcp.option.dhcp_max_message_size", "FT_UINT16", 0),
         "option_max_datagram_reassembly_size": ("dhcp.option.max_datagram_reassembly_size", "FT_UINT16", 0),
         "option_merit_dump_file": ("dhcp.option.merit_dump_file", "FT_STRINGZ", 0),

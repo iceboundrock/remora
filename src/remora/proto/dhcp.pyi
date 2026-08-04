@@ -263,7 +263,7 @@ class DHCP(ProtocolBase):
     option_isns_administrative_flags_management_scns: Field[bool]
     option_rfc3825_map_datum: Field[int]
     option_mask_supplier: Field[bool]
-    option_classless_static_route: Field[str]
+    option_classless_static_route: Field[bytes]
     option_dhcp_max_message_size: Field[int]
     option_max_datagram_reassembly_size: Field[int]
     option_merit_dump_file: Field[str]
