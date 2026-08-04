@@ -88,6 +88,16 @@ class TestGen:
         assert main(["gen", "--protocols", "udp", "--out", str(tmp_path / "gen")]) == 0
         assert "warning:" in capsys.readouterr().err
 
+    def test_unwritable_out_dir_exits_2(
+        self, tmp_path: Path, fake_tshark: None, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        gen_file = tmp_path / "gen"
+        gen_file.write_text("", encoding="utf-8")
+        out = gen_file / "sub"
+        assert main(["gen", "--protocols", "udp", "--out", str(out)]) == 2
+        captured = capsys.readouterr()
+        assert "error:" in captured.err
+
 
 class TestHelp:
     def test_gen_help_documents_every_flag(self, capsys: pytest.CaptureFixture[str]) -> None:

@@ -94,10 +94,14 @@ def _cmd_gen(options: argparse.Namespace) -> int:
             print(f"warning: {warning.abbrev}: {warning.message}", file=sys.stderr)
 
     out_dir = Path(options.out)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    for artifact in artifacts:
-        (out_dir / artifact.name).write_text(artifact.content, encoding="utf-8")
-        print(f"wrote {out_dir / artifact.name}")
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for artifact in artifacts:
+            (out_dir / artifact.name).write_text(artifact.content, encoding="utf-8")
+            print(f"wrote {out_dir / artifact.name}")
+    except OSError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
     print(f"wrote {len(artifacts)} artifact(s) under tshark {version}")
     return 0
 
