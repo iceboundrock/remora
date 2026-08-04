@@ -4,7 +4,17 @@ Extras-only protocols (codegen.toml ``[extras]``) resolve through
 ``__getattr__``: installed extras import transparently; missing ones raise an
 ImportError naming the extra to install. ``__path__`` is pkgutil-extended so
 extras distributions merge into this package from any sys.path root (wheel
-installs share the directory; editable installs contribute their own).
+installs share the directory; editable installs contribute their own). That
+merge only works in tandem with the matching ``extend_path`` call in
+``remora/__init__.py``: pkgutil resolves a sub-package's portions by walking
+the *parent* package's ``__path__``, so ``remora`` has to be extended first.
+
+Extras reached this way are untyped. A module-level ``__getattr__`` returns
+``object``, which also switches off attribute checking on ``remora.proto`` as a
+whole, so a type checker cannot verify ``remora.proto.WLAN`` (nor catch a typo
+next to it). Import from the submodule — ``from remora.proto.wlan import
+WLAN`` — for full static typing via the generated ``.pyi`` stubs;
+``remora.proto.WLAN`` is the runtime convenience.
 """
 
 from pkgutil import extend_path
@@ -80,17 +90,19 @@ __all__ = [
 def __getattr__(name: str) -> object:
     module_name = name.lower()
     extra = EXTRAS_MODULES.get(module_name)
-    if extra is None:
+    # Only the two spellings the package itself would bind: the module name
+    # (``wlan``) and the class name (``WLAN``). Anything else is a typo.
+    if extra is None or name not in (module_name, module_name.upper()):
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     import importlib
 
     try:
         module = importlib.import_module(f"{__name__}.{module_name}")
-    except ModuleNotFoundError:
+    except ModuleNotFoundError as exc:
         raise ImportError(
             f"Protocol {module_name!r} is in the {extra!r} extra, which is not "
             f"installed. Install it with: pip install 'remora[{extra}]'"
-        ) from None
+        ) from exc
     if name == module_name:
         return module
     return getattr(module, name)
