@@ -1,9 +1,9 @@
-"""Pairing tests for the hand-written seed protocol modules (issue #13).
+"""Pairing tests for the generated protocol modules (issues #13/#19).
 
-The seed ``.py`` modules are dumb compact tables in the frozen format the M2
-generator (issue #14) will emit; the sibling ``.pyi`` stubs shadow them for
-type checkers. These tests parse each stub with ``ast`` and cross-check it
-against the runtime ``_table_`` in both directions, so the pair cannot drift.
+Originally written against the hand-written M1 seeds, these tests are the
+frozen-format contract and now run against the generated core-set modules:
+each ``.pyi`` stub is parsed with ``ast`` and cross-checked against the
+runtime ``_table_`` in both directions, so the pair cannot drift.
 
 The ``assert_type`` calls are the static half of the acceptance criteria:
 they are verified when mypy checks this file and are no-ops at runtime.
@@ -95,23 +95,6 @@ class TestStubTablePairing:
     def test_every_ftype_is_known(self, module: ModuleType, cls: type[ProtocolBase]) -> None:
         for attr, (_, ftype, _) in cls._table_.items():
             assert ftype in values.FTYPE_TABLE, f"{attr}: unknown ftype {ftype!r}"
-
-    def test_attr_names_follow_seed_naming_convention(
-        self, module: ModuleType, cls: type[ProtocolBase]
-    ) -> None:
-        """The hand-written seeds derive attrs as dots-to-underscores (typo guard).
-
-        This is a convention of the seed modules only, not part of the frozen
-        compact-table format: ``_meta.py`` stores the full tshark name precisely
-        so that generated modules (issue #14) may deviate, e.g. to escape Python
-        keywords (``*.class`` cannot flatten to ``class``). When the M2 emitter
-        replaces the seeds, its output encodes whatever rule it adopts.
-        """
-        prefix = f"{cls._proto_}."
-        for attr, (tshark_name, _, _) in cls._table_.items():
-            assert tshark_name.startswith(prefix), f"{attr}: {tshark_name!r} lacks {prefix!r}"
-            derived = tshark_name.removeprefix(prefix).replace(".", "_")
-            assert attr == derived, f"{attr!r} != derived {derived!r}"
 
     def test_proto_matches_module_name(self, module: ModuleType, cls: type[ProtocolBase]) -> None:
         assert module.__name__.rsplit(".", 1)[-1] == cls._proto_
