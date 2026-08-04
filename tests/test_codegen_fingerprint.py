@@ -17,6 +17,7 @@ from remora.codegen.fingerprint import (
     CodegenConfig,
     Fingerprint,
     add_header,
+    canonicalize_dump,
     check_artifacts,
     generate_artifacts,
     load_config,
@@ -81,6 +82,33 @@ class TestFingerprintValue:
         assert hashed.startswith("plugins=sha256:")
         assert len(hashed) == len("plugins=sha256:") + 12
         assert summarize_env("other\n") != hashed
+
+
+class TestCanonicalizeDump:
+    """tshark shuffles ``-G fields`` between runs; canonicalizing pins it (#68)."""
+
+    def test_sorts_lines(self) -> None:
+        assert canonicalize_dump("c\na\nb\n") == "a\nb\nc\n"
+
+    def test_drops_empty_lines(self) -> None:
+        assert canonicalize_dump("b\n\n   \na\n") == "a\nb\n"
+
+    def test_is_idempotent(self) -> None:
+        once = canonicalize_dump(SAMPLE_DUMP)
+        assert canonicalize_dump(once) == once
+
+    def test_shuffled_dumps_canonicalize_identically(self) -> None:
+        lines = SAMPLE_DUMP.splitlines(keepends=True)
+        shuffled = "".join(reversed(lines))
+        assert shuffled != SAMPLE_DUMP
+        assert canonicalize_dump(shuffled) == canonicalize_dump(SAMPLE_DUMP)
+
+    def test_preserves_the_record_set(self) -> None:
+        assert set(canonicalize_dump(SAMPLE_DUMP).splitlines()) == set(SAMPLE_DUMP.splitlines())
+
+    def test_empty_dump_stays_empty(self) -> None:
+        assert canonicalize_dump("") == ""
+        assert canonicalize_dump("\n  \n") == ""
 
 
 class TestHeader:
@@ -489,6 +517,88 @@ class TestMain:
         assert (fresh / "udp.py").is_file()
         assert (fresh / "udp.pyi").is_file()
         capsys.readouterr()
+
+
+class TestSeamCanonicalizesTheFieldsDump:
+    """End-to-end proof of the #68 fix: dump order cannot reach the artifacts.
+
+    These patch ``_run_tshark`` rather than ``_tshark_dumps`` so the real seam —
+    the one that canonicalizes — actually runs.
+    """
+
+    # Same three records as SAMPLE_DUMP, emitted in a different order, as tshark
+    # is free to do between two runs of one binary.
+    SHUFFLED_DUMP = (
+        "F\tStream index\tudp.stream\tFT_UINT32\tudp\tBASE_DEC\t0x0\t\n"
+        "F\tSource Port\tudp.srcport\tFT_UINT16\tudp\tBASE_PT_UDP\t0x0\t\n"
+        "P\tUser Datagram Protocol\tudp\n"
+    )
+
+    def _patch_tshark(self, monkeypatch: pytest.MonkeyPatch, dump: str) -> None:
+        def fake_run(tshark: str, *args: str) -> str:
+            if args == ("--version",):
+                return "TShark (Wireshark) 4.6.6 (Git)."
+            if args == ("-G", "fields"):
+                return dump
+            return ""
+
+        monkeypatch.setattr(fingerprint_module, "_run_tshark", fake_run)
+        monkeypatch.setenv("TSHARK", "/usr/bin/true")
+
+    def _prepare(self, tmp_path: Path) -> tuple[Path, Path]:
+        config_file = tmp_path / "codegen.toml"
+        config_file.write_text(
+            '[tshark]\nversion = "4.6.6"\n[generate]\nprotocols = ["udp"]\nmulti = []\n',
+            encoding="utf-8",
+        )
+        proto_dir = tmp_path / "proto"
+        proto_dir.mkdir()
+        return config_file, proto_dir
+
+    def _argv(self, command: str, config_file: Path, proto_dir: Path) -> list[str]:
+        return [command, "--config", str(config_file), "--proto-dir", str(proto_dir)]
+
+    def test_write_then_check_across_a_reshuffle_stays_in_sync(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Write under one dump order, check under another: no drift (#68)."""
+        assert self.SHUFFLED_DUMP != SAMPLE_DUMP
+        config_file, proto_dir = self._prepare(tmp_path)
+
+        self._patch_tshark(monkeypatch, SAMPLE_DUMP)
+        assert main(self._argv("write", config_file, proto_dir)) == 0
+        capsys.readouterr()
+
+        self._patch_tshark(monkeypatch, self.SHUFFLED_DUMP)
+        assert main(self._argv("check", config_file, proto_dir)) == 0
+        assert "in sync" in capsys.readouterr().out
+
+    def test_shuffled_dumps_produce_byte_identical_artifacts(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Both the fingerprint header and the emitted body are order-independent."""
+        written: list[dict[str, str]] = []
+        for dump in (SAMPLE_DUMP, self.SHUFFLED_DUMP):
+            root = tmp_path / f"run{len(written)}"
+            root.mkdir()
+            config_file, proto_dir = self._prepare(root)
+            self._patch_tshark(monkeypatch, dump)
+            assert main(self._argv("write", config_file, proto_dir)) == 0
+            capsys.readouterr()
+            written.append(
+                {
+                    path.name: path.read_text(encoding="utf-8")
+                    for path in sorted(proto_dir.iterdir())
+                }
+            )
+        assert written[0] == written[1]
+        # And the hash really is over canonical text, not tshark's raw stdout.
+        header = parse_header(written[0]["udp.py"])
+        assert header is not None
+        assert (
+            header.dump_sha256
+            == make_fingerprint(canonicalize_dump(SAMPLE_DUMP), tshark_version="4.6.6").dump_sha256
+        )
 
 
 def test_pyproject_declares_tomli_as_a_runtime_dependency() -> None:

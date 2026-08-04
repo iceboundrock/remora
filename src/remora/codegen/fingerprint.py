@@ -6,9 +6,15 @@ generated file carries a provenance header:
 
     # remora-fingerprint: v1
     # tshark: <version>
-    # dump-sha256: <sha256 of the ``tshark -G fields`` dump, 64 hex>
+    # dump-sha256: <sha256 of the canonicalized ``-G fields`` dump, 64 hex>
     # env: plugins=none | plugins=sha256:<12 hex of the -G plugins dump>
     # generator: remora <version>
+
+``dump-sha256`` covers the *canonicalized* (line-sorted) fields dump, not
+tshark's raw stdout: tshark emits ``-G fields`` records in an order that varies
+between runs of the same binary, so the raw text hashes differently every time
+(issue #68). :func:`canonicalize_dump` is applied once at the ``_tshark_dumps``
+seam, so hashing and parsing both see the same stable text.
 
 The ``env:`` line summarizes only the ``-G plugins`` dump; Lua scripts are not
 separately summarized, because the fields and protocols they register surface
@@ -61,6 +67,20 @@ class Fingerprint:
     dump_sha256: str
     env: str
     generator: str
+
+
+def canonicalize_dump(dump: str) -> str:
+    """Return a ``-G fields`` dump in a stable, order-independent form.
+
+    tshark emits ``-G fields`` records in an order that varies between runs of
+    the *same* binary (issue #68): the record set is stable, the emission order
+    is not. Sorting the non-empty lines makes the text reproducible without
+    changing the record set, so both the fingerprint hash and the parse become
+    deterministic. Idempotent, and safe for :func:`parse_fields_dump`, which
+    scans records independently and never relies on ``P`` preceding its ``F``s.
+    """
+    records = sorted(line for line in dump.splitlines() if line.strip())
+    return "".join(f"{record}\n" for record in records)
 
 
 def summarize_env(plugins_dump: str) -> str:
@@ -289,8 +309,14 @@ def _tshark_version_output(tshark: str) -> str:
 
 
 def _tshark_dumps(tshark: str) -> tuple[str, str]:
-    """Run ``tshark -G fields`` and ``tshark -G plugins``; return both dumps."""
-    return _run_tshark(tshark, "-G", "fields"), _run_tshark(tshark, "-G", "plugins")
+    """Run ``tshark -G fields`` and ``tshark -G plugins``; return both dumps.
+
+    The fields dump is canonicalized here, at the single seam both :func:`main`
+    and ``psdsl gen`` go through, so hashing and parsing downstream can never
+    disagree about the text they saw (issue #68).
+    """
+    fields_dump = _run_tshark(tshark, "-G", "fields")
+    return canonicalize_dump(fields_dump), _run_tshark(tshark, "-G", "plugins")
 
 
 def _environment_error_message(error: Exception) -> str:
