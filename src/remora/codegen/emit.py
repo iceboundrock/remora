@@ -32,10 +32,14 @@ ftype; a ``.pyi`` annotation line is a single attribute annotation and
 cannot be wrapped at all. The five seed protocols (eth/ip/tcp/udp/dns) are
 lint-clean, but arbitrary ``tshark -G fields`` dumps are not — roughly a
 quarter of real protocols emit at least one over-long line. Entries stay on
-one line by design; the lint policy for generated trees (per-file E501
-ignores, an exclude, or exploded table entries) is deferred to the
-protocol-shipping issue (#19), where generated modules are actually
-committed.
+one line by design; the shipped tree (issue #19) ignores E501 for
+``src/remora/proto/*`` and excludes the directory from ruff format, so the
+committed bytes match this emitter exactly.
+
+Determinism: output is byte-deterministic *in input field order*, so
+reproducible bytes require the canonicalized dump order produced at the
+``_tshark_dumps`` seam in :mod:`remora.codegen.fingerprint` (issue #68) —
+tshark's own ``-G fields`` emission order varies between runs.
 """
 
 from __future__ import annotations

@@ -16,6 +16,12 @@ between runs of the same binary, so the raw text hashes differently every time
 (issue #68). :func:`canonicalize_dump` is applied once at the ``_tshark_dumps``
 seam, so hashing and parsing both see the same stable text.
 
+The canonicalization is deliberately asymmetric: the ``-G fields`` dump is
+line-sorted before both hashing and parsing, while the ``-G plugins`` dump is
+hashed raw, because its emission order was verified stable (16 lines, identical
+digests across repeated runs of the same binary) — if plugins ordering ever
+drifts, canonicalize it too.
+
 The ``env:`` line summarizes only the ``-G plugins`` dump; Lua scripts are not
 separately summarized, because the fields and protocols they register surface
 through the ``-G fields`` dump itself, so ``dump-sha256`` (not ``env``) is what
