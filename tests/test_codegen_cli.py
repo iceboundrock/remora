@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,11 @@ import pytest
 import remora.codegen.fingerprint as fingerprint_module
 from remora.codegen.cli import main
 from remora.codegen.fingerprint import parse_header
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    import tomli as tomllib
 
 SAMPLE_DUMP = (
     "P\tUser Datagram Protocol\tudp\n"
@@ -113,3 +119,11 @@ class TestHelp:
             main(["--help"])
         assert excinfo.value.code == 0
         assert "gen" in capsys.readouterr().out
+
+
+def test_pyproject_declares_psdsl_console_script() -> None:
+    """The psdsl entry point must target cli.main (issue #21)."""
+    pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    with pyproject.open("rb") as handle:
+        data = tomllib.load(handle)
+    assert data["project"]["scripts"]["psdsl"] == "remora.codegen.cli:main"

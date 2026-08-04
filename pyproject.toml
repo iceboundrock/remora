@@ -30,6 +30,9 @@ classifiers = [
 Homepage = "https://github.com/iceboundrock/remora"
 Issues = "https://github.com/iceboundrock/remora/issues"
 
+[project.scripts]
+psdsl = "remora.codegen.cli:main"
+
 [dependency-groups]
 dev = [
     "mypy>=1.14",
