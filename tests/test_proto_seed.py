@@ -26,19 +26,69 @@ from remora.codegen.mangle import mangle_field
 from remora.expr import Comparison
 from remora.fields import FieldRef, Packet
 from remora.proto import DNS, IP, TCP
+from remora.proto import arp as arp_mod
+from remora.proto import dhcp as dhcp_mod
+from remora.proto import dhcpv6 as dhcpv6_mod
 from remora.proto import dns as dns_mod
 from remora.proto import eth as eth_mod
+from remora.proto import ftp as ftp_mod
+from remora.proto import gre as gre_mod
+from remora.proto import http as http_mod
+from remora.proto import http2 as http2_mod
+from remora.proto import icmp as icmp_mod
+from remora.proto import icmpv6 as icmpv6_mod
+from remora.proto import igmp as igmp_mod
+from remora.proto import imap as imap_mod
 from remora.proto import ip as ip_mod
+from remora.proto import ipv6 as ipv6_mod
+from remora.proto import llc as llc_mod
+from remora.proto import ntp as ntp_mod
+from remora.proto import pop as pop_mod
+from remora.proto import quic as quic_mod
+from remora.proto import rtp as rtp_mod
+from remora.proto import sctp as sctp_mod
+from remora.proto import sip as sip_mod
+from remora.proto import smtp as smtp_mod
+from remora.proto import snmp as snmp_mod
+from remora.proto import ssh as ssh_mod
+from remora.proto import stp as stp_mod
 from remora.proto import tcp as tcp_mod
+from remora.proto import tls as tls_mod
 from remora.proto import udp as udp_mod
+from remora.proto import vlan as vlan_mod
 from remora.proto._meta import ProtocolBase
 
 SEEDS: list[tuple[ModuleType, type[ProtocolBase]]] = [
-    (eth_mod, eth_mod.ETH),
-    (ip_mod, ip_mod.IP),
-    (tcp_mod, tcp_mod.TCP),
-    (udp_mod, udp_mod.UDP),
+    (arp_mod, arp_mod.ARP),
+    (dhcp_mod, dhcp_mod.DHCP),
+    (dhcpv6_mod, dhcpv6_mod.DHCPV6),
     (dns_mod, dns_mod.DNS),
+    (eth_mod, eth_mod.ETH),
+    (ftp_mod, ftp_mod.FTP),
+    (gre_mod, gre_mod.GRE),
+    (http_mod, http_mod.HTTP),
+    (http2_mod, http2_mod.HTTP2),
+    (icmp_mod, icmp_mod.ICMP),
+    (icmpv6_mod, icmpv6_mod.ICMPV6),
+    (igmp_mod, igmp_mod.IGMP),
+    (imap_mod, imap_mod.IMAP),
+    (ip_mod, ip_mod.IP),
+    (ipv6_mod, ipv6_mod.IPV6),
+    (llc_mod, llc_mod.LLC),
+    (ntp_mod, ntp_mod.NTP),
+    (pop_mod, pop_mod.POP),
+    (quic_mod, quic_mod.QUIC),
+    (rtp_mod, rtp_mod.RTP),
+    (sctp_mod, sctp_mod.SCTP),
+    (sip_mod, sip_mod.SIP),
+    (smtp_mod, smtp_mod.SMTP),
+    (snmp_mod, snmp_mod.SNMP),
+    (ssh_mod, ssh_mod.SSH),
+    (stp_mod, stp_mod.STP),
+    (tcp_mod, tcp_mod.TCP),
+    (tls_mod, tls_mod.TLS),
+    (udp_mod, udp_mod.UDP),
+    (vlan_mod, vlan_mod.VLAN),
 ]
 
 seed_params = pytest.mark.parametrize(

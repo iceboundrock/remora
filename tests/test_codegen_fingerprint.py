@@ -191,6 +191,10 @@ class TestLoadConfig:
         # (the M1 seed multi set + ipv6.addr + sctp.port).
         assert len(config.protocols) == 30
         assert len(config.multi) == 22
+        # Spot-check multi membership
+        assert {"ipv6.addr", "sctp.port", "tcp.port", "dns.qry.name"} <= config.multi
+        # Spot-check protocol membership
+        assert "tls" in config.protocols
 
 
 def _config(**overrides: object) -> CodegenConfig:
