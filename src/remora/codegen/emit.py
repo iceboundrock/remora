@@ -25,6 +25,17 @@ per-protocol function with no view of its siblings, so it cannot detect
 module-name collisions; batch callers (#19/#21) MUST dedupe the emitted
 module names across a whole dump.
 
+Field-attr collisions (``dhcp.option.classless_static.route`` and
+``dhcp.option.classless_static_route`` both mangle to
+``option_classless_static_route``) are resolved first-wins, with one
+exception: a non-``FT_NONE`` field displaces an already-selected
+``FT_NONE`` one, in place. ``FT_NONE`` fields are presence-only
+expert/structural markers with no extractable value, so binding the shared
+attr to the data field is always the better trade, and the preference makes
+the winner of a marker/data pair independent of dump ordering. The losing
+field is skipped and recorded as an :class:`EmitWarning`; no collision is
+ever silent.
+
 Line length: emitted lines can exceed the repo's 100-column ruff limit when
 field abbrevs or mangled attr names are long. A ``.py`` table entry line is
 about 20 characters of overhead plus the attr name, the abbrev and the
@@ -99,25 +110,45 @@ def _escape(text: str) -> str:
 def _resolve_attrs(
     protocol: Protocol, fields: Sequence[FieldDef]
 ) -> tuple[list[tuple[str, FieldDef]], list[EmitWarning]]:
-    """Mangle each field to an attr name; first occurrence wins on collision."""
+    """Mangle each field to an attr name; first occurrence wins, data beats ``FT_NONE``.
+
+    ``FT_NONE`` fields are presence-only expert/structural markers carrying no
+    extractable value, so a data field is always the better binding for a
+    shared attr name: a later non-``FT_NONE`` field replaces an already-selected
+    ``FT_NONE`` one, in place, keeping the attr at its original output
+    position. That makes the winner of a marker/data pair independent of dump
+    ordering. Every other collision stays first-wins, and no collision is ever
+    silent — the losing field always gets an :class:`EmitWarning`.
+    """
     attrs: list[tuple[str, FieldDef]] = []
-    first_by_name: dict[str, str] = {}
+    index_by_name: dict[str, int] = {}
     warnings: list[EmitWarning] = []
     for field in fields:
         # Strip against the module's protocol abbrev, not ``field.parent``: the attribute
         # namespace belongs to the module. Fields registered under a different parent
         # (e.g. ``can.len`` under ``acf-can``) keep their full abbrev under either choice.
         attr = mangle_field(field.abbrev, protocol.abbrev)
-        prior = first_by_name.get(attr)
-        if prior is not None:
-            warnings.append(
-                EmitWarning(
-                    field.abbrev,
-                    f"attribute name {attr!r} already taken by {prior!r}; field skipped",
+        prior_index = index_by_name.get(attr)
+        if prior_index is not None:
+            prior = attrs[prior_index][1]
+            if prior.ftype == "FT_NONE" and field.ftype != "FT_NONE":
+                attrs[prior_index] = (attr, field)
+                warnings.append(
+                    EmitWarning(
+                        prior.abbrev,
+                        f"attribute name {attr!r} reassigned to data field "
+                        f"{field.abbrev!r}; FT_NONE marker field skipped",
+                    )
                 )
-            )
+            else:
+                warnings.append(
+                    EmitWarning(
+                        field.abbrev,
+                        f"attribute name {attr!r} already taken by {prior.abbrev!r}; field skipped",
+                    )
+                )
             continue
-        first_by_name[attr] = field.abbrev
+        index_by_name[attr] = len(attrs)
         attrs.append((attr, field))
     return attrs, warnings
 
@@ -257,8 +288,10 @@ def emit_protocol(
     byte-deterministic.
 
     Distinct abbrevs can mangle to the same attribute name (the policy is not
-    injective): the first occurrence wins, later collisions are skipped and
-    recorded as :class:`EmitWarning`s.
+    injective): the first occurrence wins, except that a non-``FT_NONE`` field
+    displaces an already-selected ``FT_NONE`` one (keeping that attr's output
+    position). The losing field is skipped either way and recorded as an
+    :class:`EmitWarning`.
     """
     module_name = mangle_protocol(protocol.abbrev)
     class_name = module_name.upper()

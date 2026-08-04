@@ -151,6 +151,91 @@ class TestEmitEdgeCases:
         assert emitted.warnings[0].abbrev == "bgp.prefix.length"
         assert "prefix_length" in emitted.warnings[0].message
 
+    def test_collision_data_field_displaces_earlier_ft_none_marker(self) -> None:
+        proto = Protocol(name="Dynamic Host Configuration Protocol", abbrev="dhcp")
+        fields = [
+            make_field("dhcp.option.classless_static.route", "FT_NONE", "dhcp"),
+            make_field("dhcp.option.classless_static_route", "FT_BYTES", "dhcp"),
+        ]
+        emitted = emit_protocol(proto, fields)
+        assert (
+            '"option_classless_static_route": ("dhcp.option.classless_static_route", '
+            '"FT_BYTES", 0),' in emitted.py_source
+        )
+        assert "dhcp.option.classless_static.route" not in emitted.py_source
+        assert "    option_classless_static_route: Field[bytes]" in emitted.pyi_source
+        assert len(emitted.warnings) == 1
+        assert emitted.warnings[0].abbrev == "dhcp.option.classless_static.route"
+        assert "option_classless_static_route" in emitted.warnings[0].message
+        assert "dhcp.option.classless_static_route" in emitted.warnings[0].message
+        assert "FT_NONE" in emitted.warnings[0].message
+
+    def test_collision_ft_none_marker_never_displaces_earlier_data_field(self) -> None:
+        proto = Protocol(name="Dynamic Host Configuration Protocol", abbrev="dhcp")
+        fields = [
+            make_field("dhcp.option.classless_static_route", "FT_BYTES", "dhcp"),
+            make_field("dhcp.option.classless_static.route", "FT_NONE", "dhcp"),
+        ]
+        emitted = emit_protocol(proto, fields)
+        assert (
+            '"option_classless_static_route": ("dhcp.option.classless_static_route", '
+            '"FT_BYTES", 0),' in emitted.py_source
+        )
+        assert "dhcp.option.classless_static.route" not in emitted.py_source
+        assert len(emitted.warnings) == 1
+        assert emitted.warnings[0].abbrev == "dhcp.option.classless_static.route"
+        assert "already taken by 'dhcp.option.classless_static_route'" in (
+            emitted.warnings[0].message
+        )
+
+    def test_collision_between_two_data_fields_stays_first_wins(self) -> None:
+        proto = Protocol(name="Border Gateway Protocol", abbrev="bgp")
+        fields = [
+            make_field("bgp.prefix_length", "FT_UINT8", "bgp"),
+            make_field("bgp.prefix.length", "FT_BYTES", "bgp"),
+        ]
+        emitted = emit_protocol(proto, fields)
+        assert '"prefix_length": ("bgp.prefix_length", "FT_UINT8", 0),' in emitted.py_source
+        assert "bgp.prefix.length" not in emitted.py_source
+        assert len(emitted.warnings) == 1
+        assert emitted.warnings[0].abbrev == "bgp.prefix.length"
+        assert "already taken by 'bgp.prefix_length'" in emitted.warnings[0].message
+
+    def test_collision_between_two_ft_none_markers_stays_first_wins(self) -> None:
+        proto = Protocol(name="Border Gateway Protocol", abbrev="bgp")
+        fields = [
+            make_field("bgp.prefix_length", "FT_NONE", "bgp"),
+            make_field("bgp.prefix.length", "FT_NONE", "bgp"),
+        ]
+        emitted = emit_protocol(proto, fields)
+        assert '"prefix_length": ("bgp.prefix_length", "FT_NONE", 0),' in emitted.py_source
+        assert "bgp.prefix.length" not in emitted.py_source
+        assert len(emitted.warnings) == 1
+        assert emitted.warnings[0].abbrev == "bgp.prefix.length"
+        assert "already taken by 'bgp.prefix_length'" in emitted.warnings[0].message
+
+    def test_displacing_data_field_keeps_the_attrs_original_position(self) -> None:
+        proto = Protocol(name="Dynamic Host Configuration Protocol", abbrev="dhcp")
+        fields = [
+            make_field("dhcp.before", "FT_UINT8", "dhcp"),
+            make_field("dhcp.option.classless_static.route", "FT_NONE", "dhcp"),
+            make_field("dhcp.after", "FT_UINT8", "dhcp"),
+            make_field("dhcp.option.classless_static_route", "FT_BYTES", "dhcp"),
+        ]
+        emitted = emit_protocol(proto, fields)
+        table_attrs = [
+            line.strip().split('"')[1]
+            for line in emitted.py_source.splitlines()
+            if line.startswith('        "')
+        ]
+        assert table_attrs == ["before", "option_classless_static_route", "after"]
+        pyi_attrs = [
+            line.strip().split(":")[0]
+            for line in emitted.pyi_source.splitlines()
+            if line.startswith("    ")
+        ]
+        assert pyi_attrs == ["before", "option_classless_static_route", "after"]
+
     def test_keyword_field_attr_is_escaped_in_both_sources(self) -> None:
         proto = Protocol(name="6LoWPAN", abbrev="6lowpan")
         emitted = emit_protocol(proto, [make_field("6lowpan.class", "FT_UINT8", "6lowpan")])
