@@ -51,8 +51,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from remora import __version__
-from remora.codegen.emit import EmitWarning, emit_protocol
-from remora.codegen.parse import ParseWarning, parse_fields_dump
+from remora.codegen.emit import EmitWarning, emit_extras_map, emit_protocol
+from remora.codegen.parse import FieldDictionary, ParseWarning, parse_fields_dump
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -220,10 +220,50 @@ class CheckReport:
     messages: tuple[str, ...]
 
 
+def _emit_protocols(
+    protocols: Sequence[str],
+    dictionary: FieldDictionary,
+    fp: Fingerprint,
+    multi: frozenset[str],
+    module_name_to_abbrev: dict[str, str],
+    warnings: list[ParseWarning | EmitWarning],
+) -> tuple[Artifact, ...]:
+    """Emit one destination's ``.py``/``.pyi`` pairs, appending to the shared state.
+
+    ``module_name_to_abbrev`` and ``warnings`` are accumulators owned by the
+    caller: collision detection has to span every destination, because all of
+    them ultimately land in the one ``remora.proto`` namespace.
+    """
+    by_abbrev = {protocol.abbrev: protocol for protocol in dictionary.protocols}
+    artifacts: list[Artifact] = []
+    for abbrev in protocols:
+        protocol = by_abbrev.get(abbrev)
+        if protocol is None:
+            raise ValueError(f"protocol {abbrev!r} not found in the -G fields dump")
+        fields = [field for field in dictionary.fields if field.parent == abbrev]
+        module = emit_protocol(protocol, fields, multi)
+        if module.module_name in module_name_to_abbrev:
+            prior_abbrev = module_name_to_abbrev[module.module_name]
+            raise ValueError(
+                f"module name {module.module_name!r} collides: protocols {prior_abbrev!r} "
+                f"and {abbrev!r} both mangle to the same name"
+            )
+        module_name_to_abbrev[module.module_name] = abbrev
+        artifacts.append(Artifact(f"{module.module_name}.py", add_header(module.py_source, fp)))
+        artifacts.append(Artifact(f"{module.module_name}.pyi", add_header(module.pyi_source, fp)))
+        warnings.extend(module.warnings)
+    return tuple(artifacts)
+
+
 def generate_artifacts(
     config: CodegenConfig, dump: str, *, plugins_dump: str = ""
 ) -> tuple[tuple[Artifact, ...], tuple[ParseWarning | EmitWarning, ...]]:
     """Emit fingerprinted ``.py``/``.pyi`` pairs for every configured protocol.
+
+    One flat artifact set for ``config.protocols`` only — extras and the
+    ``_extras.py`` map are :func:`generate_distributions`'s business. ``psdsl
+    gen`` (:mod:`remora.codegen.cli`) generates into a single directory and
+    stays on this entry point.
 
     Returns the artifacts and every diagnostic the run produced: the dump's
     :class:`~remora.codegen.parse.ParseWarning`\\ s first (in input-line order),
@@ -237,31 +277,47 @@ def generate_artifacts(
     fingerprint = make_fingerprint(
         dump, tshark_version=config.tshark_version, plugins_dump=plugins_dump
     )
-    by_abbrev = {protocol.abbrev: protocol for protocol in dictionary.protocols}
-    artifacts: list[Artifact] = []
+    warnings: list[ParseWarning | EmitWarning] = list(dictionary.warnings)
+    artifacts = _emit_protocols(
+        config.protocols, dictionary, fingerprint, config.multi, {}, warnings
+    )
+    return artifacts, tuple(warnings)
+
+
+def generate_distributions(
+    config: CodegenConfig, dump: str, *, plugins_dump: str = ""
+) -> tuple[dict[str, tuple[Artifact, ...]], tuple[ParseWarning | EmitWarning, ...]]:
+    """Emit every destination's artifacts: ``"core"`` plus one entry per extra.
+
+    Core always includes ``_extras.py`` — the module → extra map the import hook
+    in ``remora.proto.__init__`` consumes — fingerprinted like every artifact.
+    Module-name collision detection spans all destinations, because everything
+    ultimately shares the one ``remora.proto`` namespace.
+    """
+    dictionary = parse_fields_dump(dump)
+    fingerprint = make_fingerprint(
+        dump, tshark_version=config.tshark_version, plugins_dump=plugins_dump
+    )
     warnings: list[ParseWarning | EmitWarning] = list(dictionary.warnings)
     module_name_to_abbrev: dict[str, str] = {}
-    for abbrev in config.protocols:
-        protocol = by_abbrev.get(abbrev)
-        if protocol is None:
-            raise ValueError(f"protocol {abbrev!r} not found in the -G fields dump")
-        fields = [field for field in dictionary.fields if field.parent == abbrev]
-        module = emit_protocol(protocol, fields, config.multi)
-        if module.module_name in module_name_to_abbrev:
-            prior_abbrev = module_name_to_abbrev[module.module_name]
-            raise ValueError(
-                f"module name {module.module_name!r} collides: protocols {prior_abbrev!r} "
-                f"and {abbrev!r} both mangle to the same name"
-            )
-        module_name_to_abbrev[module.module_name] = abbrev
-        artifacts.append(
-            Artifact(f"{module.module_name}.py", add_header(module.py_source, fingerprint))
+    dists: dict[str, tuple[Artifact, ...]] = {}
+    core = _emit_protocols(
+        config.protocols, dictionary, fingerprint, config.multi, module_name_to_abbrev, warnings
+    )
+    assignments: list[tuple[str, str]] = []
+    for extra_name, protocols in config.extras:
+        before = set(module_name_to_abbrev)
+        dists[extra_name] = _emit_protocols(
+            protocols, dictionary, fingerprint, config.multi, module_name_to_abbrev, warnings
         )
-        artifacts.append(
-            Artifact(f"{module.module_name}.pyi", add_header(module.pyi_source, fingerprint))
+        assignments.extend(
+            (module_name, extra_name)
+            for module_name in module_name_to_abbrev
+            if module_name not in before
         )
-        warnings.extend(module.warnings)
-    return tuple(artifacts), tuple(warnings)
+    extras_map = Artifact("_extras.py", add_header(emit_extras_map(assignments), fingerprint))
+    dists["core"] = (*core, extras_map)
+    return dists, tuple(warnings)
 
 
 def check_artifacts(artifacts: Sequence[Artifact], proto_dir: Path) -> CheckReport:
@@ -367,6 +423,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("command", choices=("check", "write"))
     parser.add_argument("--config", default="codegen.toml", help="path to codegen.toml")
     parser.add_argument("--proto-dir", default="src/remora/proto", help="artifact directory")
+    parser.add_argument("--packages-dir", default="packages", help="extras distribution root")
     parser.add_argument("--tshark", default=None, help="path to the tshark binary")
     options = parser.parse_args(argv)
 
@@ -394,7 +451,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     try:
-        artifacts, warnings = generate_artifacts(config, fields_dump, plugins_dump=plugins_dump)
+        dists, warnings = generate_distributions(config, fields_dump, plugins_dump=plugins_dump)
     except ValueError as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
@@ -405,12 +462,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"warning: {warning.abbrev}: {warning.message}", file=sys.stderr)
 
     proto_dir = Path(options.proto_dir)
+
+    def dest_dir(dest: str) -> Path:
+        if dest == "core":
+            return proto_dir
+        return Path(options.packages_dir) / f"remora-{dest}" / "src" / "remora" / "proto"
+
+    total = sum(len(artifacts) for artifacts in dists.values())
     if options.command == "write":
-        proto_dir.mkdir(parents=True, exist_ok=True)
-        for artifact in artifacts:
-            (proto_dir / artifact.name).write_text(artifact.content, encoding="utf-8")
-            print(f"wrote {proto_dir / artifact.name}")
-        print(f"wrote {len(artifacts)} artifact(s)")
+        for dest, artifacts in dists.items():
+            directory = dest_dir(dest)
+            directory.mkdir(parents=True, exist_ok=True)
+            for artifact in artifacts:
+                (directory / artifact.name).write_text(artifact.content, encoding="utf-8")
+                print(f"wrote {directory / artifact.name}")
+        print(f"wrote {total} artifact(s)")
         return 0
 
     if not proto_dir.is_dir():
@@ -421,18 +487,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 2
 
-    report = check_artifacts(artifacts, proto_dir)
-    if not report.ok:
-        for message in report.messages:
+    messages: list[str] = []
+    for dest, artifacts in dists.items():
+        directory = dest_dir(dest)
+        if not directory.is_dir():
+            messages.append(f"{directory}: missing (regenerate with the write command)")
+            continue
+        messages.extend(check_artifacts(artifacts, directory).messages)
+    if messages:
+        for message in messages:
             print(message, file=sys.stderr)
         print(
-            f"error: {len(report.messages)} artifact problem(s); regenerate with "
+            f"error: {len(messages)} artifact problem(s); regenerate with "
             f"`uv run python -m remora.codegen write` under tshark "
             f"{config.tshark_version}",
             file=sys.stderr,
         )
         return 1
-    print(f"codegen artifacts in sync ({len(artifacts)} artifact(s) checked)")
+    print(f"codegen artifacts in sync ({total} artifact(s) checked)")
     return 0
 
 

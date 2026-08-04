@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -20,6 +21,7 @@ from remora.codegen.fingerprint import (
     canonicalize_dump,
     check_artifacts,
     generate_artifacts,
+    generate_distributions,
     load_config,
     main,
     make_fingerprint,
@@ -437,11 +439,12 @@ class TestMain:
         assert main(self._argv("write", config_file, proto_dir)) == 0
         assert (proto_dir / "udp.py").is_file()
         assert (proto_dir / "udp.pyi").is_file()
+        assert (proto_dir / "_extras.py").is_file()  # core always ships the extras map
         capsys.readouterr()  # drain the write output so the check assertions cannot alias it
         assert main(self._argv("check", config_file, proto_dir)) == 0
         checked = capsys.readouterr().out
         assert "in sync" in checked
-        assert "2 artifact(s)" in checked
+        assert "3 artifact(s)" in checked
 
     def test_check_reports_drift(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
@@ -477,16 +480,22 @@ class TestMain:
         assert main(self._argv("check", config_file, proto_dir)) == 2
         assert "4.6.7" in capsys.readouterr().err
 
-    def test_empty_config_passes_trivially(
+    def test_empty_config_generates_only_the_extras_map(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
+        """No protocols still means one artifact: core's ``_extras.py`` is unconditional."""
         config_file, proto_dir = self._prepare(tmp_path, monkeypatch)
         config_file.write_text(
             '[tshark]\nversion = "4.6.6"\n[generate]\nprotocols = []\nmulti = []\n',
             encoding="utf-8",
         )
+        assert main(self._argv("check", config_file, proto_dir)) == 1
+        assert "_extras.py: missing" in capsys.readouterr().err
+        assert main(self._argv("write", config_file, proto_dir)) == 0
+        assert [path.name for path in sorted(proto_dir.iterdir())] == ["_extras.py"]
+        capsys.readouterr()
         assert main(self._argv("check", config_file, proto_dir)) == 0
-        assert "0" in capsys.readouterr().out
+        assert "1 artifact(s)" in capsys.readouterr().out
 
     def test_missing_tshark_exits_2(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
@@ -654,6 +663,124 @@ class TestSeamCanonicalizesTheFieldsDump:
             header.dump_sha256
             == make_fingerprint(canonicalize_dump(SAMPLE_DUMP), tshark_version="4.6.6").dump_sha256
         )
+
+
+class TestGenerateDistributions:
+    DUMP = (
+        "P\tUser Datagram Protocol\tudp\n"
+        "F\tSource Port\tudp.srcport\tFT_UINT16\tudp\tBASE_PT_UDP\t0x0\t\n"
+        "P\tIEEE 802.11 wireless LAN\twlan\n"
+        "F\tType\twlan.fc.type\tFT_UINT16\twlan\tBASE_DEC\t0x0\t\n"
+    )
+
+    def test_destinations_and_extras_map(self) -> None:
+        config = _config(protocols=("udp",), extras=(("wireless", ("wlan",)),))
+        dists, _warnings = generate_distributions(config, self.DUMP)
+        assert set(dists) == {"core", "wireless"}
+        core_names = {artifact.name for artifact in dists["core"]}
+        assert core_names == {"udp.py", "udp.pyi", "_extras.py"}
+        assert {artifact.name for artifact in dists["wireless"]} == {"wlan.py", "wlan.pyi"}
+        extras_map = next(a for a in dists["core"] if a.name == "_extras.py")
+        assert parse_header(extras_map.content) is not None
+        assert '"wlan": "wireless",' in extras_map.content
+
+    def test_empty_extras_still_emits_empty_map(self) -> None:
+        config = _config(protocols=("udp",))
+        dists, _warnings = generate_distributions(config, self.DUMP)
+        assert set(dists) == {"core"}
+        extras_map = next(a for a in dists["core"] if a.name == "_extras.py")
+        assert "EXTRAS_MODULES: dict[str, str] = {}" in extras_map.content
+
+    def test_collisions_detected_across_destinations(self) -> None:
+        dump = (
+            "P\tProto A\tab-c\n"
+            "F\tX\tab-c.x\tFT_UINT8\tab-c\tBASE_DEC\t0x0\t\n"
+            "P\tProto B\tab.c\n"
+            "F\tX\tab.c.x\tFT_UINT8\tab.c\tBASE_DEC\t0x0\t\n"
+        )
+        config = _config(protocols=("ab-c",), extras=(("wireless", ("ab.c",)),))
+        with pytest.raises(ValueError, match="collides"):
+            generate_distributions(config, dump)
+
+    def test_generate_artifacts_unchanged_for_psdsl_gen(self) -> None:
+        config = _config(protocols=("udp",))
+        artifacts, _warnings = generate_artifacts(config, self.DUMP)
+        assert {artifact.name for artifact in artifacts} == {"udp.py", "udp.pyi"}
+
+
+class TestMainMultiDest:
+    def _patch_tshark(self, monkeypatch: pytest.MonkeyPatch, dump: str) -> None:
+        monkeypatch.setattr(
+            fingerprint_module,
+            "_tshark_version_output",
+            lambda tshark: "TShark (Wireshark) 4.6.6 (Git).",
+        )
+        monkeypatch.setattr(
+            fingerprint_module,
+            "_tshark_dumps",
+            lambda tshark: (canonicalize_dump(dump), ""),
+        )
+        monkeypatch.setenv("TSHARK", "/usr/bin/true")
+
+    def _write_repo_config(self, root: Path) -> Path:
+        config = root / "codegen.toml"
+        config.write_text(
+            "[tshark]\nversion = '4.6.6'\n"
+            "[generate]\nprotocols = ['udp']\n"
+            "[extras.wireless]\nprotocols = ['wlan']\n",
+            encoding="utf-8",
+        )
+        return config
+
+    def _argv(self, command: str, config_file: Path, root: Path) -> list[str]:
+        return [
+            command,
+            "--config",
+            str(config_file),
+            "--proto-dir",
+            str(root / "src/remora/proto"),
+            "--packages-dir",
+            str(root / "packages"),
+        ]
+
+    def test_write_places_extras_under_packages(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._patch_tshark(monkeypatch, TestGenerateDistributions.DUMP)
+        config_file = self._write_repo_config(tmp_path)
+        assert main(self._argv("write", config_file, tmp_path)) == 0
+        assert (tmp_path / "src/remora/proto/_extras.py").is_file()
+        assert (tmp_path / "packages/remora-wireless/src/remora/proto/wlan.py").is_file()
+        assert (tmp_path / "packages/remora-wireless/src/remora/proto/wlan.pyi").is_file()
+        assert "5 artifact(s)" in capsys.readouterr().out
+
+    def test_check_flags_missing_extras_dir(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._patch_tshark(monkeypatch, TestGenerateDistributions.DUMP)
+        config_file = self._write_repo_config(tmp_path)
+        assert main(self._argv("write", config_file, tmp_path)) == 0
+        capsys.readouterr()  # drain the write output so the check assertions cannot alias it
+        assert main(self._argv("check", config_file, tmp_path)) == 0
+        assert "5 artifact(s)" in capsys.readouterr().out
+
+        shutil.rmtree(tmp_path / "packages/remora-wireless")
+        assert main(self._argv("check", config_file, tmp_path)) == 1
+        assert "remora-wireless" in capsys.readouterr().err
+
+    def test_check_reports_drift_inside_an_extra(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._patch_tshark(monkeypatch, TestGenerateDistributions.DUMP)
+        config_file = self._write_repo_config(tmp_path)
+        assert main(self._argv("write", config_file, tmp_path)) == 0
+        drifted = tmp_path / "packages/remora-wireless/src/remora/proto/wlan.py"
+        drifted.write_text(drifted.read_text(encoding="utf-8") + "# stale\n", encoding="utf-8")
+        capsys.readouterr()
+        assert main(self._argv("check", config_file, tmp_path)) == 1
+        captured = capsys.readouterr()
+        assert "wlan.py" in captured.err
+        assert "# stale" in captured.err
 
 
 def test_pyproject_declares_tomli_as_a_runtime_dependency() -> None:

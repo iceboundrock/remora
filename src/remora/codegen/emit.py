@@ -325,6 +325,6 @@ def emit_extras_map(assignments: Sequence[tuple[str, str]]) -> str:
         lines.append("EXTRAS_MODULES: dict[str, str] = {}")
     else:
         lines.append("EXTRAS_MODULES: dict[str, str] = {")
-        lines.extend(f'    "{module}": "{extra}",' for module, extra in entries)
+        lines.extend(f'    "{_escape(module)}": "{_escape(extra)}",' for module, extra in entries)
         lines.append("}")
     return "\n".join(lines) + "\n"
