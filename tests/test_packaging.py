@@ -117,3 +117,52 @@ def test_installed_extra_resolves_through_proto_getattr() -> None:
     assert isinstance(wlan_cls, type)
     assert issubclass(wlan_cls, ProtocolBase)
     assert wlan_cls._proto_ == "wlan"
+
+
+def test_every_generated_protocol_is_assigned_exactly_once() -> None:
+    from remora.codegen.emit import mangle_protocol
+    from remora.codegen.fingerprint import parse_header
+
+    config = _toml(REPO / "codegen.toml")
+    generate = config["generate"]
+    extras = config["extras"]
+    assert isinstance(generate, dict) and isinstance(extras, dict)
+
+    owners: dict[str, str] = {}
+    core_protocols = generate["protocols"]
+    assert isinstance(core_protocols, list)
+    for abbrev in core_protocols:
+        assert isinstance(abbrev, str)
+        owners[mangle_protocol(abbrev)] = "core"
+    for extra_name, spec in extras.items():
+        assert isinstance(spec, dict)
+        protocols = spec["protocols"]
+        assert isinstance(protocols, list)
+        for abbrev in protocols:
+            assert isinstance(abbrev, str)
+            module = mangle_protocol(abbrev)
+            assert module not in owners, (
+                f"{module} assigned to both {owners[module]} and {extra_name}"
+            )
+            owners[module] = extra_name
+
+    def generated_modules(proto_dir: Path) -> set[str]:
+        found: set[str] = set()
+        for path in proto_dir.glob("*.py"):
+            if path.name == "_extras.py" or path.stem.startswith("_"):
+                continue
+            if parse_header(path.read_text(encoding="utf-8")) is None:
+                continue  # hand-written infrastructure (__init__.py, _meta.py)
+            assert path.with_suffix(".pyi").is_file(), f"{path.name} has no .pyi sibling"
+            found.add(path.stem)
+        return found
+
+    trees = {"core": generated_modules(REPO / "src/remora/proto")}
+    for extra_name in EXTRA_NAMES:
+        trees[extra_name] = generated_modules(
+            REPO / "packages" / f"remora-{extra_name}" / "src/remora/proto"
+        )
+
+    for dest, modules in trees.items():
+        expected = {module for module, owner in owners.items() if owner == dest}
+        assert modules == expected, f"{dest}: committed modules do not match codegen.toml"
