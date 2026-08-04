@@ -10,6 +10,8 @@ readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
 authors = [{ name = "Ruoshi Li", email = "iceboundrock@gmail.com" }]
+# remora.codegen reads codegen.toml; tomllib is only stdlib from 3.11 on.
+dependencies = ["tomli>=2.0; python_version < '3.11'"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",

@@ -33,7 +33,7 @@ from pathlib import Path
 
 from remora import __version__
 from remora.codegen.emit import EmitWarning, emit_protocol
-from remora.codegen.parse import parse_fields_dump
+from remora.codegen.parse import ParseWarning, parse_fields_dump
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -166,8 +166,13 @@ class CheckReport:
 
 def generate_artifacts(
     config: CodegenConfig, dump: str, *, plugins_dump: str = ""
-) -> tuple[tuple[Artifact, ...], tuple[EmitWarning, ...]]:
+) -> tuple[tuple[Artifact, ...], tuple[ParseWarning | EmitWarning, ...]]:
     """Emit fingerprinted ``.py``/``.pyi`` pairs for every configured protocol.
+
+    Returns the artifacts and every diagnostic the run produced: the dump's
+    :class:`~remora.codegen.parse.ParseWarning`\\ s first (in input-line order),
+    then each protocol's :class:`~remora.codegen.emit.EmitWarning`\\ s. Nothing
+    the parser skipped is ever silently dropped.
 
     Raises ValueError if a configured protocol abbrev is not in the dump or if
     two configured protocols mangle to the same module name.
@@ -178,7 +183,7 @@ def generate_artifacts(
     )
     by_abbrev = {protocol.abbrev: protocol for protocol in dictionary.protocols}
     artifacts: list[Artifact] = []
-    warnings: list[EmitWarning] = []
+    warnings: list[ParseWarning | EmitWarning] = list(dictionary.warnings)
     module_name_to_abbrev: dict[str, str] = {}
     for abbrev in config.protocols:
         protocol = by_abbrev.get(abbrev)
@@ -324,7 +329,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"error: {error}", file=sys.stderr)
         return 2
     for warning in warnings:
-        print(f"warning: {warning.abbrev}: {warning.message}", file=sys.stderr)
+        if isinstance(warning, ParseWarning):
+            print(f"warning: -G fields line {warning.line_no}: {warning.message}", file=sys.stderr)
+        else:
+            print(f"warning: {warning.abbrev}: {warning.message}", file=sys.stderr)
 
     proto_dir = Path(options.proto_dir)
     if options.command == "write":

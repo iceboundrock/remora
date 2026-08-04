@@ -5,7 +5,8 @@
 
 [tshark]
 # Pinned tshark: the version ppa:wireshark-dev/stable ships for ubuntu-latest.
-# Bumping it requires regenerating all committed artifacts (`... fingerprint write`).
+# Bumping it requires regenerating all committed artifacts
+# (`uv run python -m remora.codegen write`).
 version = "4.6.6"
 
 [generate]

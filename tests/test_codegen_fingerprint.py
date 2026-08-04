@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import importlib.util
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 import remora.codegen.fingerprint as fingerprint_module
+from remora.codegen.emit import EmitWarning
 from remora.codegen.fingerprint import (
     Artifact,
     CheckReport,
@@ -25,6 +27,12 @@ from remora.codegen.fingerprint import (
     render_header,
     summarize_env,
 )
+from remora.codegen.parse import ParseWarning
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    import tomli as tomllib
 
 SAMPLE_DUMP = (
     "P\tUser Datagram Protocol\tudp\n"
@@ -200,6 +208,31 @@ class TestGenerateArtifacts:
     def test_duplicate_protocol_in_config_raises(self) -> None:
         with pytest.raises(ValueError, match=r"module name.*collides"):
             generate_artifacts(_config(protocols=("udp", "udp")), SAMPLE_DUMP)
+
+    def test_parse_warnings_are_surfaced(self) -> None:
+        dump = SAMPLE_DUMP + "P\tUser Datagram Protocol\tudp\nZ\tnot a record type\n"
+        artifacts, warnings = generate_artifacts(_config(), dump)
+        assert [a.name for a in artifacts] == ["udp.py", "udp.pyi"]
+        assert all(isinstance(w, ParseWarning) for w in warnings)
+        assert [(w.line_no, w.message) for w in warnings if isinstance(w, ParseWarning)] == [
+            (4, "duplicate protocol abbrev 'udp'"),
+            (5, "unknown record type 'Z'"),
+        ]
+
+    def test_parse_warnings_come_before_emit_warnings(self) -> None:
+        dump = (
+            SAMPLE_DUMP
+            + "Z\tnot a record type\n"
+            + "F\tA B\tudp.a.b\tFT_UINT16\tudp\tBASE_DEC\t0x0\t\n"
+            + "F\tA-B\tudp.a-b\tFT_UINT16\tudp\tBASE_DEC\t0x0\t\n"
+        )
+        _, warnings = generate_artifacts(_config(), dump)
+        assert [type(w) for w in warnings] == [ParseWarning, EmitWarning]
+        first, second = warnings
+        assert isinstance(first, ParseWarning)
+        assert first.line_no == 4
+        assert isinstance(second, EmitWarning)
+        assert second.abbrev == "udp.a-b"
 
     def test_colliding_module_names_raise(self) -> None:
         # Create a dump with two protocols that mangle to the same name:
@@ -405,6 +438,21 @@ class TestMain:
         assert "error:" in captured.err
         assert str(missing) in captured.err
 
+    def test_warnings_printed_to_stderr_without_failing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        dump = (
+            SAMPLE_DUMP
+            + "Z\tnot a record type\n"
+            + "F\tA B\tudp.a.b\tFT_UINT16\tudp\tBASE_DEC\t0x0\t\n"
+            + "F\tA-B\tudp.a-b\tFT_UINT16\tudp\tBASE_DEC\t0x0\t\n"
+        )
+        config_file, proto_dir = self._prepare(tmp_path, monkeypatch, dump=dump)
+        assert main(self._argv("write", config_file, proto_dir)) == 0
+        captured = capsys.readouterr()
+        assert "warning: -G fields line 4: unknown record type 'Z'" in captured.err
+        assert "warning: udp.a-b: attribute name 'a_b' already taken" in captured.err
+
     def test_write_creates_missing_proto_dir(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -421,6 +469,21 @@ class TestMain:
         assert (fresh / "udp.py").is_file()
         assert (fresh / "udp.pyi").is_file()
         capsys.readouterr()
+
+
+def test_pyproject_declares_tomli_as_a_runtime_dependency() -> None:
+    """On py3.10 ``import remora.codegen`` pulls in tomli, so it cannot be dev-only.
+
+    A dev-group-only tomli means ``pip install remora`` on 3.10 raises
+    ModuleNotFoundError from :mod:`remora.codegen.fingerprint`.
+    """
+    pyproject = Path(__file__).parent.parent / "pyproject.toml"
+    with pyproject.open("rb") as handle:
+        data = tomllib.load(handle)
+    dependencies = data["project"]["dependencies"]
+    tomli_requirements = [dep for dep in dependencies if dep.startswith("tomli")]
+    assert tomli_requirements, f"[project] dependencies must require tomli: {dependencies!r}"
+    assert all("python_version < '3.11'" in dep for dep in tomli_requirements), tomli_requirements
 
 
 def test_codegen_package_is_runnable_as_a_module() -> None:
