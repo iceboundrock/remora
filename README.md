@@ -83,10 +83,15 @@ locally installed tshark (resolved from `--tshark`, then `$TSHARK`, then
 whatever version generated the files. A missing binary or unknown protocol
 name exits nonzero with a one-line error.
 
-One caveat: `tshark -G fields` carries no multiplicity signal and `psdsl gen`
-takes no curated multi list, so every generated field is declared scalar — a
-field that occurs several times per packet resolves to its first occurrence.
-The committed `remora.proto` modules curate multiplicity by hand.
+`tshark -G fields` carries no multiplicity signal, so multiplicity is curated
+by hand: pass `--multi` with the field abbrevs that occur several times per
+packet, and they are declared multi-valued (`MultiField`); every other field
+is scalar and resolves to its first occurrence:
+
+    uv run psdsl gen --protocols dns ip --multi dns.qry.name ip.addr --out ./gen
+
+The committed `remora.proto` modules curate multiplicity the same way, by
+hand.
 
 **Importing the output.** The output directory is a plain directory of modules:
 each `.pyi` stub sits beside its `.py` module, so type checkers and IDEs
