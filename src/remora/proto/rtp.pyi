@@ -1,0 +1,57 @@
+# remora-fingerprint: v1
+# tshark: 4.6.6
+# dump-sha256: 322912d4e14fe37b69f23f55fba883f64cd737f04da4b14a762926dbe6bf1d36
+# env: plugins=sha256:54f0935767ee
+# generator: remora 0.1.0
+
+from remora.fields import Field
+from remora.proto._meta import ProtocolBase
+
+class RTP(ProtocolBase):
+    version: Field[int]
+    padding: Field[bool]
+    ext: Field[bool]
+    cc: Field[int]
+    marker: Field[bool]
+    p_type: Field[int]
+    seq: Field[int]
+    extseq: Field[int]
+    timestamp: Field[int]
+    timestamp_ext: Field[int]
+    ssrc: Field[int]
+    ext_profile: Field[int]
+    ext_len: Field[int]
+    csrc_items: Field[str]
+    csrc_item: Field[int]
+    hdr_exts: Field[str]
+    hdr_ext: Field[int]
+    payload: Field[bytes]
+    padding_data: Field[bytes]
+    padding_count: Field[int]
+    setup: Field[str]
+    setup_frame: Field[int]
+    setup_method: Field[str]
+    follow: Field[bool]
+    timestamp_offset: Field[int]
+    block_length: Field[int]
+    ext_rfc5285_id: Field[int]
+    ext_rfc5285_len: Field[int]
+    ext_rfc5285_appbits: Field[int]
+    ext_rfc5285_data: Field[bytes]
+    rfc4571_len: Field[int]
+    fragments: Field[str]
+    fragment: Field[int]
+    fragment_overlap: Field[bool]
+    fragment_overlap_conflict: Field[bool]
+    fragment_multipletails: Field[bool]
+    fragment_toolongfragment: Field[bool]
+    fragment_error: Field[int]
+    fragment_count: Field[int]
+    reassembled_in: Field[int]
+    reassembled_length: Field[int]
+    srtp_enc_payload: Field[bytes]
+    srtp_mki: Field[bytes]
+    srtp_auth_tag: Field[bytes]
+    fragment_unfinished: Field[str]
+    padding_missing: Field[str]
+    padding_bogus: Field[str]
