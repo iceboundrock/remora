@@ -146,6 +146,12 @@ def parse_header(source: str) -> Fingerprint | None:
     )
 
 
+# The domain extras fixed by the epic: an allowlist keeps the names safe as
+# ``packages/remora-<name>`` path segments and stops one colliding with the
+# reserved "core" destination (which would silently drop the core protocols).
+_ALLOWED_EXTRAS = frozenset({"wireless", "industrial", "telecom"})
+
+
 @dataclass(frozen=True)
 class CodegenConfig:
     """Parsed ``codegen.toml``: the one place the generation toolchain is pinned."""
@@ -180,6 +186,11 @@ def load_config(path: Path) -> CodegenConfig:
         raise ValueError("codegen.toml: [extras] must be a table")
     extras: list[tuple[str, tuple[str, ...]]] = []
     for extra_name, spec in raw_extras.items():
+        if extra_name not in _ALLOWED_EXTRAS:
+            raise ValueError(
+                f"codegen.toml: unknown extra {extra_name!r}; "
+                "allowed: industrial, telecom, wireless"
+            )
         if not isinstance(spec, dict):
             raise ValueError(f"codegen.toml: [extras.{extra_name}] must be a table")
         extras.append(
@@ -488,12 +499,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     messages: list[str] = []
+    configured: set[Path] = set()
     for dest, artifacts in dists.items():
         directory = dest_dir(dest)
+        configured.add(directory)
         if not directory.is_dir():
             messages.append(f"{directory}: missing (regenerate with the write command)")
             continue
         messages.extend(check_artifacts(artifacts, directory).messages)
+    # A distribution dropped from codegen.toml leaves its tree on disk, where
+    # nothing above would ever look at it again. Check it against an empty
+    # expected set so every fingerprinted file left behind reports as an orphan.
+    packages_dir = Path(options.packages_dir)
+    if packages_dir.is_dir():
+        for stale_dir in sorted(packages_dir.glob("remora-*/src/remora/proto")):
+            if not stale_dir.is_dir() or stale_dir in configured:
+                continue
+            messages.extend(
+                f"{stale_dir}: {message}" for message in check_artifacts((), stale_dir).messages
+            )
     if messages:
         for message in messages:
             print(message, file=sys.stderr)

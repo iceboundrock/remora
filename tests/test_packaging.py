@@ -47,6 +47,21 @@ def test_missing_extra_raises_naming_the_extra(monkeypatch: pytest.MonkeyPatch) 
         _ = remora.proto.WLAN
 
 
+def test_nested_import_failure_propagates_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An installed extra whose own dependency is missing must surface the real error."""
+    real_import_module = importlib.import_module
+
+    def fake_import_module(name: str, package: str | None = None) -> object:
+        if name == "remora.proto.wlan":
+            raise ModuleNotFoundError("No module named 'zlib_ng'", name="zlib_ng")
+        return real_import_module(name, package)
+
+    monkeypatch.setattr(importlib, "import_module", fake_import_module)
+    with pytest.raises(ModuleNotFoundError, match=r"zlib_ng") as excinfo:
+        _ = remora.proto.WLAN
+    assert "remora[wireless]" not in str(excinfo.value)
+
+
 def test_unknown_attribute_raises_attribute_error() -> None:
     with pytest.raises(AttributeError, match=r"module 'remora\.proto' has no attribute 'NOPE'"):
         _ = remora.proto.NOPE

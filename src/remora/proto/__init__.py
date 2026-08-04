@@ -99,6 +99,11 @@ def __getattr__(name: str) -> object:
     try:
         module = importlib.import_module(f"{__name__}.{module_name}")
     except ModuleNotFoundError as exc:
+        # Only the protocol module's own absence means "extra not installed";
+        # an installed extra failing on its own missing dependency must surface
+        # that real failure instead of this advice.
+        if exc.name != f"{__name__}.{module_name}":
+            raise
         raise ImportError(
             f"Protocol {module_name!r} is in the {extra!r} extra, which is not "
             f"installed. Install it with: pip install 'remora[{extra}]'"

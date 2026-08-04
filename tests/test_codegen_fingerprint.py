@@ -227,6 +227,27 @@ class TestLoadConfig:
         with pytest.raises(ValueError, match=r"\[extras\.wireless\] must be a table"):
             load_config(path)
 
+    def test_extra_named_core_rejected(self, tmp_path: Path) -> None:
+        """``core`` is the reserved destination name; it must not be an extra."""
+        path = tmp_path / "codegen.toml"
+        path.write_text(
+            "[tshark]\nversion = '4.6.6'\n"
+            "[generate]\nprotocols = ['udp']\n"
+            "[extras.core]\nprotocols = ['wlan']\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match=r"unknown extra 'core'"):
+            load_config(path)
+
+    def test_unknown_extra_name_rejected(self, tmp_path: Path) -> None:
+        path = tmp_path / "codegen.toml"
+        path.write_text(
+            "[tshark]\nversion = '4.6.6'\n[extras.bogus]\nprotocols = ['wlan']\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match=r"unknown extra 'bogus'; allowed: "):
+            load_config(path)
+
     def test_protocol_in_core_and_extra_rejected(self, tmp_path: Path) -> None:
         path = tmp_path / "codegen.toml"
         path.write_text(
@@ -430,7 +451,17 @@ class TestMain:
         return config_file, proto_dir
 
     def _argv(self, command: str, config_file: Path, proto_dir: Path) -> list[str]:
-        return [command, "--config", str(config_file), "--proto-dir", str(proto_dir)]
+        # --packages-dir is pinned inside tmp_path so the stale-distribution scan
+        # cannot wander into the real repo's packages/ tree.
+        return [
+            command,
+            "--config",
+            str(config_file),
+            "--proto-dir",
+            str(proto_dir),
+            "--packages-dir",
+            str(config_file.parent / "packages"),
+        ]
 
     def test_write_then_check_in_sync(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
@@ -620,7 +651,15 @@ class TestSeamCanonicalizesTheFieldsDump:
         return config_file, proto_dir
 
     def _argv(self, command: str, config_file: Path, proto_dir: Path) -> list[str]:
-        return [command, "--config", str(config_file), "--proto-dir", str(proto_dir)]
+        return [
+            command,
+            "--config",
+            str(config_file),
+            "--proto-dir",
+            str(proto_dir),
+            "--packages-dir",
+            str(config_file.parent / "packages"),
+        ]
 
     def test_write_then_check_across_a_reshuffle_stays_in_sync(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
@@ -767,6 +806,46 @@ class TestMainMultiDest:
         shutil.rmtree(tmp_path / "packages/remora-wireless")
         assert main(self._argv("check", config_file, tmp_path)) == 1
         assert "remora-wireless" in capsys.readouterr().err
+
+    def test_check_reports_a_stale_distribution_directory(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Dropping ``[extras.wireless]`` must not make its tree invisible to drift."""
+        self._patch_tshark(monkeypatch, TestGenerateDistributions.DUMP)
+        config_file = self._write_repo_config(tmp_path)
+        assert main(self._argv("write", config_file, tmp_path)) == 0
+        capsys.readouterr()
+        assert main(self._argv("check", config_file, tmp_path)) == 0
+        capsys.readouterr()
+
+        config_file.write_text(
+            "[tshark]\nversion = '4.6.6'\n[generate]\nprotocols = ['udp']\n",
+            encoding="utf-8",
+        )
+        # Regenerate core so the only remaining problem is the abandoned tree.
+        assert main(self._argv("write", config_file, tmp_path)) == 0
+        capsys.readouterr()
+        assert main(self._argv("check", config_file, tmp_path)) == 1
+        captured = capsys.readouterr()
+        assert "remora-wireless" in captured.err
+        assert "wlan.py" in captured.err
+
+    def test_check_ignores_unfingerprinted_files_in_a_stale_dir(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._patch_tshark(monkeypatch, TestGenerateDistributions.DUMP)
+        config_file = self._write_repo_config(tmp_path)
+        assert main(self._argv("write", config_file, tmp_path)) == 0
+        stale = tmp_path / "packages/remora-wireless/src/remora/proto"
+        for path in sorted(stale.iterdir()):
+            path.unlink()
+        (stale / "__init__.py").write_text("# hand-written\n", encoding="utf-8")
+        config_file.write_text(
+            "[tshark]\nversion = '4.6.6'\n[generate]\nprotocols = ['udp']\n",
+            encoding="utf-8",
+        )
+        assert main(self._argv("write", config_file, tmp_path)) == 0
+        assert main(self._argv("check", config_file, tmp_path)) == 0
 
     def test_check_reports_drift_inside_an_extra(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
