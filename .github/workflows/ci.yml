@@ -52,3 +52,45 @@ jobs:
           tshark --version | head -n 1
       - name: Check generated-artifact drift
         run: uv run python -m remora.codegen check
+
+  wheels:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          python-version: "3.12"
+      - name: Build all distributions
+        run: |
+          uv build --out-dir dist
+          uv build --out-dir dist packages/remora-wireless
+          uv build --out-dir dist packages/remora-industrial
+          uv build --out-dir dist packages/remora-telecom
+      - name: Spot-check wheel contents
+        run: python .github/scripts/check_wheel_contents.py
+      - name: Core-only install refuses extras protocols helpfully
+        run: |
+          python -m venv core-env
+          core-env/bin/pip install dist/remora-*.whl
+          core-env/bin/python -c "
+          from remora.proto import TCP
+          try:
+              from remora.proto import WLAN
+          except ImportError as error:
+              assert \"pip install 'remora[wireless]'\" in str(error), error
+              print('core-only ImportError OK:', error)
+          else:
+              raise SystemExit('expected an ImportError for WLAN')
+          "
+      - name: remora[all] resolves every extra
+        run: |
+          python -m venv all-env
+          all-env/bin/pip install --no-index --find-links dist "remora[all]"
+          all-env/bin/python -c "
+          from remora.proto import WLAN, RADIOTAP, MODBUS, MBTCP, DNP3, GTP, DIAMETER
+          print('extras resolve OK')
+          "
+      - name: Extras stubs resolve for mypy
+        run: |
+          all-env/bin/pip install mypy
+          all-env/bin/python -m mypy --strict .github/scripts/check_stub_resolution.py
