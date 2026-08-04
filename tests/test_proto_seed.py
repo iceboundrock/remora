@@ -1,9 +1,9 @@
-"""Pairing tests for the hand-written seed protocol modules (issue #13).
+"""Pairing tests for the generated protocol modules (issues #13/#19).
 
-The seed ``.py`` modules are dumb compact tables in the frozen format the M2
-generator (issue #14) will emit; the sibling ``.pyi`` stubs shadow them for
-type checkers. These tests parse each stub with ``ast`` and cross-check it
-against the runtime ``_table_`` in both directions, so the pair cannot drift.
+Originally written against the hand-written M1 seeds, these tests are the
+frozen-format contract and now run against the generated core-set modules:
+each ``.pyi`` stub is parsed with ``ast`` and cross-checked against the
+runtime ``_table_`` in both directions, so the pair cannot drift.
 
 The ``assert_type`` calls are the static half of the acceptance criteria:
 they are verified when mypy checks this file and are no-ops at runtime.
@@ -22,22 +22,73 @@ from typing_extensions import assert_type
 
 from conftest import FakePacket
 from remora import values
+from remora.codegen.mangle import mangle_field
 from remora.expr import Comparison
 from remora.fields import FieldRef, Packet
 from remora.proto import DNS, IP, TCP
+from remora.proto import arp as arp_mod
+from remora.proto import dhcp as dhcp_mod
+from remora.proto import dhcpv6 as dhcpv6_mod
 from remora.proto import dns as dns_mod
 from remora.proto import eth as eth_mod
+from remora.proto import ftp as ftp_mod
+from remora.proto import gre as gre_mod
+from remora.proto import http as http_mod
+from remora.proto import http2 as http2_mod
+from remora.proto import icmp as icmp_mod
+from remora.proto import icmpv6 as icmpv6_mod
+from remora.proto import igmp as igmp_mod
+from remora.proto import imap as imap_mod
 from remora.proto import ip as ip_mod
+from remora.proto import ipv6 as ipv6_mod
+from remora.proto import llc as llc_mod
+from remora.proto import ntp as ntp_mod
+from remora.proto import pop as pop_mod
+from remora.proto import quic as quic_mod
+from remora.proto import rtp as rtp_mod
+from remora.proto import sctp as sctp_mod
+from remora.proto import sip as sip_mod
+from remora.proto import smtp as smtp_mod
+from remora.proto import snmp as snmp_mod
+from remora.proto import ssh as ssh_mod
+from remora.proto import stp as stp_mod
 from remora.proto import tcp as tcp_mod
+from remora.proto import tls as tls_mod
 from remora.proto import udp as udp_mod
+from remora.proto import vlan as vlan_mod
 from remora.proto._meta import ProtocolBase
 
 SEEDS: list[tuple[ModuleType, type[ProtocolBase]]] = [
-    (eth_mod, eth_mod.ETH),
-    (ip_mod, ip_mod.IP),
-    (tcp_mod, tcp_mod.TCP),
-    (udp_mod, udp_mod.UDP),
+    (arp_mod, arp_mod.ARP),
+    (dhcp_mod, dhcp_mod.DHCP),
+    (dhcpv6_mod, dhcpv6_mod.DHCPV6),
     (dns_mod, dns_mod.DNS),
+    (eth_mod, eth_mod.ETH),
+    (ftp_mod, ftp_mod.FTP),
+    (gre_mod, gre_mod.GRE),
+    (http_mod, http_mod.HTTP),
+    (http2_mod, http2_mod.HTTP2),
+    (icmp_mod, icmp_mod.ICMP),
+    (icmpv6_mod, icmpv6_mod.ICMPV6),
+    (igmp_mod, igmp_mod.IGMP),
+    (imap_mod, imap_mod.IMAP),
+    (ip_mod, ip_mod.IP),
+    (ipv6_mod, ipv6_mod.IPV6),
+    (llc_mod, llc_mod.LLC),
+    (ntp_mod, ntp_mod.NTP),
+    (pop_mod, pop_mod.POP),
+    (quic_mod, quic_mod.QUIC),
+    (rtp_mod, rtp_mod.RTP),
+    (sctp_mod, sctp_mod.SCTP),
+    (sip_mod, sip_mod.SIP),
+    (smtp_mod, smtp_mod.SMTP),
+    (snmp_mod, snmp_mod.SNMP),
+    (ssh_mod, ssh_mod.SSH),
+    (stp_mod, stp_mod.STP),
+    (tcp_mod, tcp_mod.TCP),
+    (tls_mod, tls_mod.TLS),
+    (udp_mod, udp_mod.UDP),
+    (vlan_mod, vlan_mod.VLAN),
 ]
 
 seed_params = pytest.mark.parametrize(
@@ -96,25 +147,22 @@ class TestStubTablePairing:
         for attr, (_, ftype, _) in cls._table_.items():
             assert ftype in values.FTYPE_TABLE, f"{attr}: unknown ftype {ftype!r}"
 
-    def test_attr_names_follow_seed_naming_convention(
-        self, module: ModuleType, cls: type[ProtocolBase]
-    ) -> None:
-        """The hand-written seeds derive attrs as dots-to-underscores (typo guard).
-
-        This is a convention of the seed modules only, not part of the frozen
-        compact-table format: ``_meta.py`` stores the full tshark name precisely
-        so that generated modules (issue #14) may deviate, e.g. to escape Python
-        keywords (``*.class`` cannot flatten to ``class``). When the M2 emitter
-        replaces the seeds, its output encodes whatever rule it adopts.
-        """
-        prefix = f"{cls._proto_}."
-        for attr, (tshark_name, _, _) in cls._table_.items():
-            assert tshark_name.startswith(prefix), f"{attr}: {tshark_name!r} lacks {prefix!r}"
-            derived = tshark_name.removeprefix(prefix).replace(".", "_")
-            assert attr == derived, f"{attr!r} != derived {derived!r}"
-
     def test_proto_matches_module_name(self, module: ModuleType, cls: type[ProtocolBase]) -> None:
         assert module.__name__.rsplit(".", 1)[-1] == cls._proto_
+
+    def test_attr_names_follow_the_frozen_mangle_policy(
+        self, module: ModuleType, cls: type[ProtocolBase]
+    ) -> None:
+        """Attr names are generated, never hand-edited: re-derive them from the policy.
+
+        Catches locally what previously only the CI drift job would catch — a
+        tandem hand-edit of a ``.py`` table entry and its ``.pyi`` annotation
+        keeps the pairing tests green but breaks emitter-exactness.
+        """
+        for attr, (tshark_name, _, _) in cls._table_.items():
+            assert attr == mangle_field(tshark_name, cls._proto_), (
+                f"{attr}: not what mangle_field({tshark_name!r}, {cls._proto_!r}) emits"
+            )
 
 
 P = TypeVar("P", bound=ProtocolBase)

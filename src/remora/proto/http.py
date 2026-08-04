@@ -1,0 +1,111 @@
+# remora-fingerprint: v1
+# tshark: 4.6.6
+# dump-sha256: 630382087156e14bd89d187b03f348d56b4e3b966b05d17d41fc2ec9c09f008e
+# env: plugins=sha256:54f0935767ee
+# generator: remora 0.1.0
+
+"""Generated protocol module for tshark layer ``http`` — do not edit."""
+
+from typing import ClassVar
+
+from remora.proto._meta import FieldTable, ProtocolBase
+
+__all__ = ["HTTP"]
+
+
+class HTTP(ProtocolBase):
+    """Hypertext Transfer Protocol (tshark layer ``http``)."""
+
+    _proto_ = "http"
+    _table_: ClassVar[FieldTable] = {
+        "accept": ("http.accept", "FT_STRING", 0),
+        "accept_encoding": ("http.accept_encoding", "FT_STRING", 0),
+        "accept_language": ("http.accept_language", "FT_STRING", 0),
+        "authorization": ("http.authorization", "FT_STRING", 0),
+        "cache_control": ("http.cache_control", "FT_STRING", 0),
+        "chunk_boundary": ("http.chunk_boundary", "FT_BYTES", 0),
+        "chunk_data": ("http.chunk_data", "FT_BYTES", 0),
+        "chunk_size": ("http.chunk_size", "FT_UINT32", 0),
+        "authcitrix": ("http.authcitrix", "FT_BOOLEAN", 0),
+        "authcitrix_domain": ("http.authcitrix.domain", "FT_STRING", 0),
+        "authcitrix_password": ("http.authcitrix.password", "FT_STRING", 0),
+        "authcitrix_session": ("http.authcitrix.session", "FT_STRING", 0),
+        "authcitrix_user": ("http.authcitrix.user", "FT_STRING", 0),
+        "connection": ("http.connection", "FT_STRING", 0),
+        "content_length": ("http.content_length", "FT_UINT64", 0),
+        "content_encoding": ("http.content_encoding", "FT_STRING", 0),
+        "content_length_header": ("http.content_length_header", "FT_STRING", 0),
+        "content_range": ("http.content_range", "FT_STRING", 0),
+        "content_type": ("http.content_type", "FT_STRING", 0),
+        "cookie": ("http.cookie", "FT_STRING", 0),
+        "cookie_pair": ("http.cookie_pair", "FT_STRING", 0),
+        "authbasic": ("http.authbasic", "FT_STRING", 0),
+        "date": ("http.date", "FT_STRING", 0),
+        "decompression_disabled": ("http.decompression_disabled", "FT_NONE", 0),
+        "decompression_failed": ("http.decompression_failed", "FT_NONE", 0),
+        "excess_data": ("http.excess_data", "FT_NONE", 0),
+        "file_data": ("http.file_data", "FT_BYTES", 0),
+        "request_full_uri": ("http.request.full_uri", "FT_STRING", 0),
+        "body_fragment_error": ("http.body.fragment.error", "FT_FRAMENUM", 0),
+        "body_fragment": ("http.body.fragment", "FT_FRAMENUM", 0),
+        "body_fragment_count": ("http.body.fragment.count", "FT_UINT32", 0),
+        "body_fragment_overlap": ("http.body.fragment.overlap", "FT_BOOLEAN", 0),
+        "body_fragment_overlap_conflicts": ("http.body.fragment.overlap.conflicts", "FT_BOOLEAN", 0),
+        "body_fragment_too_long_fragment": ("http.body.fragment.too_long_fragment", "FT_BOOLEAN", 0),
+        "body_fragment_multiple_tails": ("http.body.fragment.multiple_tails", "FT_BOOLEAN", 0),
+        "body_segment": ("http.body.segment", "FT_BYTES", 0),
+        "subdissector_failed": ("http.subdissector_failed", "FT_NONE", 0),
+        "http2_settings_uri": ("http.http2_settings_uri", "FT_BYTES", 0),
+        "http2_settings": ("http.http2_settings", "FT_STRING", 0),
+        "host": ("http.host", "FT_STRING", 0),
+        "bad_header_name": ("http.bad_header_name", "FT_NONE", 0),
+        "last_modified": ("http.last_modified", "FT_STRING", 0),
+        "leading_crlf": ("http.leading_crlf", "FT_NONE", 0),
+        "location": ("http.location", "FT_STRING", 0),
+        "notification": ("http.notification", "FT_BOOLEAN", 0),
+        "proxy_authenticate": ("http.proxy_authenticate", "FT_STRING", 0),
+        "proxy_authorization": ("http.proxy_authorization", "FT_STRING", 0),
+        "proxy_connect_host": ("http.proxy_connect_host", "FT_STRING", 0),
+        "proxy_connect_port": ("http.proxy_connect_port", "FT_UINT16", 0),
+        "range": ("http.range", "FT_STRING", 0),
+        "body_fragments": ("http.body.fragments", "FT_NONE", 0),
+        "body_reassembled_data": ("http.body.reassembled.data", "FT_BYTES", 0),
+        "body_reassembled_in": ("http.body.reassembled.in", "FT_FRAMENUM", 0),
+        "body_reassembled_length": ("http.body.reassembled.length", "FT_UINT32", 0),
+        "referer": ("http.referer", "FT_STRING", 0),
+        "request": ("http.request", "FT_BOOLEAN", 0),
+        "request_method": ("http.request.method", "FT_STRING", 0),
+        "request_uri": ("http.request.uri", "FT_STRING", 0),
+        "request_uri_path": ("http.request.uri.path", "FT_STRING", 0),
+        "request_uri_path_segment": ("http.request.uri.path.segment", "FT_STRING", 0),
+        "request_uri_query": ("http.request.uri.query", "FT_STRING", 0),
+        "request_uri_query_parameter": ("http.request.uri.query.parameter", "FT_STRING", 0),
+        "request_version": ("http.request.version", "FT_STRING", 0),
+        "request_in": ("http.request_in", "FT_FRAMENUM", 0),
+        "request_line": ("http.request.line", "FT_STRING", 0),
+        "response": ("http.response", "FT_BOOLEAN", 0),
+        "response_phrase": ("http.response.phrase", "FT_STRING", 0),
+        "response_version": ("http.response.version", "FT_STRING", 0),
+        "response_in": ("http.response_in", "FT_FRAMENUM", 0),
+        "response_line": ("http.response.line", "FT_STRING", 0),
+        "sec_websocket_accept": ("http.sec_websocket_accept", "FT_STRING", 0),
+        "sec_websocket_extensions": ("http.sec_websocket_extensions", "FT_STRING", 0),
+        "sec_websocket_key": ("http.sec_websocket_key", "FT_STRING", 0),
+        "sec_websocket_protocol": ("http.sec_websocket_protocol", "FT_STRING", 0),
+        "sec_websocket_version": ("http.sec_websocket_version", "FT_STRING", 0),
+        "server": ("http.server", "FT_STRING", 0),
+        "set_cookie": ("http.set_cookie", "FT_STRING", 0),
+        "response_code": ("http.response.code", "FT_UINT24", 0),
+        "response_code_desc": ("http.response.code.desc", "FT_STRING", 0),
+        "te_and_length": ("http.te_and_length", "FT_NONE", 0),
+        "time": ("http.time", "FT_RELATIVE_TIME", 0),
+        "transfer_encoding": ("http.transfer_encoding", "FT_STRING", 0),
+        "tls_port": ("http.tls_port", "FT_NONE", 0),
+        "unknown_header": ("http.unknown_header", "FT_STRING", 0),
+        "te_unknown": ("http.te_unknown", "FT_NONE", 0),
+        "upgrade": ("http.upgrade", "FT_STRING", 0),
+        "user_agent": ("http.user_agent", "FT_STRING", 0),
+        "www_authenticate": ("http.www_authenticate", "FT_STRING", 0),
+        "x_forwarded_for": ("http.x_forwarded_for", "FT_STRING", 0),
+        "chunked_trailer_part": ("http.chunked_trailer_part", "FT_STRING", 0),
+    }

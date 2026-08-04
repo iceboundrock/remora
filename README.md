@@ -57,7 +57,7 @@ Milestones: [M1 可用内核](https://github.com/iceboundrock/remora/milestone/1
 
 ## Generated artifacts & drift check
 
-Generated protocol modules under `src/remora/proto/` carry a fingerprint header recording the tshark version, a hash of the `tshark -G fields` dump, the plugin environment, and the generator version. The generation toolchain is pinned in **`codegen.toml`** at the repo root — the pinned tshark version lives there and nowhere else; CI and this document both defer to it. That file also lists which protocols are generated and committed; that list is still empty while the M1 seeds are hand-written ([#19](https://github.com/iceboundrock/remora/issues/19) populates it).
+Generated protocol modules under `src/remora/proto/` carry a fingerprint header recording the tshark version, a hash of the `tshark -G fields` dump, the plugin environment, and the generator version. The generation toolchain is pinned in **`codegen.toml`** at the repo root — the pinned tshark version lives there and nowhere else; CI and this document both defer to it. That file also lists which protocols are generated and committed — the ~30-protocol core set ([#19](https://github.com/iceboundrock/remora/issues/19)) — plus the curated multi-value field set; regeneration must run under the pinned tshark (CI re-checks byte equality on every push).
 
 Verify the committed artifacts against a fresh regeneration:
 

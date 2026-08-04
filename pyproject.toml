@@ -58,6 +58,18 @@ select = [
     "RUF", # ruff-specific
 ]
 
+[tool.ruff.lint.per-file-ignores]
+# Generated protocol tables (issue #19) keep one field entry per line no
+# matter how long the abbrev is; the emitter never wraps (see the line-length
+# note in src/remora/codegen/emit.py).
+"src/remora/proto/*" = ["E501"]
+
+[tool.ruff.format]
+# Generated protocol modules are byte-exact emitter output; reformatting them
+# would break `python -m remora.codegen check`. _meta.py and __init__.py ride
+# along (they remain lint-checked apart from E501; only the formatter skips them).
+exclude = ["src/remora/proto/*.py", "src/remora/proto/*.pyi"]
+
 [tool.mypy]
 strict = true
 python_version = "3.10"

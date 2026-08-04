@@ -44,6 +44,14 @@ _ALL_FTYPES = [
     "FT_STRING",
     "FT_STRINGZ",
     "FT_NONE",
+    # Explicit str mappings for the ftypes the issue #19 core set surfaced
+    # (previously reached str via the unknown-ftype fallback); see issue #69.
+    "FT_EUI64",
+    "FT_OID",
+    "FT_UINT_STRING",
+    "FT_GUID",
+    "FT_STRINGZPAD",
+    "FT_AX25",
 ]
 
 _EXPECTED_PY_TYPES: dict[str, type] = {
@@ -60,6 +68,12 @@ _EXPECTED_PY_TYPES: dict[str, type] = {
     "FT_STRING": str,
     "FT_STRINGZ": str,
     "FT_NONE": str,
+    "FT_EUI64": str,
+    "FT_OID": str,
+    "FT_UINT_STRING": str,
+    "FT_GUID": str,
+    "FT_STRINGZPAD": str,
+    "FT_AX25": str,
 }
 
 

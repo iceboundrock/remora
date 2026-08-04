@@ -10,9 +10,27 @@
 version = "4.6.6"
 
 [generate]
-# tshark protocol abbrevs generated and committed under src/remora/proto/.
-# Populated by issue #19; empty means the drift check trivially passes.
-protocols = []
+# tshark protocol abbrevs generated and committed under src/remora/proto/
+# (the issue #19 core set). Every entry must exist in the pinned dump;
+# `python -m remora.codegen write` errors loudly on a missing abbrev.
+protocols = [
+    "eth", "ip", "ipv6", "tcp", "udp", "dns",
+    "http", "http2", "tls",
+    "icmp", "icmpv6", "arp",
+    "dhcp", "dhcpv6", "ntp", "ssh", "ftp", "smtp", "pop", "imap",
+    "snmp", "sip", "rtp", "quic", "sctp",
+    "gre", "vlan", "llc", "stp", "igmp",
+]
 # tshark field abbrevs that are multi-valued (`-G fields` has no multiplicity
-# signal, so this set is curated by hand).
-multi = []
+# signal, so this set is curated by hand). Exactly the M1 seed multi set plus
+# the obvious analogs ipv6.addr and sctp.port; extend deliberately, never
+# speculatively — flipping a shipped scalar to multi changes its access type.
+multi = [
+    "eth.addr", "eth.ig", "eth.lg",
+    "ip.addr", "ipv6.addr",
+    "tcp.port", "udp.port", "sctp.port",
+    "dns.qry.name", "dns.qry.type", "dns.qry.class",
+    "dns.resp.name", "dns.resp.type", "dns.resp.class", "dns.resp.ttl",
+    "dns.a", "dns.aaaa", "dns.cname", "dns.ns",
+    "dns.ptr.domain_name", "dns.mx.mail_exchange", "dns.txt",
+]
