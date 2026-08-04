@@ -22,6 +22,7 @@ from typing_extensions import assert_type
 
 from conftest import FakePacket
 from remora import values
+from remora.codegen.mangle import mangle_field
 from remora.expr import Comparison
 from remora.fields import FieldRef, Packet
 from remora.proto import DNS, IP, TCP
@@ -98,6 +99,20 @@ class TestStubTablePairing:
 
     def test_proto_matches_module_name(self, module: ModuleType, cls: type[ProtocolBase]) -> None:
         assert module.__name__.rsplit(".", 1)[-1] == cls._proto_
+
+    def test_attr_names_follow_the_frozen_mangle_policy(
+        self, module: ModuleType, cls: type[ProtocolBase]
+    ) -> None:
+        """Attr names are generated, never hand-edited: re-derive them from the policy.
+
+        Catches locally what previously only the CI drift job would catch — a
+        tandem hand-edit of a ``.py`` table entry and its ``.pyi`` annotation
+        keeps the pairing tests green but breaks emitter-exactness.
+        """
+        for attr, (tshark_name, _, _) in cls._table_.items():
+            assert attr == mangle_field(tshark_name, cls._proto_), (
+                f"{attr}: not what mangle_field({tshark_name!r}, {cls._proto_!r}) emits"
+            )
 
 
 P = TypeVar("P", bound=ProtocolBase)
