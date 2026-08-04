@@ -2,12 +2,13 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-> **As shipped (deviations from this plan):** the review loop improved four interfaces after this plan was written — the plan body below is the historical record, the code is authoritative.
+> **As shipped (deviations from this plan):** the review loop improved five interfaces after this plan was written — the plan body below is the historical record, the code is authoritative.
 >
 > 1. The driver command is `python -m remora.codegen {check,write}` (via `src/remora/codegen/__main__.py`), not `python -m remora.codegen.fingerprint …`, which still runs but emits a runpy `RuntimeWarning`.
 > 2. `find_tshark` raises `FileNotFoundError` (so `main` reports a missing binary as an environment error, exit 2), not `SystemExit`.
 > 3. `tomli` is a runtime dependency (`tomli>=2.0; python_version < '3.11'`) so `import remora.codegen` works on a plain py3.10 install; the unconditional dev-group entry remains for mypy's 3.10-target analysis.
 > 4. `generate_artifacts` returns `tuple[ParseWarning | EmitWarning, ...]` (parse warnings first, input order) — parse warnings are surfaced by `main` on stderr, not discarded.
+> 5. `_tshark_environment` was split into `_tshark_version_output` + `_tshark_dumps` seams and `main` reordered so the version pin is compared before the expensive `-G` dumps are collected.
 
 **Goal:** Every generated protocol artifact carries a provenance fingerprint header, one documented command verifies committed artifacts against a pinned-toolchain regeneration, and a CI job fails with a readable diff on drift.
 
