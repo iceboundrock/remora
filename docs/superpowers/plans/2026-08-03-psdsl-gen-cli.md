@@ -517,9 +517,7 @@ def test_gen_udp_produces_importable_fingerprinted_pair(
 def test_gen_unknown_protocol_fails_cleanly(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    exit_code = main(
-        ["gen", "--protocols", "remora-no-such-proto", "--out", str(tmp_path / "gen")]
-    )
+    exit_code = main(["gen", "--protocols", "remora-no-such-proto", "--out", str(tmp_path / "gen")])
     assert exit_code == 2
     captured = capsys.readouterr()
     assert "error:" in captured.err
