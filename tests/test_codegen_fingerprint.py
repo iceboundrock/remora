@@ -156,10 +156,11 @@ class TestLoadConfig:
         with pytest.raises(ValueError, match=r"\[generate\] must be a table"):
             load_config(config_file)
 
-    def test_repo_config_is_loadable_and_empty(self) -> None:
+    def test_repo_config_is_loadable_and_pinned(self) -> None:
         config = load_config(Path(__file__).parent.parent / "codegen.toml")
         assert config.tshark_version
-        # Issue #19 core protocol set: 30 protocols, 22 multi fields (M1 seed set + ipv6.addr + sctp.port)
+        # Issue #19 core protocol set: 30 protocols, 22 multi fields
+        # (the M1 seed multi set + ipv6.addr + sctp.port).
         assert len(config.protocols) == 30
         assert len(config.multi) == 22
 

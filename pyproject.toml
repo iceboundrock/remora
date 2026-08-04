@@ -67,7 +67,7 @@ select = [
 [tool.ruff.format]
 # Generated protocol modules are byte-exact emitter output; reformatting them
 # would break `python -m remora.codegen check`. _meta.py and __init__.py ride
-# along (they remain fully lint-checked, only the formatter skips them).
+# along (they remain lint-checked apart from E501; only the formatter skips them).
 exclude = ["src/remora/proto/*.py", "src/remora/proto/*.pyi"]
 
 [tool.mypy]
