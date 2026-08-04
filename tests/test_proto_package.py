@@ -72,4 +72,4 @@ def test_no_hand_written_field_tables_remain() -> None:
         assert header is not None, f"{path.name} lacks a fingerprint header"
         assert header.tshark_version == pinned
         checked += 1
-    assert checked == 2 * len(configured_protocols())
+    assert checked == 2 * len(configured_protocols()) + 1  # + the generated _extras.py map
