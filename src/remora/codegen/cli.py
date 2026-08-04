@@ -43,9 +43,9 @@ def _build_parser() -> argparse.ArgumentParser:
         help="generate protocol modules from the local tshark",
         description=(
             "Run the dump → parse → emit → fingerprint pipeline against the local "
-            "tshark and write importable .py/.pyi pairs to the output directory. Every "
-            "generated field is scalar—multi-occurrence fields resolve to their first "
-            "occurrence."
+            "tshark and write importable .py/.pyi pairs to the output directory. "
+            "Fields listed in --multi are declared multi-valued; all others are "
+            "scalar and resolve to their first occurrence."
         ),
     )
     gen.add_argument(
@@ -61,6 +61,17 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
         metavar="NAME",
         help="tshark protocol abbrevs to generate (e.g. udp dns)",
+    )
+    gen.add_argument(
+        "--multi",
+        nargs="+",
+        action="extend",
+        default=[],
+        metavar="NAME",
+        help=(
+            "tshark field abbrevs to declare multi-valued, emitted as MultiField "
+            "(e.g. dns.qry.name ip.addr); unlisted fields are scalar"
+        ),
     )
     gen.add_argument(
         "--out",
@@ -83,7 +94,7 @@ def _cmd_gen(options: argparse.Namespace) -> int:
     config = CodegenConfig(
         tshark_version=version,
         protocols=tuple(dict.fromkeys(options.protocols)),
-        multi=frozenset(),
+        multi=frozenset(options.multi),
     )
     try:
         artifacts, warnings = generate_artifacts(config, fields_dump, plugins_dump=plugins_dump)

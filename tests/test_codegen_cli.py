@@ -118,6 +118,31 @@ class TestGen:
         options = _build_parser().parse_args(["gen", "--protocols", "udp", "--protocols", "dns"])
         assert options.protocols == ["udp", "dns"]
 
+    def test_multi_flag_emits_multifield(self, tmp_path: Path, fake_tshark: None) -> None:
+        out = tmp_path / "gen"
+        argv = ["gen", "--protocols", "udp", "--multi", "udp.srcport", "--out", str(out)]
+        assert main(argv) == 0
+        pyi = (out / "udp.pyi").read_text(encoding="utf-8")
+        assert "srcport: MultiField[int]" in pyi
+        assert "stream: Field[int]" in pyi  # unlisted field stays scalar
+        py = (out / "udp.py").read_text(encoding="utf-8")
+        assert '"srcport": ("udp.srcport", "FT_UINT16", 1)' in py
+        assert '"stream": ("udp.stream", "FT_UINT32", 0)' in py
+
+    def test_multi_defaults_to_all_scalar(self, tmp_path: Path, fake_tshark: None) -> None:
+        out = tmp_path / "gen"
+        assert main(["gen", "--protocols", "udp", "--out", str(out)]) == 0
+        pyi = (out / "udp.pyi").read_text(encoding="utf-8")
+        assert "MultiField" not in pyi
+
+    def test_repeated_multi_flag_extends_parser_level(self) -> None:
+        from remora.codegen.cli import _build_parser
+
+        options = _build_parser().parse_args(
+            ["gen", "--protocols", "udp", "--multi", "udp.srcport", "--multi", "udp.stream"]
+        )
+        assert options.multi == ["udp.srcport", "udp.stream"]
+
 
 class TestHelp:
     def test_gen_help_documents_every_flag(self, capsys: pytest.CaptureFixture[str]) -> None:
@@ -125,7 +150,7 @@ class TestHelp:
             main(["gen", "--help"])
         assert excinfo.value.code == 0
         message = capsys.readouterr().out
-        for flag in ("--tshark", "--protocols", "--out"):
+        for flag in ("--tshark", "--protocols", "--out", "--multi"):
             assert flag in message
 
     def test_top_level_help_lists_gen(self, capsys: pytest.CaptureFixture[str]) -> None:
