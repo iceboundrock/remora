@@ -43,7 +43,9 @@ def _build_parser() -> argparse.ArgumentParser:
         help="generate protocol modules from the local tshark",
         description=(
             "Run the dump → parse → emit → fingerprint pipeline against the local "
-            "tshark and write importable .py/.pyi pairs to the output directory."
+            "tshark and write importable .py/.pyi pairs to the output directory. Every "
+            "generated field is scalar—multi-occurrence fields resolve to their first "
+            "occurrence."
         ),
     )
     gen.add_argument(
@@ -55,6 +57,7 @@ def _build_parser() -> argparse.ArgumentParser:
     gen.add_argument(
         "--protocols",
         nargs="+",
+        action="extend",
         required=True,
         metavar="NAME",
         help="tshark protocol abbrevs to generate (e.g. udp dns)",

@@ -105,6 +105,19 @@ class TestGen:
         captured = capsys.readouterr()
         assert "error:" in captured.err
 
+    def test_repeated_protocols_flag_accumulates(
+        self, tmp_path: Path, fake_tshark: None, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        out = tmp_path / "gen"
+        assert main(["gen", "--protocols", "udp", "--protocols", "udp", "--out", str(out)]) == 0
+        assert "2 artifact(s)" in capsys.readouterr().out
+
+    def test_repeated_protocols_flag_extends_parser_level(self) -> None:
+        from remora.codegen.cli import _build_parser
+
+        options = _build_parser().parse_args(["gen", "--protocols", "udp", "--protocols", "dns"])
+        assert options.protocols == ["udp", "dns"]
+
 
 class TestHelp:
     def test_gen_help_documents_every_flag(self, capsys: pytest.CaptureFixture[str]) -> None:

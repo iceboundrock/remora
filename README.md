@@ -77,13 +77,18 @@ locally against *your* binary:
 
     uv run psdsl gen --protocols udp dns --out ./gen
 
-`psdsl gen` runs the same dump → parse → emit → fingerprint pipeline as the
-committed artifacts, but against the locally installed tshark (resolved from
-`--tshark`, then `$TSHARK`, then `PATH`, then Homebrew) with no version pin —
-the fingerprint header records whatever version generated the files. A missing
-binary or unknown protocol name exits nonzero with a one-line error.
+`psdsl gen` runs the dump → parse → emit → fingerprint pipeline against the
+locally installed tshark (resolved from `--tshark`, then `$TSHARK`, then
+`PATH`, then Homebrew) with no version pin — the fingerprint header records
+whatever version generated the files. A missing binary or unknown protocol
+name exits nonzero with a one-line error.
 
-**Importing the output.** The output directory is a plain package directory:
+One caveat: `tshark -G fields` carries no multiplicity signal and `psdsl gen`
+takes no curated multi list, so every generated field is declared scalar — a
+field that occurs several times per packet resolves to its first occurrence.
+The committed `remora.proto` modules curate multiplicity by hand.
+
+**Importing the output.** The output directory is a plain directory of modules:
 each `.pyi` stub sits beside its `.py` module, so type checkers and IDEs
 resolve the stubs with no extra configuration. Generate into a directory
 inside your project (say `./gen`) and import it as a package — Python ≥3.3
@@ -97,6 +102,7 @@ query = UDP.srcport == 53
 
 This works as long as the *parent* of the output directory is on the import
 path — true automatically when `gen/` sits in your project root and you run
-Python from there. For mypy, the same layout just works; if you generate
-outside the project tree, add the parent directory to `mypy_path` (or
-`MYPYPATH`) and to `sys.path` at runtime.
+Python from there. At runtime, the generated modules import from `remora`, so
+`remora` must be installed in the environment that imports them. For mypy, the
+same layout just works; if you generate outside the project tree, add the
+parent directory to `mypy_path` (or `MYPYPATH`) and to `sys.path` at runtime.
