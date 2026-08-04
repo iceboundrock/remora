@@ -31,7 +31,7 @@
 
 Add to `class TestGen` in `tests/test_codegen_cli.py` (note: `assert_type`-style static assertions are not needed here — these are runtime tests over generated source text):
 
-```python
+```text
     def test_multi_flag_emits_multifield(self, tmp_path: Path, fake_tshark: None) -> None:
         out = tmp_path / "gen"
         argv = ["gen", "--protocols", "udp", "--multi", "udp.srcport", "--out", str(out)]
@@ -60,7 +60,7 @@ Add to `class TestGen` in `tests/test_codegen_cli.py` (note: `assert_type`-style
 
 In `class TestHelp`, extend the flag loop in `test_gen_help_documents_every_flag`:
 
-```python
+```text
         for flag in ("--tshark", "--protocols", "--out", "--multi"):
             assert flag in message
 ```
@@ -74,7 +74,7 @@ Expected: the three new tests FAIL (`unrecognized arguments: --multi` → exit c
 
 In `src/remora/codegen/cli.py`, add after the `--protocols` argument in `_build_parser` (before `--out`):
 
-```python
+```text
     gen.add_argument(
         "--multi",
         nargs="+",
@@ -90,13 +90,13 @@ In `src/remora/codegen/cli.py`, add after the `--protocols` argument in `_build_
 
 In `_cmd_gen`, replace `multi=frozenset(),` with:
 
-```python
+```text
         multi=frozenset(options.multi),
 ```
 
 Update the `gen` subparser `description` — the current text ends with "Every generated field is scalar—multi-occurrence fields resolve to their first occurrence." Replace that sentence so the description reads:
 
-```python
+```text
         description=(
             "Run the dump → parse → emit → fingerprint pipeline against the local "
             "tshark and write importable .py/.pyi pairs to the output directory. "
