@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import sys
 from pathlib import Path
 
@@ -127,3 +128,23 @@ def test_pyproject_declares_psdsl_console_script() -> None:
     with pyproject.open("rb") as handle:
         data = tomllib.load(handle)
     assert data["project"]["scripts"]["psdsl"] == "remora.codegen.cli:main"
+
+
+class TestGeneratedOutputImport:
+    def test_import_from_temp_out_dir(
+        self, tmp_path: Path, fake_tshark: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The documented mechanism: out dir = package dir, parent on sys.path."""
+        out = tmp_path / "genproto"
+        assert main(["gen", "--protocols", "udp", "--out", str(out)]) == 0
+        monkeypatch.syspath_prepend(str(tmp_path))
+        try:
+            module = importlib.import_module("genproto.udp")
+            udp = module.UDP
+            ref = udp.srcport == 53
+            assert type(ref).__name__ == "Comparison"
+            assert udp._table_["srcport"] == ("udp.srcport", "FT_UINT16", 0)
+            assert (out / "udp.pyi").is_file()  # stub sits beside the module
+        finally:
+            sys.modules.pop("genproto.udp", None)
+            sys.modules.pop("genproto", None)
