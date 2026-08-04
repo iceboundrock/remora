@@ -331,8 +331,13 @@ class TestMain:
         proto_dir.mkdir()
         monkeypatch.setattr(
             fingerprint_module,
-            "_tshark_environment",
-            lambda tshark: (f"TShark (Wireshark) {reported_version} (Git).", dump, ""),
+            "_tshark_version_output",
+            lambda tshark: f"TShark (Wireshark) {reported_version} (Git).",
+        )
+        monkeypatch.setattr(
+            fingerprint_module,
+            "_tshark_dumps",
+            lambda tshark: (dump, ""),
         )
         monkeypatch.setenv("TSHARK", "/usr/bin/true")
         return config_file, proto_dir
@@ -374,6 +379,19 @@ class TestMain:
         assert "4.6.7" in captured.err
         assert "4.6.6" in captured.err
 
+    def test_version_mismatch_skips_the_expensive_dumps(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The pin is compared before ``-G fields``/``-G plugins`` are collected."""
+        config_file, proto_dir = self._prepare(tmp_path, monkeypatch, reported_version="4.6.7")
+
+        def explode(tshark: str) -> tuple[str, str]:
+            raise AssertionError("dumps must not be collected on pin mismatch")
+
+        monkeypatch.setattr(fingerprint_module, "_tshark_dumps", explode)
+        assert main(self._argv("check", config_file, proto_dir)) == 2
+        assert "4.6.7" in capsys.readouterr().err
+
     def test_empty_config_passes_trivially(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -402,12 +420,12 @@ class TestMain:
     ) -> None:
         config_file, proto_dir = self._prepare(tmp_path, monkeypatch)
 
-        def explode(tshark: str) -> tuple[str, str, str]:
+        def explode(tshark: str) -> tuple[str, str]:
             raise subprocess.CalledProcessError(
                 2, [tshark, "-G", "fields"], output="", stderr="tshark: bad dissector\n"
             )
 
-        monkeypatch.setattr(fingerprint_module, "_tshark_environment", explode)
+        monkeypatch.setattr(fingerprint_module, "_tshark_dumps", explode)
         assert main(self._argv("check", config_file, proto_dir)) == 2
         captured = capsys.readouterr()
         assert "error:" in captured.err
@@ -420,8 +438,8 @@ class TestMain:
         config_file, proto_dir = self._prepare(tmp_path, monkeypatch)
         monkeypatch.setattr(
             fingerprint_module,
-            "_tshark_environment",
-            lambda tshark: ("not tshark output at all\n", SAMPLE_DUMP, ""),
+            "_tshark_version_output",
+            lambda tshark: "not tshark output at all\n",
         )
         assert main(self._argv("check", config_file, proto_dir)) == 2
         captured = capsys.readouterr()

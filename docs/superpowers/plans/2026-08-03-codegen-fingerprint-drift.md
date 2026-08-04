@@ -2,6 +2,13 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **As shipped (deviations from this plan):** the review loop improved four interfaces after this plan was written — the plan body below is the historical record, the code is authoritative.
+>
+> 1. The driver command is `python -m remora.codegen {check,write}` (via `src/remora/codegen/__main__.py`), not `python -m remora.codegen.fingerprint …`, which still runs but emits a runpy `RuntimeWarning`.
+> 2. `find_tshark` raises `FileNotFoundError` (so `main` reports a missing binary as an environment error, exit 2), not `SystemExit`.
+> 3. `tomli` is a runtime dependency (`tomli>=2.0; python_version < '3.11'`) so `import remora.codegen` works on a plain py3.10 install; the unconditional dev-group entry remains for mypy's 3.10-target analysis.
+> 4. `generate_artifacts` returns `tuple[ParseWarning | EmitWarning, ...]` (parse warnings first, input order) — parse warnings are surfaced by `main` on stderr, not discarded.
+
 **Goal:** Every generated protocol artifact carries a provenance fingerprint header, one documented command verifies committed artifacts against a pinned-toolchain regeneration, and a CI job fails with a readable diff on drift.
 
 **Architecture:** `src/remora/codegen/fingerprint.py` gets four layers, each pure and unit-testable with synthetic inputs: (1) the `Fingerprint` value + header render/parse/attach, (2) `codegen.toml` config loading (the single source of truth for the pinned tshark version, the generated protocol list, and the multi-field set), (3) `generate_artifacts`/`check_artifacts` composing the existing `parse_fields_dump` + `emit_protocol` pipeline with headers and diffing against `src/remora/proto/`, (4) a `python -m remora.codegen.fingerprint {check,write}` driver that is the only place tshark subprocesses are spawned. A new CI job installs tshark from the wireshark-dev/stable PPA and runs `check`; the check command itself enforces the version pin.

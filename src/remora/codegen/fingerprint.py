@@ -10,6 +10,11 @@ generated file carries a provenance header:
     # env: plugins=none | plugins=sha256:<12 hex of the -G plugins dump>
     # generator: remora <version>
 
+The ``env:`` line summarizes only the ``-G plugins`` dump; Lua scripts are not
+separately summarized, because the fields and protocols they register surface
+through the ``-G fields`` dump itself, so ``dump-sha256`` (not ``env``) is what
+catches Lua-driven drift.
+
 ``python -m remora.codegen check`` regenerates everything named by
 ``codegen.toml`` under the pinned tshark and diffs against the committed
 files; ``write`` regenerates in place. Seed modules carry no header and are
@@ -271,13 +276,19 @@ def find_tshark(explicit: str | None = None) -> str:
     return candidate
 
 
-def _tshark_environment(tshark: str) -> tuple[str, str, str]:
-    """Run tshark once each for version, fields dump, and plugins dump."""
+def _run_tshark(tshark: str, *args: str) -> str:
+    """Run one tshark subcommand and return its stdout; CalledProcessError on failure."""
+    return subprocess.run([tshark, *args], check=True, capture_output=True, text=True).stdout
 
-    def run(*args: str) -> str:
-        return subprocess.run([tshark, *args], check=True, capture_output=True, text=True).stdout
 
-    return run("--version"), run("-G", "fields"), run("-G", "plugins")
+def _tshark_version_output(tshark: str) -> str:
+    """Run ``tshark --version`` and return its stdout."""
+    return _run_tshark(tshark, "--version")
+
+
+def _tshark_dumps(tshark: str) -> tuple[str, str]:
+    """Run ``tshark -G fields`` and ``tshark -G plugins``; return both dumps."""
+    return _run_tshark(tshark, "-G", "fields"), _run_tshark(tshark, "-G", "plugins")
 
 
 def _environment_error_message(error: Exception) -> str:
@@ -309,18 +320,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     try:
-        version_output, fields_dump, plugins_dump = _tshark_environment(find_tshark(options.tshark))
-        installed = parse_tshark_version(version_output)
+        tshark = find_tshark(options.tshark)
+        installed = parse_tshark_version(_tshark_version_output(tshark))
+        if installed != config.tshark_version:
+            print(
+                f"error: installed tshark {installed} does not match the pinned "
+                f"{config.tshark_version} in {options.config}; install the pinned version "
+                "or update the pin and regenerate every artifact",
+                file=sys.stderr,
+            )
+            return 2
+        # The pin is checked first so a mismatched build never pays for the dumps.
+        fields_dump, plugins_dump = _tshark_dumps(tshark)
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
         print(f"error: {_environment_error_message(error)}", file=sys.stderr)
-        return 2
-    if installed != config.tshark_version:
-        print(
-            f"error: installed tshark {installed} does not match the pinned "
-            f"{config.tshark_version} in {options.config}; install the pinned version "
-            "or update the pin and regenerate every artifact",
-            file=sys.stderr,
-        )
         return 2
 
     try:
