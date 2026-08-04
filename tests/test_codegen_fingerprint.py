@@ -196,6 +196,57 @@ class TestLoadConfig:
         # Spot-check protocol membership
         assert "tls" in config.protocols
 
+    def test_extras_parsed_in_order(self, tmp_path: Path) -> None:
+        path = tmp_path / "codegen.toml"
+        path.write_text(
+            "[tshark]\nversion = '4.6.6'\n"
+            "[generate]\nprotocols = ['udp']\n"
+            "[extras.wireless]\nprotocols = ['wlan', 'radiotap']\n"
+            "[extras.telecom]\nprotocols = ['gtp']\n",
+            encoding="utf-8",
+        )
+        config = load_config(path)
+        assert config.extras == (
+            ("wireless", ("wlan", "radiotap")),
+            ("telecom", ("gtp",)),
+        )
+
+    def test_extras_default_empty(self, tmp_path: Path) -> None:
+        path = tmp_path / "codegen.toml"
+        path.write_text("[tshark]\nversion = '4.6.6'\n", encoding="utf-8")
+        assert load_config(path).extras == ()
+
+    def test_extras_non_table_rejected(self, tmp_path: Path) -> None:
+        path = tmp_path / "codegen.toml"
+        path.write_text(
+            "[tshark]\nversion = '4.6.6'\n[extras]\nwireless = ['wlan']\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match=r"\[extras\.wireless\] must be a table"):
+            load_config(path)
+
+    def test_protocol_in_core_and_extra_rejected(self, tmp_path: Path) -> None:
+        path = tmp_path / "codegen.toml"
+        path.write_text(
+            "[tshark]\nversion = '4.6.6'\n"
+            "[generate]\nprotocols = ['wlan']\n"
+            "[extras.wireless]\nprotocols = ['wlan']\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="'wlan' assigned more than once"):
+            load_config(path)
+
+    def test_protocol_in_two_extras_rejected(self, tmp_path: Path) -> None:
+        path = tmp_path / "codegen.toml"
+        path.write_text(
+            "[tshark]\nversion = '4.6.6'\n"
+            "[extras.wireless]\nprotocols = ['wlan']\n"
+            "[extras.industrial]\nprotocols = ['wlan']\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="'wlan' assigned more than once"):
+            load_config(path)
+
 
 def _config(**overrides: object) -> CodegenConfig:
     base: dict[str, object] = {

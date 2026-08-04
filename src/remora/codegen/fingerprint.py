@@ -153,6 +153,7 @@ class CodegenConfig:
     tshark_version: str
     protocols: tuple[str, ...]
     multi: frozenset[str]
+    extras: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
 
 def _str_list(raw: object, where: str) -> tuple[str, ...]:
@@ -174,10 +175,32 @@ def load_config(path: Path) -> CodegenConfig:
     generate = data.get("generate", {})
     if not isinstance(generate, dict):
         raise ValueError("codegen.toml: [generate] must be a table")
+    raw_extras = data.get("extras", {})
+    if not isinstance(raw_extras, dict):
+        raise ValueError("codegen.toml: [extras] must be a table")
+    extras: list[tuple[str, tuple[str, ...]]] = []
+    for extra_name, spec in raw_extras.items():
+        if not isinstance(spec, dict):
+            raise ValueError(f"codegen.toml: [extras.{extra_name}] must be a table")
+        extras.append(
+            (extra_name, _str_list(spec.get("protocols", []), f"[extras.{extra_name}] protocols"))
+        )
+    seen: set[str] = set()
+    for abbrev in [
+        *_str_list(generate.get("protocols", []), "[generate] protocols"),
+        *(abbrev for _, protocols in extras for abbrev in protocols),
+    ]:
+        if abbrev in seen:
+            raise ValueError(
+                f"codegen.toml: protocol {abbrev!r} assigned more than once "
+                "across [generate] and [extras]"
+            )
+        seen.add(abbrev)
     return CodegenConfig(
         tshark_version=version,
         protocols=_str_list(generate.get("protocols", []), "[generate] protocols"),
         multi=frozenset(_str_list(generate.get("multi", []), "[generate] multi")),
+        extras=tuple(extras),
     )
 
 
