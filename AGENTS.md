@@ -45,7 +45,7 @@ Data flow for a query: **Expr IR → planner → tshark argv → reader → RawP
 
 Cross-cutting invariants:
 
-- `tests/test_proto_seed.py` pairing tests are the frozen-format contract, now running against the generated core modules — keep them passing unmodified.
+- `tests/test_proto_seed.py` pairing tests are the frozen-format contract, running against all generated core modules (reshaped in #19 when the generated tree replaced the hand-written seeds) — from here on, keep them passing unmodified.
 - Attribute names come from the frozen mangle policy (`src/remora/codegen/mangle.py`) at generation time; `_table_` stores the full tshark name precisely so nothing at runtime may re-derive tshark names from attribute names or vice versa.
 - Absence is `()` from `get_raw`, `None` from scalar instance access, `()` from multi instance access — never an exception (except `FieldNotProjectedError` for fields outside a `-T fields` projection).
 - Underscore-prefixed attributes on protocol classes are reserved; ruff RUF012 requires the `ClassVar[FieldTable]` annotation on tables.

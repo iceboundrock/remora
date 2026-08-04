@@ -14,6 +14,13 @@ Robustness policy — no line is ever silently dropped:
   *first* occurrence wins; every later duplicate is skipped and recorded as
   a warning. Input line order makes this deterministic. Real dumps contain
   duplicate protocol abbrevs (e.g. ``tpkt`` in tshark 4.6.x).
+
+  Since #68 callers feed this parser the *canonicalized* (line-sorted) dump,
+  so "first occurrence" means first in canonical order, not in tshark's own
+  emission order. That is intentional — tshark's order varies between runs,
+  and only the canonical order makes the winner reproducible — but it does
+  pick a different winner for at least one duplicate protocol than raw order
+  would (``ipv6.routing.type.mipv6``, observed on 4.6.7).
 - Blank lines (empty or whitespace-only) are skipped silently.
 
 The bitmask and blurb columns are currently not modeled (nothing consumes
