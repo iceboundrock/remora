@@ -18,8 +18,10 @@ catches Lua-driven drift.
 ``python -m remora.codegen check`` regenerates everything named by
 ``codegen.toml`` under the pinned tshark and diffs against the committed
 files; ``write`` regenerates in place. Seed modules carry no header and are
-ignored. Only :func:`main` spawns tshark — everything else is pure and takes
-dump text, so tests need no tshark binary.
+ignored. tshark is spawned only by :func:`main` and by ``psdsl gen``
+(:mod:`remora.codegen.cli`), both through the ``_tshark_version_output``/
+``_tshark_dumps`` seams here — everything else is pure and takes dump text,
+so tests need no tshark binary.
 """
 
 from __future__ import annotations
