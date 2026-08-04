@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import subprocess
 from pathlib import Path
 
@@ -133,6 +134,18 @@ class TestLoadConfig:
             encoding="utf-8",
         )
         with pytest.raises(ValueError, match="protocols"):
+            load_config(config_file)
+
+    def test_non_table_tshark_section_rejected(self, tmp_path: Path) -> None:
+        config_file = tmp_path / "codegen.toml"
+        config_file.write_text("tshark = 5\n", encoding="utf-8")
+        with pytest.raises(ValueError, match=r"\[tshark\] must be a table"):
+            load_config(config_file)
+
+    def test_non_table_generate_section_rejected(self, tmp_path: Path) -> None:
+        config_file = tmp_path / "codegen.toml"
+        config_file.write_text('generate = 5\n\n[tshark]\nversion = "4.6.6"\n', encoding="utf-8")
+        with pytest.raises(ValueError, match=r"\[generate\] must be a table"):
             load_config(config_file)
 
     def test_repo_config_is_loadable_and_empty(self) -> None:
@@ -408,6 +421,15 @@ class TestMain:
         assert (fresh / "udp.py").is_file()
         assert (fresh / "udp.pyi").is_file()
         capsys.readouterr()
+
+
+def test_codegen_package_is_runnable_as_a_module() -> None:
+    """``python -m remora.codegen`` needs a __main__ so runpy does not re-execute
+    fingerprint.py (which the package __init__ already imported) and warn.
+
+    The spec is only located, never imported: importing it runs the CLI.
+    """
+    assert importlib.util.find_spec("remora.codegen.__main__") is not None
 
 
 def test_codegen_package_reexports() -> None:

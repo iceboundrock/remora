@@ -51,4 +51,4 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tshark
           tshark --version | head -n 1
       - name: Check generated-artifact drift
-        run: uv run python -m remora.codegen.fingerprint check
+        run: uv run python -m remora.codegen check

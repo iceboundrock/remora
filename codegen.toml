@@ -1,6 +1,6 @@
 # Single source of truth for the generated-artifact toolchain (issue #16).
 #
-# CI consumes this file through `python -m remora.codegen.fingerprint check`;
+# CI consumes this file through `python -m remora.codegen check`;
 # docs point here. The pinned tshark version appears nowhere else.
 
 [tshark]

@@ -61,10 +61,10 @@ Generated protocol modules under `src/remora/proto/` carry a fingerprint header 
 
 Verify the committed artifacts against a fresh regeneration:
 
-    uv run python -m remora.codegen.fingerprint check
+    uv run python -m remora.codegen check
 
 The command exits non-zero with a unified diff when any committed artifact drifts from what the pinned tshark regenerates, and refuses to run against a tshark that does not match the pin. To regenerate in place after a pin bump or emitter change:
 
-    uv run python -m remora.codegen.fingerprint write
+    uv run python -m remora.codegen write
 
-CI runs the same check on every push and pull request.
+CI runs the same check on every pull request and push to `main`.

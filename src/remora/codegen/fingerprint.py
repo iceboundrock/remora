@@ -10,8 +10,8 @@ generated file carries a provenance header:
     # env: plugins=none | plugins=sha256:<12 hex of the -G plugins dump>
     # generator: remora <version>
 
-``python -m remora.codegen.fingerprint check`` regenerates everything named
-by ``codegen.toml`` under the pinned tshark and diffs against the committed
+``python -m remora.codegen check`` regenerates everything named by
+``codegen.toml`` under the pinned tshark and diffs against the committed
 files; ``write`` regenerates in place. Seed modules carry no header and are
 ignored. Only :func:`main` spawns tshark — everything else is pure and takes
 dump text, so tests need no tshark binary.
@@ -132,10 +132,15 @@ def load_config(path: Path) -> CodegenConfig:
     """Load ``codegen.toml``; raise ValueError with a readable message if invalid."""
     with path.open("rb") as handle:
         data = tomllib.load(handle)
-    version = data.get("tshark", {}).get("version")
+    tshark = data.get("tshark", {})
+    if not isinstance(tshark, dict):
+        raise ValueError("codegen.toml: [tshark] must be a table")
+    version = tshark.get("version")
     if not isinstance(version, str) or not version:
         raise ValueError("codegen.toml: [tshark] version must be a non-empty string")
     generate = data.get("generate", {})
+    if not isinstance(generate, dict):
+        raise ValueError("codegen.toml: [generate] must be a table")
     return CodegenConfig(
         tshark_version=version,
         protocols=_str_list(generate.get("protocols", []), "[generate] protocols"),
@@ -281,9 +286,9 @@ def _environment_error_message(error: Exception) -> str:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Entry point for ``python -m remora.codegen.fingerprint`` (see module docs)."""
+    """Entry point for ``python -m remora.codegen`` (see module docs)."""
     parser = argparse.ArgumentParser(
-        prog="python -m remora.codegen.fingerprint",
+        prog="python -m remora.codegen",
         description="Check or regenerate fingerprinted protocol artifacts.",
     )
     parser.add_argument("command", choices=("check", "write"))
@@ -344,7 +349,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(message, file=sys.stderr)
         print(
             f"error: {len(report.messages)} artifact problem(s); regenerate with "
-            f"`uv run python -m remora.codegen.fingerprint write` under tshark "
+            f"`uv run python -m remora.codegen write` under tshark "
             f"{config.tshark_version}",
             file=sys.stderr,
         )
