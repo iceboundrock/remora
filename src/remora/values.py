@@ -27,8 +27,15 @@ FT_ABSOLUTE_TIME          datetime (aware, UTC)       epoch seconds, e.g. ``"162
 FT_RELATIVE_TIME          timedelta                   seconds, e.g. ``"0.000123"``
 FT_DOUBLE, FT_FLOAT       float                       anything :func:`float` accepts
 FT_STRING, FT_STRINGZ,    str                         identity (returned unchanged)
-FT_NONE
+FT_NONE, FT_STRINGZPAD,
+FT_UINT_STRING, FT_EUI64,
+FT_OID, FT_GUID, FT_AX25
 ========================  ==========================  =======================================
+
+The last six are carried as ``str`` deliberately, not for lack of a better
+idea: richer typing (EUI-64/GUID as bytes, OID as a tuple of ints) is tracked
+in issue #69, and would change the shipped static type of every field using
+them.
 
 Unknown ftypes fall back to ``str`` (identity), so new or exotic dissector
 types degrade gracefully instead of failing.
@@ -164,6 +171,21 @@ _INT_FTYPES = (
     "FT_CHAR",
 )
 
+_STR_FTYPES = (
+    # Surfaced by the issue #19 core protocol set. These already resolved to
+    # ``str`` through the unknown-ftype fallback; listing them makes the choice
+    # deliberate rather than accidental, so `test_every_ftype_is_known` can hold
+    # the line on genuinely unrecognized ftypes. Richer typing (EUI-64 and GUID
+    # as bytes, OID as a tuple of ints) is tracked in issue #69 — changing them
+    # changes the shipped static type of every field that uses them.
+    "FT_EUI64",  # dns, icmpv6
+    "FT_OID",  # snmp, tls
+    "FT_UINT_STRING",  # ssh
+    "FT_GUID",  # dhcp, sip
+    "FT_STRINGZPAD",  # dhcp, stp
+    "FT_AX25",  # arp
+)
+
 FTYPE_TABLE: Mapping[str, FTypeInfo[Any]] = {
     "FT_IPv4": FTypeInfo(IPv4Address, IPv4Address),
     "FT_IPv6": FTypeInfo(IPv6Address, IPv6Address),
@@ -177,6 +199,7 @@ FTYPE_TABLE: Mapping[str, FTypeInfo[Any]] = {
     "FT_STRING": _STR_INFO,
     "FT_STRINGZ": _STR_INFO,
     "FT_NONE": _STR_INFO,
+    **{name: _STR_INFO for name in _STR_FTYPES},
     **{name: _INT_INFO for name in _INT_FTYPES},
 }
 
