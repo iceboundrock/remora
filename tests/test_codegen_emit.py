@@ -13,7 +13,7 @@ from types import ModuleType
 import pytest
 
 from conftest import FakePacket
-from remora.codegen.emit import EmittedModule, emit_protocol, mangle_protocol
+from remora.codegen.emit import EmittedModule, emit_extras_map, emit_protocol, mangle_protocol
 from remora.codegen.parse import FieldDef, Protocol
 from remora.proto._meta import ProtocolBase
 from test_proto_seed import SEEDS, stub_fields
@@ -503,3 +503,22 @@ def test_emitted_dns_stub_passes_mypy_strict(tmp_path: Path) -> None:
         timeout=120,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+class TestEmitExtrasMap:
+    def test_sorted_deterministic_source(self) -> None:
+        source = emit_extras_map([("wlan", "wireless"), ("dnp3", "industrial")])
+        assert source == emit_extras_map([("dnp3", "industrial"), ("wlan", "wireless")])
+        assert '"dnp3": "industrial",' in source
+        assert source.index('"dnp3"') < source.index('"wlan"')
+        assert source.endswith("\n")
+
+    def test_empty_map(self) -> None:
+        source = emit_extras_map([])
+        assert "EXTRAS_MODULES: dict[str, str] = {}" in source
+
+    def test_source_executes_and_typechecks_shape(self) -> None:
+        source = emit_extras_map([("wlan", "wireless")])
+        namespace: dict[str, object] = {}
+        exec(compile(source, "_extras.py", "exec"), namespace)
+        assert namespace["EXTRAS_MODULES"] == {"wlan": "wireless"}
