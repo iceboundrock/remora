@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import enum
 import re
+import string
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -275,9 +276,129 @@ class Contains(Expr):
             raise ValueError("contains needle must not be empty (it would match every packet)")
 
 
+#: Escapes with identical meaning in Python ``re`` and PCRE2, inside a class.
+_SHARED_CLASS_ESCAPES = frozenset("dDwWsSnrtfv")
+#: Additional escapes shared outside a character class.
+_SHARED_ESCAPES = _SHARED_CLASS_ESCAPES | frozenset("bB")
+#: Group prefixes (after ``(``) with identical meaning in both dialects.
+_SHARED_GROUP_PREFIXES = ("?:", "?=", "?!", "?<=", "?<!")
+#: ``{m}`` / ``{m,}`` / ``{m,n}`` — the brace-quantifier forms both dialects share.
+_QUANTIFIER_BRACE = re.compile(r"\{\d+(?:,\d*)?\}")
+
+
+def _subset_error(pattern: str, position: int, reason: str) -> ValueError:
+    return ValueError(
+        f"unsupported regex in {pattern!r} at position {position}: {reason}; "
+        "matches() accepts only the Python-re/PCRE2 common subset (see Matches)"
+    )
+
+
+def _consume_escape(pattern: str, i: int, in_class: bool) -> int:
+    """Validate the escape starting at ``pattern[i] == '\\'``; return the index
+    after it. Escaped punctuation is literal in both dialects; alphanumeric
+    escapes are allowed only from the shared whitelist (``\\xHH`` with exactly
+    two hex digits; ``\\p{...}``, ``\\x{...}``, ``\\A``, ``\\h``, backreferences
+    etc. are dialect-specific and rejected)."""
+    if i + 1 >= len(pattern):
+        return i + 1  # trailing backslash: re.compile reports it as a syntax error
+    nxt = pattern[i + 1]
+    if not nxt.isalnum():
+        return i + 2
+    if nxt == "x":
+        digits = pattern[i + 2 : i + 4]
+        if len(digits) == 2 and all(c in string.hexdigits for c in digits):
+            return i + 4
+        raise _subset_error(pattern, i, r"escape '\x' must be followed by exactly two hex digits")
+    allowed = _SHARED_CLASS_ESCAPES if in_class else _SHARED_ESCAPES
+    if nxt in allowed:
+        return i + 2
+    raise _subset_error(pattern, i, f"escape '\\{nxt}' is dialect-specific")
+
+
+def _validate_matches_subset(pattern: str) -> None:
+    """Reject regex constructs outside the Python-re/PCRE2 common subset.
+
+    A ``matches`` pattern is compiled by Wireshark's PCRE2 when the expression
+    is pushed down and by Python ``re`` when it lands in the residual
+    predicate. The two dialects agree only on a common core; anything outside
+    it (possessive quantifiers, atomic groups, branch reset, inline flags,
+    named groups, backreferences, conditionals, POSIX classes, ``\\x{...}``,
+    ``\\A``/``\\p{...}``/``\\h``, ...) would change meaning — or validity —
+    depending on which backend evaluates the expression, so construction
+    rejects it loudly. Structural syntax errors (unbalanced brackets and the
+    like) are left for ``re.compile`` to report.
+    """
+    i = 0
+    n = len(pattern)
+    in_class = False
+    prev_quant = False
+    while i < n:
+        ch = pattern[i]
+        if in_class:
+            if ch == "\\":
+                i = _consume_escape(pattern, i, in_class=True)
+                continue
+            if ch == "[":
+                raise _subset_error(
+                    pattern,
+                    i,
+                    "'[' inside a character class (POSIX classes diverge); escape it as '\\['",
+                )
+            if ch == "]":
+                in_class = False
+            i += 1
+            continue
+        if prev_quant and ch == "+":
+            raise _subset_error(pattern, i, "possessive quantifiers are dialect-specific")
+        was_quant = False
+        if ch == "\\":
+            i = _consume_escape(pattern, i, in_class=False)
+        elif ch == "[":
+            in_class = True
+            i += 1
+        elif ch == "(":
+            if pattern[i + 1 : i + 2] == "?" and not any(
+                pattern.startswith(prefix, i + 1) for prefix in _SHARED_GROUP_PREFIXES
+            ):
+                raise _subset_error(pattern, i, "group construct '(?...' is dialect-specific")
+            i += 1
+        elif ch == "{":
+            match = _QUANTIFIER_BRACE.match(pattern, i)
+            if match is None:
+                raise _subset_error(
+                    pattern,
+                    i,
+                    "unescaped '{' does not form a shared quantifier "
+                    "({m}, {m,}, {m,n}); escape it as '\\{'",
+                )
+            i = match.end()
+            was_quant = True
+        elif ch in "*+?":
+            # A '?' directly after a quantifier is the shared lazy modifier,
+            # not a quantifier of its own.
+            was_quant = not (prev_quant and ch == "?")
+            i += 1
+        else:
+            i += 1
+        prev_quant = was_quant
+
+
 @dataclass(frozen=True, eq=False, slots=True)
 class Matches(Expr):
-    """``field matches pattern`` — case-insensitive regex test (Wireshark default)."""
+    """``field matches pattern`` — case-insensitive regex test (Wireshark default).
+
+    Patterns are restricted at construction to the Python-re/PCRE2 common
+    subset, so a pattern means the same thing whether tshark (PCRE2) or the
+    Python predicate backend (``re``) evaluates it. Accepted: literals, ``.``,
+    ``^``/``$``, alternation ``|``, quantifiers ``*`` ``+`` ``?`` ``{m}``
+    ``{m,}`` ``{m,n}`` with the lazy ``?`` modifier, plain and ``(?:...)``
+    groups, lookarounds, character classes with ranges/negation, escaped
+    punctuation, and the escapes ``\\d \\D \\w \\W \\s \\S \\b \\B \\n \\r
+    \\t \\f \\v \\xHH``. Dialect-specific constructs — possessive/atomic
+    forms, inline flags, named groups, backreferences, branch reset,
+    conditionals, POSIX classes, ``\\x{...}``, ``\\A``/``\\p{...}``/``\\h``
+    — raise :class:`ValueError`.
+    """
 
     field: FieldLike
     pattern: str
@@ -285,6 +406,7 @@ class Matches(Expr):
     def __post_init__(self) -> None:
         if not isinstance(self.pattern, str):
             raise TypeError(f"matches pattern must be str, not {type(self.pattern).__name__}")
+        _validate_matches_subset(self.pattern)
         try:
             re.compile(self.pattern)
         except re.error as exc:
@@ -384,7 +506,8 @@ class FieldExprOps:
         return Contains(self._self_field(), needle)
 
     def matches(self, pattern: str) -> Matches:
-        """Case-insensitive regex test: ``HOST.matches(r"^ex.*com$")``."""
+        """Case-insensitive regex test: ``HOST.matches(r"^ex.*com$")`` (Python-re/PCRE2
+        common subset only — see :class:`Matches`)."""
         return Matches(self._self_field(), pattern)
 
     def __contains__(self, item: object) -> NoReturn:

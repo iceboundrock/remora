@@ -23,7 +23,9 @@ Rendering rules
   UnsupportedExprError.
 - ``Matches(field, pattern)`` -> ``field matches "pattern"``, string fields
   only. Wireshark's ``matches`` is case-insensitive by default; the predicate
-  backend mirrors that with ``re.IGNORECASE``.
+  backend mirrors that with ``re.IGNORECASE``. Patterns are restricted at
+  construction to the Python-re/PCRE2 common subset (see
+  :class:`remora.expr.Matches`), so pushing one down cannot change its meaning.
 
 Literal rendering
 -----------------

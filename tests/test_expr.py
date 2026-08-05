@@ -324,3 +324,70 @@ class TestExtendedWalkers:
         tree = (PORT.in_([80]) & HOST.contains("a")) | ~HOST.matches("b")
         names = [f.name for f in field_refs(tree)]
         assert names == ["tcp.port", "http.host", "http.host"]
+
+
+class TestMatchesCommonSubset:
+    """matches() accepts only the Python-re/PCRE2 common subset (PR #73):
+    a pattern must mean the same thing whether it is pushed to tshark (PCRE2)
+    or evaluated as a residual predicate (Python re), so dialect-specific
+    constructs are rejected at construction — on every Python version."""
+
+    @pytest.mark.parametrize(
+        "pattern",
+        [
+            "",
+            "example",
+            "^ex.*com$",
+            "a.c",
+            "foo|bar",
+            "[a-z0-9]+",
+            "[^/]{1,8}",
+            "ab{2,3}c",
+            "ab{2,}?c",
+            r"foo\.bar",
+            r"\d+\.\d+",
+            r"\bword\b",
+            r"(?:ab)+?",
+            r"(?=look)a",
+            r"(?!no)a",
+            r"(?<=pre)a",
+            r"(?<!pre)a",
+            r"(a|b)c",
+            r"\x2f",
+            r"[\d\s-]",
+            "café",
+        ],
+    )
+    def test_common_subset_patterns_accepted(self, pattern: str) -> None:
+        assert HOST.matches(pattern).pattern == pattern
+
+    @pytest.mark.parametrize(
+        ("pattern", "construct"),
+        [
+            ("(?|alpha|gamma)", "group"),  # PCRE2 branch reset (the review's repro)
+            ("(?>a+)b", "group"),  # atomic group
+            ("a*+", "possessive"),
+            ("a++", "possessive"),
+            ("ab{2,3}+c", "possessive"),
+            ("(?i)a", "group"),  # inline flags
+            ("(?P<name>a)", "group"),  # named group, Python spelling
+            ("(?<name>a)", "group"),  # named group, PCRE2 spelling
+            ("(?#comment)a", "group"),
+            ("(?(1)a|b)", "group"),  # conditional
+            (r"(a)\1", "escape"),  # backreference
+            (r"\Astart", "escape"),
+            (r"\h+", "escape"),  # PCRE2 horizontal whitespace
+            (r"\p{L}", "escape"),  # unicode property
+            (r"\x{2f}", "escape"),  # PCRE2 braced hex
+            ("[[:alpha:]]", "character class"),  # POSIX class
+            ("{,3}", "quantifier"),  # Python reads {0,3}; PCRE2 reads literal text
+        ],
+    )
+    def test_dialect_specific_patterns_rejected(self, pattern: str, construct: str) -> None:
+        with pytest.raises(ValueError, match="common subset") as exc_info:
+            HOST.matches(pattern)
+        assert construct in str(exc_info.value)
+
+    def test_syntax_errors_still_reported_as_invalid_regex(self) -> None:
+        with pytest.raises(ValueError, match="invalid regular expression"):
+            HOST.matches("[unclosed")
