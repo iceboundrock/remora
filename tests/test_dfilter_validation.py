@@ -161,7 +161,7 @@ class TestSemanticsTableGoldensValidate:
         dfilters = [case.dfilter for case in CASES if case.dfilter is not None]
         # Exact count: a case losing its golden string must fail loudly here.
         # Update deliberately when the table grows.
-        assert len(dfilters) == 23
+        assert len(dfilters) == 24
         _assert_all_valid(
             [
                 (f"semantics[{case.id}]: {case.expr!r}", case.dfilter)
@@ -274,4 +274,29 @@ class TestNeSemanticsParity:
     def test_ne_row_set_matches_predicate_backend(self, pcap: Path, expr: Expr) -> None:
         dfilter = compile_dfilter(expr)
         assert dfilter.startswith("!(")  # sanity: != really is negated ==
+        assert _tshark_matching_frames(pcap, dfilter) == _predicate_matching_frames(pcap, expr)
+
+
+class TestMatchesSemanticsParity:
+    """The row set tshark selects for ``field matches "p"`` must equal the
+    predicate backend's row set for the same Expr — pinning case-insensitive
+    matching, per-occurrence anchoring on multi-value fields, and the
+    absent-field negation contract against a real PCRE2, not just our reading
+    of it (PR #73 review: the common-subset guarantee needs parity evidence)."""
+
+    @pytest.mark.parametrize(
+        ("pcap", "expr"),
+        [
+            pytest.param(DNS_MULTI, DNS.qry_name.matches("^alpha"), id="anchored-multi-occurrence"),
+            pytest.param(DNS_MULTI, DNS.qry_name.matches("ALPHA"), id="case-insensitive"),
+            pytest.param(DNS_MULTI, DNS.qry_name.matches("example$"), id="dollar-anchor"),
+            pytest.param(
+                DNS_MULTI, DNS.qry_name.matches("a{2,}|beta"), id="quantifier-alternation"
+            ),
+            pytest.param(TCP_MIXED, ~DNS.qry_name.matches("alpha"), id="negation-absent-field"),
+        ],
+    )
+    def test_matches_row_set_matches_predicate_backend(self, pcap: Path, expr: Expr) -> None:
+        dfilter = compile_dfilter(expr)
+        assert " matches " in dfilter
         assert _tshark_matching_frames(pcap, dfilter) == _predicate_matching_frames(pcap, expr)

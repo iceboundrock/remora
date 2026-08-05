@@ -317,6 +317,17 @@ CASES: tuple[Case, ...] = (
         ),
     ),
     Case(
+        # Any-occurrence under matches, like every operator (PR #73 review).
+        id="matches-multi-value-any-occurrence",
+        expr=QNAME.matches("^alpha"),
+        dfilter='dns.qry.name matches "^alpha"',
+        rows=(
+            (FakePacket({"dns.qry.name": ("beta.io", "alpha.example")}), True),
+            (FakePacket({"dns.qry.name": ("beta.io", "gamma.net")}), False),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
         id="not-matches-absent-is-true",
         expr=~HOST.matches("com"),
         dfilter='!(http.host matches "com")',
