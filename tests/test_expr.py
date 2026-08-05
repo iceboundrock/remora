@@ -11,12 +11,16 @@ from remora.expr import (
     And,
     CompareOp,
     Comparison,
+    Contains,
     Expr,
     FieldExprOps,
     FieldLike,
+    Matches,
+    Membership,
     Not,
     Or,
     Presence,
+    ValueRange,
     conjuncts,
     field_refs,
 )
@@ -48,6 +52,7 @@ class StubField(FieldExprOps):
 SRC = StubField("ip.src", "FT_IPv4")
 DST = StubField("ip.dst", "FT_IPv4")
 PORT = StubField("tcp.port", "FT_UINT16", multi=True)
+HOST = StubField("http.host", "FT_STRING")
 
 
 class TestOperatorConstruction:
@@ -201,3 +206,113 @@ class TestTyping:
     def test_comparison_is_expr(self) -> None:
         e: Expr = SRC == "10.0.0.1"
         assert isinstance(e, Expr)
+
+
+class TestExtendedOperatorConstruction:
+    def test_in_builds_membership(self) -> None:
+        e = PORT.in_([80, 443])
+        assert isinstance(e, Membership)
+        assert e.field.name == "tcp.port"
+        assert e.values == (80, 443)
+
+    def test_in_converts_range_to_inclusive_value_range(self) -> None:
+        e = PORT.in_([range(8000, 8081)])
+        assert e.values == (ValueRange(8000, 8080),)
+
+    def test_in_converts_pair_tuple_to_value_range(self) -> None:
+        e = PORT.in_([(6000, 6002)])
+        assert e.values == (ValueRange(6000, 6002),)
+
+    def test_in_accepts_mixed_scalars_and_ranges(self) -> None:
+        e = PORT.in_([443, (8000, 8080)])
+        assert e.values == (443, ValueRange(8000, 8080))
+
+    def test_in_rejects_empty_set(self) -> None:
+        with pytest.raises(ValueError, match="empty"):
+            PORT.in_([])
+
+    def test_in_rejects_stepped_range(self) -> None:
+        with pytest.raises(ValueError, match="step"):
+            PORT.in_([range(0, 10, 2)])
+
+    def test_in_rejects_empty_range(self) -> None:
+        with pytest.raises(ValueError, match="empty range"):
+            PORT.in_([range(5, 5)])
+
+    def test_in_rejects_non_literal_elements(self) -> None:
+        with pytest.raises(TypeError, match="membership"):
+            PORT.in_([[80, 443]])
+
+    def test_contains_builds_node(self) -> None:
+        e = HOST.contains("example")
+        assert isinstance(e, Contains)
+        assert e.field.name == "http.host"
+        assert e.needle == "example"
+
+    def test_contains_rejects_empty_needle(self) -> None:
+        with pytest.raises(ValueError, match="empty"):
+            HOST.contains("")
+        with pytest.raises(ValueError, match="empty"):
+            HOST.contains(b"")
+
+    def test_contains_rejects_non_str_bytes_needle(self) -> None:
+        with pytest.raises(TypeError, match="needle"):
+            Contains(HOST, 443)  # type: ignore[arg-type]
+
+    def test_matches_builds_node(self) -> None:
+        e = HOST.matches("^ex.*com$")
+        assert isinstance(e, Matches)
+        assert e.pattern == "^ex.*com$"
+
+    def test_matches_rejects_invalid_regex_at_construction(self) -> None:
+        with pytest.raises(ValueError, match="invalid regular expression"):
+            HOST.matches("[unclosed")
+
+
+class TestInOperatorGuard:
+    """Python's `in` operator is NOT the membership API (issue #17 contract):
+    `in` coerces `__contains__`'s result to bool, so it can never build an
+    Expr — it must fail loudly, pointing the user at .in_()/.contains()."""
+
+    def test_python_in_raises_pointing_to_in_(self) -> None:
+        with pytest.raises(TypeError, match=r"in_"):
+            443 in PORT  # noqa: B015
+
+    def test_python_in_mentions_contains_alternative(self) -> None:
+        with pytest.raises(TypeError, match="contains"):
+            "example" in HOST  # noqa: B015
+
+
+class TestExtendedStructuralEquals:
+    def test_membership_equal_and_order_sensitive(self) -> None:
+        assert PORT.in_([80, 443]).equals(PORT.in_([80, 443]))
+        assert not PORT.in_([80, 443]).equals(PORT.in_([443, 80]))
+        assert not PORT.in_([80]).equals(PORT.in_([80, 443]))
+        assert not PORT.in_([80]).equals(StubField("udp.port", "FT_UINT16").in_([80]))
+
+    def test_membership_range_vs_scalar_not_equal(self) -> None:
+        assert not PORT.in_([(80, 80)]).equals(PORT.in_([80]))
+
+    def test_membership_literal_type_matters(self) -> None:
+        assert not PORT.in_([1]).equals(PORT.in_([True]))
+
+    def test_contains_equal_and_needle_type_matters(self) -> None:
+        assert HOST.contains("ab").equals(HOST.contains("ab"))
+        assert not HOST.contains("ab").equals(HOST.contains("cd"))
+        assert not HOST.contains("ab").equals(HOST.contains(b"ab"))
+
+    def test_matches_equal_by_field_and_pattern(self) -> None:
+        assert HOST.matches("x").equals(HOST.matches("x"))
+        assert not HOST.matches("x").equals(HOST.matches("y"))
+        assert not HOST.matches("x").equals(SRC.matches("x"))
+
+    def test_extended_nodes_differ_from_other_node_types(self) -> None:
+        assert not PORT.in_([80]).equals(PORT == 80)
+        assert not HOST.contains("a").equals(HOST.matches("a"))
+
+
+class TestExtendedWalkers:
+    def test_field_refs_walks_extended_nodes(self) -> None:
+        tree = (PORT.in_([80]) & HOST.contains("a")) | ~HOST.matches("b")
+        names = [f.name for f in field_refs(tree)]
+        assert names == ["tcp.port", "http.host", "http.host"]
