@@ -161,7 +161,7 @@ class TestSemanticsTableGoldensValidate:
         dfilters = [case.dfilter for case in CASES if case.dfilter is not None]
         # Exact count: a case losing its golden string must fail loudly here.
         # Update deliberately when the table grows.
-        assert len(dfilters) == 13
+        assert len(dfilters) == 23
         _assert_all_valid(
             [
                 (f"semantics[{case.id}]: {case.expr!r}", case.dfilter)
