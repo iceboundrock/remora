@@ -18,6 +18,16 @@ Semantics (mirror Wireshark display filters exactly)
   matches, exactly like Wireshark's multi-value ``==``. An absent field
   (``get_raw`` returns ``()``) makes every comparison False.
 - ``Presence(field)``: true iff the field has at least one occurrence.
+- ``Membership(field, values)``: each element (or inclusive range endpoint
+  pair) is coerced once at compile time; true if ANY occurrence equals a set
+  element or falls inside a range (inclusive on both ends), exactly like
+  Wireshark's ``f in {…}`` (which is sugar for an ``==``-chain of ORs).
+- ``Contains(field, needle)``: substring (str fields) / subsequence (bytes
+  fields) on ANY occurrence; the needle's type must match the field's Python
+  type (TypeError at compile time otherwise — same timing as dfilter).
+- ``Matches(field, pattern)``: case-insensitive unanchored ``re.search`` on
+  ANY occurrence (Wireshark's ``matches`` is case-insensitive by default);
+  string fields only.
 - ``Not`` / ``And`` / ``Or``: Python ``not`` / ``and`` / ``or`` over the
   recursively compiled children. Emergent semantics worth spelling out: the
   DSL's ``!=`` arrives as ``Not(Comparison(EQ, ...))``, so on a packet where
@@ -35,11 +45,24 @@ silent non-match.
 from __future__ import annotations
 
 import operator
+import re
 from collections.abc import Callable
 from typing import Any
 
 from remora import values
-from remora.expr import And, CompareOp, Comparison, Expr, Not, Or, Presence
+from remora.expr import (
+    And,
+    CompareOp,
+    Comparison,
+    Contains,
+    Expr,
+    Matches,
+    Membership,
+    Not,
+    Or,
+    Presence,
+    ValueRange,
+)
 from remora.fields import RawPacket
 
 __all__ = ["compile_predicate"]
@@ -85,6 +108,64 @@ def compile_predicate(expr: Expr) -> Callable[[RawPacket], bool]:
             return pkt.get_raw(name) != ()
 
         return present
+    if isinstance(expr, Membership):
+        name = expr.field.name
+        ftype = expr.field.ftype
+        parse = values.get_info(ftype).parse
+        scalars: list[Any] = []
+        ranges: list[tuple[Any, Any]] = []
+        for item in expr.values:
+            if isinstance(item, ValueRange):
+                lo: Any = values.coerce_literal(ftype, item.lo)
+                hi: Any = values.coerce_literal(ftype, item.hi)
+                if hi < lo:
+                    raise ValueError(f"inverted membership range: {item.lo!r}..{item.hi!r}")
+                ranges.append((lo, hi))
+            else:
+                scalars.append(values.coerce_literal(ftype, item))
+
+        def member(pkt: RawPacket) -> bool:
+            for raw in pkt.get_raw(name):
+                value = parse(raw)
+                if any(value == lit for lit in scalars):
+                    return True
+                if any(lo <= value <= hi for lo, hi in ranges):
+                    return True
+            return False
+
+        return member
+    if isinstance(expr, Contains):
+        name = expr.field.name
+        ftype = expr.field.ftype
+        needle = expr.needle
+        py_type = values.get_info(ftype).py_type
+        if not (
+            (py_type is str and isinstance(needle, str))
+            or (py_type is bytes and isinstance(needle, bytes))
+        ):
+            raise TypeError(
+                "contains needs a str needle on string fields and a bytes needle on "
+                f"bytes fields; got {type(needle).__name__} for {ftype}"
+            )
+        parse = values.get_info(ftype).parse
+
+        def contains(pkt: RawPacket) -> bool:
+            return any(needle in parse(raw) for raw in pkt.get_raw(name))
+
+        return contains
+    if isinstance(expr, Matches):
+        name = expr.field.name
+        ftype = expr.field.ftype
+        if values.get_info(ftype).py_type is not str:
+            raise TypeError(f"matches is only supported on string fields, not {ftype}")
+        parse = values.get_info(ftype).parse
+        # Wireshark's `matches` is case-insensitive by default; mirror it.
+        regex = re.compile(expr.pattern, re.IGNORECASE)
+
+        def match(pkt: RawPacket) -> bool:
+            return any(regex.search(parse(raw)) is not None for raw in pkt.get_raw(name))
+
+        return match
     if isinstance(expr, Not):
         operand = compile_predicate(expr.operand)
 

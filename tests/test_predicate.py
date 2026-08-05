@@ -21,6 +21,7 @@ DST = FieldRef[IPv4Address]("ip.dst", "FT_IPv4", False)
 PORT = FieldRef[int]("tcp.port", "FT_UINT16", True)
 TTL = FieldRef[int]("ip.ttl", "FT_UINT8", False)
 HOST = FieldRef[str]("http.host", "FT_STRING", False)
+QNAME = FieldRef[str]("dns.qry.name", "FT_STRING", True)
 PAYLOAD = FieldRef[bytes]("tcp.payload", "FT_BYTES", False)
 TIME = FieldRef[datetime]("frame.time", "FT_ABSOLUTE_TIME", False)
 DELTA = FieldRef[timedelta]("frame.time_delta", "FT_RELATIVE_TIME", False)
@@ -219,3 +220,119 @@ class TestEvalTimeErrors:
         pred = compile_predicate(PORT == 443)  # compiles fine
         with pytest.raises(ValueError, match="garbage"):
             pred(FakePacket({"tcp.port": ("garbage",)}))
+
+
+class TestMembership:
+    def test_scalar_set_match(self) -> None:
+        pred = compile_predicate(PORT.in_([80, 443]))
+        assert pred(FakePacket({"tcp.port": ("443",)})) is True
+        assert pred(FakePacket({"tcp.port": ("8080",)})) is False
+        assert pred(EMPTY) is False
+
+    def test_any_occurrence_matches(self) -> None:
+        pred = compile_predicate(PORT.in_([443]))
+        assert pred(FakePacket({"tcp.port": ("52034", "443")})) is True
+        assert pred(FakePacket({"tcp.port": ("52034", "8080")})) is False
+
+    def test_range_membership_is_inclusive(self) -> None:
+        pred = compile_predicate(PORT.in_([range(8000, 8081)]))
+        assert pred(FakePacket({"tcp.port": ("8000",)})) is True
+        assert pred(FakePacket({"tcp.port": ("8080",)})) is True
+        assert pred(FakePacket({"tcp.port": ("8081",)})) is False
+        assert pred(FakePacket({"tcp.port": ("7999",)})) is False
+
+    def test_mixed_scalars_and_ranges(self) -> None:
+        pred = compile_predicate(PORT.in_([443, (8000, 8080)]))
+        assert pred(FakePacket({"tcp.port": ("443",)})) is True
+        assert pred(FakePacket({"tcp.port": ("8040",)})) is True
+        assert pred(FakePacket({"tcp.port": ("80",)})) is False
+
+    def test_raw_text_is_converted_before_matching(self) -> None:
+        # 0x1f == 31: conversion happens per ftype, never text comparison.
+        pred = compile_predicate(PORT.in_([31]))
+        assert pred(FakePacket({"tcp.port": ("0x1f",)})) is True
+
+    def test_ipv4_range_membership(self) -> None:
+        pred = compile_predicate(SRC.in_([("10.0.0.5", "10.0.0.9"), "10.0.0.1"]))
+        assert pred(FakePacket({"ip.src": ("10.0.0.7",)})) is True
+        assert pred(FakePacket({"ip.src": ("10.0.0.1",)})) is True
+        assert pred(FakePacket({"ip.src": ("10.0.0.10",)})) is False
+
+    def test_not_in_is_true_on_absent_field(self) -> None:
+        pred = compile_predicate(~PORT.in_([80, 443]))
+        assert pred(FakePacket({"tcp.port": ("443", "52034")})) is False
+        assert pred(FakePacket({"tcp.port": ("8080",)})) is True
+        assert pred(EMPTY) is True
+
+    def test_datetime_membership_evaluates_in_python(self) -> None:
+        moment = datetime(2021, 7, 1, tzinfo=timezone.utc)  # epoch 1625097600
+        pred = compile_predicate(TIME.in_([moment]))
+        assert pred(FakePacket({"frame.time": ("1625097600",)})) is True
+        assert pred(FakePacket({"frame.time": ("1625097601",)})) is False
+
+    def test_inverted_range_raises_value_error_at_compile_time(self) -> None:
+        with pytest.raises(ValueError, match="inverted"):
+            compile_predicate(PORT.in_([(443, 80)]))
+
+    def test_bad_element_literal_raises_at_compile_time(self) -> None:
+        with pytest.raises(ValueError, match="not-an-ip"):
+            compile_predicate(SRC.in_(["not-an-ip"]))
+
+
+class TestContains:
+    def test_substring_match(self) -> None:
+        pred = compile_predicate(HOST.contains("ample"))
+        assert pred(FakePacket({"http.host": ("example.com",)})) is True
+        assert pred(FakePacket({"http.host": ("other.org",)})) is False
+        assert pred(EMPTY) is False
+
+    def test_contains_is_case_sensitive(self) -> None:
+        # Wireshark `contains` is case-sensitive (unlike `matches`).
+        pred = compile_predicate(HOST.contains("ample"))
+        assert pred(FakePacket({"http.host": ("EXAMPLE.COM",)})) is False
+
+    def test_any_occurrence_matches(self) -> None:
+        pred = compile_predicate(QNAME.contains("example"))
+        assert pred(FakePacket({"dns.qry.name": ("alpha.example", "beta.io")})) is True
+        assert pred(FakePacket({"dns.qry.name": ("beta.io", "gamma.net")})) is False
+
+    def test_bytes_subsequence_match(self) -> None:
+        pred = compile_predicate(PAYLOAD.contains(b"\xbb\xcc"))
+        assert pred(FakePacket({"tcp.payload": ("aa:bb:cc:dd",)})) is True
+        assert pred(FakePacket({"tcp.payload": ("aa:bb",)})) is False
+
+    def test_needle_type_mismatch_raises_at_compile_time(self) -> None:
+        with pytest.raises(TypeError, match="needle"):
+            compile_predicate(HOST.contains(b"ab"))
+        with pytest.raises(TypeError, match="needle"):
+            compile_predicate(PAYLOAD.contains("GET"))
+
+    def test_contains_on_int_field_raises_at_compile_time(self) -> None:
+        with pytest.raises(TypeError, match="needle"):
+            compile_predicate(PORT.contains("80"))
+
+
+class TestMatches:
+    def test_regex_search_is_unanchored(self) -> None:
+        pred = compile_predicate(HOST.matches("ample"))
+        assert pred(FakePacket({"http.host": ("example.com",)})) is True
+
+    def test_case_insensitive_by_default(self) -> None:
+        # Wireshark's `matches` is case-insensitive by default; mirrored here.
+        pred = compile_predicate(HOST.matches("^ex.*com$"))
+        assert pred(FakePacket({"http.host": ("example.com",)})) is True
+        assert pred(FakePacket({"http.host": ("EXAMPLE.COM",)})) is True
+        assert pred(FakePacket({"http.host": ("other.org",)})) is False
+
+    def test_any_occurrence_matches(self) -> None:
+        pred = compile_predicate(QNAME.matches("^alpha"))
+        assert pred(FakePacket({"dns.qry.name": ("beta.io", "alpha.example")})) is True
+        assert pred(FakePacket({"dns.qry.name": ("beta.io",)})) is False
+
+    def test_absent_field_is_false_and_negation_true(self) -> None:
+        assert compile_predicate(HOST.matches("x"))(EMPTY) is False
+        assert compile_predicate(~HOST.matches("x"))(EMPTY) is True
+
+    def test_matches_on_non_string_field_raises_at_compile_time(self) -> None:
+        with pytest.raises(TypeError, match="string fields"):
+            compile_predicate(PORT.matches("443"))
