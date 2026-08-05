@@ -143,7 +143,7 @@ class TestGoldenCorpusValidates:
         # Size guard, exact so silent shrinkage is impossible: dropping a
         # golden case must fail here rather than quietly validate less.
         # Update deliberately when cases are added.
-        assert len(GOLDEN) == 34
+        assert len(GOLDEN) == 44
         cases: list[tuple[str, str]] = []
         for case in GOLDEN:
             # Validate what the compiler emits, not just the literal golden

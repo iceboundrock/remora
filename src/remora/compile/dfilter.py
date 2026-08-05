@@ -13,6 +13,17 @@ Rendering rules
 - ``And(l, r)`` -> ``(l) && (r)``; ``Or(l, r)`` -> ``(l) || (r)``. Every
   operand is parenthesized so the emitted string preserves the IR tree
   structure regardless of nesting depth.
+- ``Membership(field, values)`` -> ``field in {v1, v2, lo .. hi}``. Elements
+  are comma-separated (whitespace-only separators became a syntax error in
+  Wireshark 4.0); range elements render spaced ``lo .. hi`` so IPv4 endpoints
+  like ``10.0.0.5 .. 10.0.0.9`` cannot lex as a malformed dotted quad.
+- ``Contains(field, needle)`` -> ``field contains "text"`` (string fields) or
+  ``field contains aa:bb`` (bytes fields). The needle's type must match the
+  field's Python type; a mismatch is a user error (TypeError), not
+  UnsupportedExprError.
+- ``Matches(field, pattern)`` -> ``field matches "pattern"``, string fields
+  only. Wireshark's ``matches`` is case-insensitive by default; the predicate
+  backend mirrors that with ``re.IGNORECASE``.
 
 Literal rendering
 -----------------
@@ -43,9 +54,22 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from ipaddress import IPv4Address, IPv6Address
+from typing import Any
 
 from remora import values
-from remora.expr import And, Comparison, Expr, Not, Or, Presence
+from remora.expr import (
+    And,
+    Comparison,
+    Contains,
+    Expr,
+    Matches,
+    Membership,
+    MembershipItem,
+    Not,
+    Or,
+    Presence,
+    ValueRange,
+)
 
 __all__ = ["UnsupportedExprError", "compile_dfilter"]
 
@@ -66,6 +90,15 @@ def compile_dfilter(expr: Expr) -> str:
         return f"{expr.field.name} {expr.op.value} {literal}"
     if isinstance(expr, Presence):
         return expr.field.name
+    if isinstance(expr, Membership):
+        rendered = ", ".join(_render_set_item(expr.field.ftype, item) for item in expr.values)
+        return f"{expr.field.name} in {{{rendered}}}"
+    if isinstance(expr, Contains):
+        return f"{expr.field.name} contains {_render_needle(expr.field.ftype, expr.needle)}"
+    if isinstance(expr, Matches):
+        if values.get_info(expr.field.ftype).py_type is not str:
+            raise TypeError(f"matches is only supported on string fields, not {expr.field.ftype}")
+        return f"{expr.field.name} matches {_render_str(expr.pattern)}"
     if isinstance(expr, Not):
         return f"!({compile_dfilter(expr.operand)})"
     if isinstance(expr, And):
@@ -114,6 +147,33 @@ _NAMED_ESCAPES = {
     "\t": "\\t",
     "\v": "\\v",
 }
+
+
+def _render_set_item(ftype: str, item: MembershipItem) -> str:
+    """Render one membership element; ranges render spaced (``lo .. hi``) so
+    IPv4 endpoints cannot mis-lex around the dots."""
+    if isinstance(item, ValueRange):
+        lo: Any = values.coerce_literal(ftype, item.lo)
+        hi: Any = values.coerce_literal(ftype, item.hi)
+        if hi < lo:
+            raise ValueError(f"inverted membership range: {item.lo!r}..{item.hi!r}")
+        return f"{_render_literal(lo)} .. {_render_literal(hi)}"
+    return _render_literal(values.coerce_literal(ftype, item))
+
+
+def _render_needle(ftype: str, needle: str | bytes) -> str:
+    """Render a contains needle; its type must match the field's Python type
+    (str fields take str, bytes fields take bytes) — anything else is a user
+    error (TypeError), mirrored exactly by the predicate backend."""
+    py_type = values.get_info(ftype).py_type
+    if py_type is str and isinstance(needle, str):
+        return _render_str(needle)
+    if py_type is bytes and isinstance(needle, bytes):
+        return ":".join(f"{byte:02x}" for byte in needle)
+    raise TypeError(
+        "contains needs a str needle on string fields and a bytes needle on "
+        f"bytes fields; got {type(needle).__name__} for {ftype}"
+    )
 
 
 def _render_str(value: str) -> str:

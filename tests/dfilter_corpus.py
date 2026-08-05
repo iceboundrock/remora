@@ -144,6 +144,29 @@ GOLDEN: tuple[GoldenCase, ...] = (
     # bool literals
     GoldenCase("bool-true", SYN == True, "tcp.flags.syn == 1"),  # noqa: E712
     GoldenCase("bool-false", SYN == False, "tcp.flags.syn == 0"),  # noqa: E712
+    # extended operators (issue #17)
+    GoldenCase("in-int-set", PORT.in_([80, 443, 8080]), "tcp.port in {80, 443, 8080}"),
+    GoldenCase("in-int-range", PORT.in_([range(8000, 8081)]), "tcp.port in {8000 .. 8080}"),
+    GoldenCase(
+        "in-mixed-scalar-and-range",
+        PORT.in_([443, (8000, 8080)]),
+        "tcp.port in {443, 8000 .. 8080}",
+    ),
+    GoldenCase("in-ipv4-set", SRC.in_(["10.0.0.1", "10.0.0.2"]), "ip.src in {10.0.0.1, 10.0.0.2}"),
+    GoldenCase(
+        "in-ipv4-range",
+        SRC.in_([("10.0.0.5", "10.0.0.9")]),
+        "ip.src in {10.0.0.5 .. 10.0.0.9}",
+    ),
+    GoldenCase(
+        "in-str-set",
+        HOST.in_(["a.com", 'say "hi"']),
+        'http.host in {"a.com", "say \\"hi\\""}',
+    ),
+    GoldenCase("contains-str", HOST.contains("example"), 'http.host contains "example"'),
+    GoldenCase("contains-bytes", PAYLOAD.contains(b"\xaa\xbb"), "tcp.payload contains aa:bb"),
+    GoldenCase("matches-plain", HOST.matches("^ex.*com$"), 'http.host matches "^ex.*com$"'),
+    GoldenCase("matches-escaped-dot", HOST.matches("foo\\.bar"), 'http.host matches "foo\\\\.bar"'),
 )
 
 
