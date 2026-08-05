@@ -179,7 +179,7 @@ class TestPlannerAndCaptureGoldensValidate:
     def test_planner_and_capture_goldens_are_accepted_by_tshark(self) -> None:
         # Exact counts, so a golden dropped from either tuple fails here rather
         # than quietly validating less. Update deliberately when they grow.
-        assert len(PLANNER_DFILTER_GOLDENS) == 5
+        assert len(PLANNER_DFILTER_GOLDENS) == 6
         assert len(CAPTURE_DFILTER_GOLDENS) == 3
         cases: list[tuple[str, str]] = [
             (f"planner[{i}]", dfilter) for i, dfilter in enumerate(PLANNER_DFILTER_GOLDENS)
@@ -191,7 +191,7 @@ class TestPlannerAndCaptureGoldensValidate:
             deduped.setdefault(dfilter, description)
         # Exact count after dedup (capture repeats two planner strings).
         # Update deliberately when a distinct composed string is added.
-        assert len(deduped) == 6
+        assert len(deduped) == 7
         _assert_all_valid([(description, dfilter) for dfilter, description in deduped.items()])
 
 

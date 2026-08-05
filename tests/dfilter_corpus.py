@@ -190,6 +190,7 @@ DF_PORT = "(tcp.port == 443)"
 DF_SRC_AND_PORT = "(ip.src == 10.0.0.1) && (tcp.port == 443)"
 DF_SRC_OR_PORT = "((ip.src == 10.0.0.1) || (tcp.port == 443))"
 DF_NOT_SRC = "(!(ip.src == 10.0.0.1))"
+DF_PORT_IN = "(tcp.port in {80, 443})"
 
 #: Every composed string tests/test_planner.py asserts `plan.dfilter` against.
 PLANNER_DFILTER_GOLDENS: tuple[str, ...] = (
@@ -198,6 +199,7 @@ PLANNER_DFILTER_GOLDENS: tuple[str, ...] = (
     DF_SRC_AND_PORT,
     DF_SRC_OR_PORT,
     DF_NOT_SRC,
+    DF_PORT_IN,
 )
 
 #: Every composed string tests/test_capture.py puts into a plan or tshark argv.

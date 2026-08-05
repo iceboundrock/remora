@@ -1,9 +1,11 @@
 """Seeded random Expr-tree generator for dfilter validation (issue #18).
 
 Generates trees only over shapes the dfilter backend supports (no
-datetime/timedelta literals, no empty bytes) using real tshark field names, so
-every compiled filter must be accepted by a real tshark parser. Determinism:
-same seed, same corpus — required so a CI failure reproduces locally.
+datetime/timedelta literals, no empty bytes; the extended-operator leaves —
+membership sets/ranges, contains, matches — are drawn only over field/literal
+kinds the backend can render) using real tshark field names, so every compiled
+filter must be accepted by a real tshark parser. Determinism: same seed, same
+corpus — required so a CI failure reproduces locally.
 """
 
 from __future__ import annotations
@@ -13,7 +15,17 @@ from collections.abc import Callable
 from ipaddress import IPv4Address, IPv6Address
 
 from dfilter_corpus import DST, HOST, PAYLOAD, PORT, RESPTIME, SRC, SRC6, SYN, StubField
-from remora.expr import And, CompareOp, Comparison, Expr, LiteralValue, Not, Or, Presence
+from remora.expr import (
+    And,
+    CompareOp,
+    Comparison,
+    Expr,
+    LiteralValue,
+    Not,
+    Or,
+    Presence,
+    ValueRange,
+)
 
 DEFAULT_SEED = 20260802
 DEFAULT_COUNT = 200
@@ -75,10 +87,55 @@ _FIELD_SPECS: tuple[_FieldSpec, ...] = (
 )
 
 
+# Membership sets over orderable/int/str/IP fields only (bool/bytes/float
+# sets add no coverage and float sets risk representation mismatches).
+# Identity, never `in`/`==`: FieldExprOps.__eq__ builds an Expr, so tuple
+# membership on fields would raise inside the operator instead of comparing.
+_EXCLUDED_FROM_SETS = (SYN, PAYLOAD, RESPTIME)
+_SET_SPECS: tuple[_FieldSpec, ...] = tuple(
+    spec for spec in _FIELD_SPECS if not any(spec[0] is f for f in _EXCLUDED_FROM_SETS)
+)
+#: Fields that may also get an inclusive ValueRange element.
+_RANGE_FIELDS = (PORT, SEQ, ULEN)
+
+# Fixed pool of patterns valid in both PCRE (tshark) and Python re.
+_REGEX_POOL = ("example", "^ex", "com$", "a.c", "foo|bar", "[a-z0-9]+", "ab{2,3}c")
+
+
+def _gen_membership(rng: random.Random) -> Expr:
+    field, _, literal_gen = rng.choice(_SET_SPECS)
+    items: list[object] = [literal_gen(rng) for _ in range(rng.randrange(1, 4))]
+    if any(field is f for f in _RANGE_FIELDS) and rng.random() < 0.5:
+        lo = rng.randrange(60000)
+        items.append(ValueRange(lo, lo + rng.randrange(1, 1000)))
+    return field.in_(items)
+
+
+def _gen_contains(rng: random.Random) -> Expr:
+    if rng.random() < 0.5:
+        needle = ""
+        while not needle:
+            needle = _gen_string(rng)
+        return HOST.contains(needle)
+    return PAYLOAD.contains(_gen_bytes(rng))
+
+
+def _gen_matches(rng: random.Random) -> Expr:
+    return HOST.matches(rng.choice(_REGEX_POOL))
+
+
 def _gen_leaf(rng: random.Random) -> Expr:
-    field, ops, literal_gen = rng.choice(_FIELD_SPECS)
-    if rng.random() < _PRESENCE_PROBABILITY:
+    roll = rng.random()
+    if roll < _PRESENCE_PROBABILITY:
+        field, _, _ = rng.choice(_FIELD_SPECS)
         return Presence(field)
+    if roll < 0.30:
+        return _gen_membership(rng)
+    if roll < 0.38:
+        return _gen_contains(rng)
+    if roll < 0.46:
+        return _gen_matches(rng)
+    field, ops, literal_gen = rng.choice(_FIELD_SPECS)
     return Comparison(rng.choice(ops), field, literal_gen(rng))
 
 

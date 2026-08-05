@@ -14,7 +14,14 @@ from ipaddress import IPv4Address
 import pytest
 
 from conftest import FakePacket
-from dfilter_corpus import DF_DST, DF_NOT_SRC, DF_SRC, DF_SRC_AND_PORT, DF_SRC_OR_PORT
+from dfilter_corpus import (
+    DF_DST,
+    DF_NOT_SRC,
+    DF_PORT_IN,
+    DF_SRC,
+    DF_SRC_AND_PORT,
+    DF_SRC_OR_PORT,
+)
 from remora.fields import FieldRef, RawPacket
 from remora.planner import Plan, make_plan
 
@@ -101,6 +108,26 @@ class TestUnsupportedExprFallback:
     def test_user_error_literal_raises_and_is_not_swallowed(self) -> None:
         with pytest.raises(ValueError, match="not-an-ip"):
             make_plan([SRC == "not-an-ip"])
+
+
+class TestExtendedOperatorPlanning:
+    """Issue #17 nodes need no planner change: pushdown-or-residual routing and
+    projection via field_refs must simply work. Pinned here end to end."""
+
+    def test_membership_conjunct_is_pushed(self) -> None:
+        plan = make_plan([PORT.in_([80, 443])], select=[PORT])
+        assert plan.dfilter == DF_PORT_IN
+        assert plan.residual is None
+        assert plan.mode == "fields"
+
+    def test_time_membership_is_residual_and_projected(self) -> None:
+        plan = make_plan([TIME.in_([JULY_2021])], select=[SRC])
+        assert plan.dfilter is None
+        assert plan.residual is not None
+        assert plan.projection is not None
+        assert [ref.name for ref in plan.projection] == ["ip.src", "frame.time"]
+        assert plan.residual(FakePacket({"frame.time": ("1625097600",)})) is True
+        assert plan.residual(FakePacket({"frame.time": ("1625097601",)})) is False
 
 
 class TestProjection:
