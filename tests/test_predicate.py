@@ -12,6 +12,7 @@ from ipaddress import IPv4Address
 import pytest
 
 from conftest import FakePacket
+from remora.compile.dfilter import compile_dfilter
 from remora.compile.predicate import compile_predicate
 from remora.expr import Expr
 from remora.fields import FieldRef
@@ -336,3 +337,59 @@ class TestMatches:
     def test_matches_on_non_string_field_raises_at_compile_time(self) -> None:
         with pytest.raises(TypeError, match="string fields"):
             compile_predicate(PORT.matches("443"))
+
+
+class TestCrossBackendErrorParity:
+    """Verify that user-error messages are identical between dfilter and predicate backends.
+
+    Both backends must raise the same exception type with the same message for
+    shared error cases. This class captures errors from both backends on the
+    same Expr and asserts they match exactly.
+    """
+
+    @pytest.mark.parametrize(
+        "expr",
+        [
+            PORT.in_([(443, 80)]),  # inverted range
+        ],
+        ids=["inverted_range"],
+    )
+    def test_inverted_range_error_parity(self, expr: Expr) -> None:
+        """Inverted membership ranges raise identical ValueError messages."""
+        with pytest.raises(ValueError) as exc_dfilter:
+            compile_dfilter(expr)
+        with pytest.raises(ValueError) as exc_predicate:
+            compile_predicate(expr)
+        assert str(exc_dfilter.value) == str(exc_predicate.value)
+
+    @pytest.mark.parametrize(
+        "expr",
+        [
+            HOST.contains(b"ab"),  # str field, bytes needle
+            PAYLOAD.contains("GET"),  # bytes field, str needle
+            PORT.contains("80"),  # int field, str needle
+        ],
+        ids=["str_field_bytes_needle", "bytes_field_str_needle", "int_field_str_needle"],
+    )
+    def test_contains_needle_mismatch_error_parity(self, expr: Expr) -> None:
+        """Contains needle type mismatch raises identical TypeError messages."""
+        with pytest.raises(TypeError) as exc_dfilter:
+            compile_dfilter(expr)
+        with pytest.raises(TypeError) as exc_predicate:
+            compile_predicate(expr)
+        assert str(exc_dfilter.value) == str(exc_predicate.value)
+
+    @pytest.mark.parametrize(
+        "expr",
+        [
+            PORT.matches("443"),  # int field
+        ],
+        ids=["int_field"],
+    )
+    def test_matches_on_non_string_field_error_parity(self, expr: Expr) -> None:
+        """Matches on non-string fields raises identical TypeError messages."""
+        with pytest.raises(TypeError) as exc_dfilter:
+            compile_dfilter(expr)
+        with pytest.raises(TypeError) as exc_predicate:
+            compile_predicate(expr)
+        assert str(exc_dfilter.value) == str(exc_predicate.value)

@@ -81,11 +81,13 @@ _OPS: dict[CompareOp, Callable[[Any, Any], bool]] = {
 def compile_predicate(expr: Expr) -> Callable[[RawPacket], bool]:
     """Compile ``expr`` into a ``RawPacket -> bool`` predicate.
 
-    Literal normalization happens here, once per ``Comparison``; malformed
-    user literals raise ``ValueError``/``TypeError`` immediately, before any
-    packet is seen. The returned predicate raises ``ValueError`` when a
-    packet's raw text is malformed for the field's ftype. An unknown ``Expr``
-    subclass raises :class:`TypeError` (see module docstring).
+    Literal normalization happens here, once per ``Comparison``, once per
+    ``Membership`` element/endpoint (after any range conversion), and at
+    contains/matches entry for type validation; malformed user literals raise
+    ``ValueError``/``TypeError`` immediately, before any packet is seen. The
+    returned predicate raises ``ValueError`` when a packet's raw text is
+    malformed for the field's ftype. An unknown ``Expr`` subclass raises
+    :class:`TypeError` (see module docstring).
     """
     if isinstance(expr, Comparison):
         op = _OPS[expr.op]
@@ -138,16 +140,16 @@ def compile_predicate(expr: Expr) -> Callable[[RawPacket], bool]:
         name = expr.field.name
         ftype = expr.field.ftype
         needle = expr.needle
-        py_type = values.get_info(ftype).py_type
+        info = values.get_info(ftype)
         if not (
-            (py_type is str and isinstance(needle, str))
-            or (py_type is bytes and isinstance(needle, bytes))
+            (info.py_type is str and isinstance(needle, str))
+            or (info.py_type is bytes and isinstance(needle, bytes))
         ):
             raise TypeError(
                 "contains needs a str needle on string fields and a bytes needle on "
                 f"bytes fields; got {type(needle).__name__} for {ftype}"
             )
-        parse = values.get_info(ftype).parse
+        parse = info.parse
 
         def contains(pkt: RawPacket) -> bool:
             return any(needle in parse(raw) for raw in pkt.get_raw(name))
@@ -156,9 +158,10 @@ def compile_predicate(expr: Expr) -> Callable[[RawPacket], bool]:
     if isinstance(expr, Matches):
         name = expr.field.name
         ftype = expr.field.ftype
-        if values.get_info(ftype).py_type is not str:
+        info = values.get_info(ftype)
+        if info.py_type is not str:
             raise TypeError(f"matches is only supported on string fields, not {ftype}")
-        parse = values.get_info(ftype).parse
+        parse = info.parse
         # Wireshark's `matches` is case-insensitive by default; mirror it.
         regex = re.compile(expr.pattern, re.IGNORECASE)
 
