@@ -63,7 +63,7 @@ from remora.codegen.mangle import mangle_field
 from remora.codegen.parse import FieldDef, Protocol
 from remora.values import get_info
 
-__all__ = ["EmitWarning", "EmittedModule", "emit_protocol", "mangle_protocol"]
+__all__ = ["EmitWarning", "EmittedModule", "emit_extras_map", "emit_protocol", "mangle_protocol"]
 
 
 def mangle_protocol(abbrev: str) -> str:
@@ -303,3 +303,28 @@ def emit_protocol(
         pyi_source=_emit_pyi(class_name, attrs, multi),
         warnings=tuple(warnings),
     )
+
+
+def emit_extras_map(assignments: Sequence[tuple[str, str]]) -> str:
+    """Render ``remora/proto/_extras.py``: extras-only module name -> extra name.
+
+    ``assignments`` pairs each mangled module name with the extra that ships it.
+    Byte-deterministic (sorted by module name); the caller prepends the
+    fingerprint header, exactly as for :func:`emit_protocol` output.
+    """
+    lines = [
+        '"""Extras-only protocol modules: module name -> extra that ships it.',
+        "",
+        "Consumed by remora.proto.__getattr__ to import installed extras and to",
+        "name the missing extra in ImportError. Generated from codegen.toml.",
+        '"""',
+        "",
+    ]
+    entries = sorted(assignments)
+    if not entries:
+        lines.append("EXTRAS_MODULES: dict[str, str] = {}")
+    else:
+        lines.append("EXTRAS_MODULES: dict[str, str] = {")
+        lines.extend(f'    "{_escape(module)}": "{_escape(extra)}",' for module, extra in entries)
+        lines.append("}")
+    return "\n".join(lines) + "\n"

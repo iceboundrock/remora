@@ -34,3 +34,16 @@ multi = [
     "dns.a", "dns.aaaa", "dns.cname", "dns.ns",
     "dns.ptr.domain_name", "dns.mx.mail_exchange", "dns.txt",
 ]
+
+# Domain extras (issue #22): protocols shipped by the remora-<name>
+# distributions instead of core. Disjoint from [generate] protocols —
+# load_config errors on any protocol assigned twice. Seed sets only;
+# filling out the full domain catalogs is future generation work.
+[extras.wireless]
+protocols = ["wlan", "radiotap"]
+
+[extras.industrial]
+protocols = ["modbus", "mbtcp", "dnp3"]
+
+[extras.telecom]
+protocols = ["gtp", "diameter"]
