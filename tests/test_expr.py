@@ -243,6 +243,14 @@ class TestExtendedOperatorConstruction:
         with pytest.raises(TypeError, match="membership"):
             PORT.in_([[80, 443]])
 
+    def test_in_rejects_bare_string(self) -> None:
+        with pytest.raises(TypeError, match="per-character"):
+            PORT.in_("80")
+
+    def test_in_rejects_bare_bytes(self) -> None:
+        with pytest.raises(TypeError, match="per-character"):
+            PORT.in_(b"80")
+
     def test_contains_builds_node(self) -> None:
         e = HOST.contains("example")
         assert isinstance(e, Contains)

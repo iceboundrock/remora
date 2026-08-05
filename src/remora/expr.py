@@ -128,7 +128,7 @@ class ValueRange:
                 )
 
 
-MembershipItem: TypeAlias = "LiteralValue | ValueRange"
+MembershipItem: TypeAlias = LiteralValue | ValueRange
 
 
 class CompareOp(enum.Enum):
@@ -371,6 +371,12 @@ class FieldExprOps:
         ``in_`` because Python's ``in`` operator cannot build an Expr — see
         ``__contains__``.
         """
+        if isinstance(values, str | bytes):
+            raise TypeError(
+                f"in_() takes an iterable of values, not a bare {type(values).__name__}: "
+                "a string would build a per-character set. Wrap it in a list, or use "
+                "field.contains(...) for substring tests."
+            )
         return Membership(self._self_field(), tuple(_membership_item(v) for v in values))
 
     def contains(self, needle: str | bytes) -> Contains:

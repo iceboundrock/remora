@@ -27,7 +27,9 @@ Semantics (mirror Wireshark display filters exactly)
   type (TypeError at compile time otherwise — same timing as dfilter).
 - ``Matches(field, pattern)``: case-insensitive unanchored ``re.search`` on
   ANY occurrence (Wireshark's ``matches`` is case-insensitive by default);
-  string fields only.
+  string fields only. Dialect caveat: patterns run under Python ``re``, not
+  Wireshark's PCRE2 — the dialects agree on common patterns but diverge at
+  the edges (e.g. PCRE2-only escapes, Unicode-aware case folding here).
 - ``Not`` / ``And`` / ``Or``: Python ``not`` / ``and`` / ``or`` over the
   recursively compiled children. Emergent semantics worth spelling out: the
   DSL's ``!=`` arrives as ``Not(Comparison(EQ, ...))``, so on a packet where
