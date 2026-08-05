@@ -317,6 +317,19 @@ CASES: tuple[Case, ...] = (
         ),
     ),
     Case(
+        # PCRE2 without UTF mode counts bytes, not characters; the predicate
+        # backend mirrors that ("café" is 5 UTF-8 bytes).
+        id="matches-byte-oriented",
+        expr=HOST.matches("^.{5}$"),
+        dfilter='http.host matches "^.{5}$"',
+        rows=(
+            (FakePacket({"http.host": ("café",)}), True),
+            (FakePacket({"http.host": ("abcde",)}), True),
+            (FakePacket({"http.host": ("abcd",)}), False),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
         # Any-occurrence under matches, like every operator (PR #73 review).
         id="matches-multi-value-any-occurrence",
         expr=QNAME.matches("^alpha"),

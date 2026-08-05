@@ -28,10 +28,14 @@ Semantics (mirror Wireshark display filters exactly)
 - ``Matches(field, pattern)``: case-insensitive unanchored ``re.search`` on
   ANY occurrence (Wireshark's ``matches`` is case-insensitive by default);
   string fields only. Dialect note: construction restricts patterns to the
-  Python-re/PCRE2 common subset (see :class:`remora.expr.Matches`), so both
-  engines agree on every accepted pattern; case-insensitivity is
-  Unicode-aware folding on both sides, where exotic folding edge cases may
-  still differ.
+  Python-re/PCRE2 common subset (see :class:`remora.expr.Matches`), and
+  matching here is **byte-oriented** — the pattern and each value are encoded
+  to UTF-8 and matched as ``bytes``, so ``.``/``{m,n}`` count bytes, ``\\w``/
+  ``\\d``/``\\s``/``\\b`` are ASCII, and case folding is ASCII-only. That
+  mirrors Wireshark, which compiles ``matches`` with ``PCRE2_CASELESS`` but
+  without UTF/UCP. One irreducible caveat remains: field text tshark could not
+  decode as UTF-8 reaches us as U+FFFD replacement characters, which cannot
+  round-trip to the original bytes, so such values may still diverge.
 - ``Not`` / ``And`` / ``Or``: Python ``not`` / ``and`` / ``or`` over the
   recursively compiled children. Emergent semantics worth spelling out: the
   DSL's ``!=`` arrives as ``Not(Comparison(EQ, ...))``, so on a packet where
@@ -166,11 +170,17 @@ def compile_predicate(expr: Expr) -> Callable[[RawPacket], bool]:
         if info.py_type is not str:
             raise TypeError(f"matches is only supported on string fields, not {ftype}")
         parse = info.parse
-        # Wireshark's `matches` is case-insensitive by default; mirror it.
-        regex = re.compile(expr.pattern, re.IGNORECASE)
+        # Wireshark compiles `matches` patterns with PCRE2_CASELESS but without
+        # UTF/UCP: matching is byte-oriented with ASCII-only case folding.
+        # Compiling the pattern's UTF-8 bytes against the value's UTF-8 bytes
+        # reproduces that byte-level semantics in Python re (bytes patterns use
+        # ASCII \w/\d/\s and ASCII-only IGNORECASE).
+        regex = re.compile(expr.pattern.encode("utf-8"), re.IGNORECASE)
 
         def match(pkt: RawPacket) -> bool:
-            return any(regex.search(parse(raw)) is not None for raw in pkt.get_raw(name))
+            return any(
+                regex.search(parse(raw).encode("utf-8")) is not None for raw in pkt.get_raw(name)
+            )
 
         return match
     if isinstance(expr, Not):

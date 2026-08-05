@@ -356,6 +356,9 @@ class TestMatchesCommonSubset:
             r"\x2f",
             r"[\d\s-]",
             "café",
+            # A ']' first in a class is a literal in both dialects, not the
+            # terminator — the scanner must skip it (PR #73 review round 2).
+            "[]a]",
         ],
     )
     def test_common_subset_patterns_accepted(self, pattern: str) -> None:
@@ -380,7 +383,16 @@ class TestMatchesCommonSubset:
             (r"\p{L}", "escape"),  # unicode property
             (r"\x{2f}", "escape"),  # PCRE2 braced hex
             ("[[:alpha:]]", "character class"),  # POSIX class
+            # Leading ']' is a class member, so the POSIX class is still nested.
+            ("[][:alpha:]]", "character class"),
             ("{,3}", "quantifier"),  # Python reads {0,3}; PCRE2 reads literal text
+            # PCRE2 limits brace repeat counts to 65535; Python does not.
+            ("a{70000}", "quantifier"),
+            ("a{0,65536}", "quantifier"),
+            # Python re: a vertical-tab character. PCRE2: the vertical
+            # whitespace CLASS — and '[\v-z]' is a hard PCRE2 error.
+            (r"\v", "escape"),
+            (r"[\v-z]", "escape"),
         ],
     )
     def test_dialect_specific_patterns_rejected(self, pattern: str, construct: str) -> None:

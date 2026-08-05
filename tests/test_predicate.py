@@ -338,6 +338,23 @@ class TestMatches:
         with pytest.raises(TypeError, match="string fields"):
             compile_predicate(PORT.matches("443"))
 
+    def test_byte_oriented_dot_counts_utf8_bytes(self) -> None:
+        # "café" is 5 UTF-8 bytes (é = 2), mirroring PCRE2 without UTF mode.
+        pred = compile_predicate(HOST.matches("^.{5}$"))
+        assert pred(FakePacket({"http.host": ("café",)})) is True
+        assert pred(FakePacket({"http.host": ("abcde",)})) is True
+        assert pred(FakePacket({"http.host": ("abcd",)})) is False
+
+    def test_byte_oriented_word_class_is_ascii(self) -> None:
+        pred = compile_predicate(HOST.matches(r"^\w+$"))
+        assert pred(FakePacket({"http.host": ("cafe",)})) is True
+        assert pred(FakePacket({"http.host": ("café",)})) is False
+
+    def test_case_folding_is_ascii_only(self) -> None:
+        pred = compile_predicate(HOST.matches("café"))
+        assert pred(FakePacket({"http.host": ("CAFé.example",)})) is True
+        assert pred(FakePacket({"http.host": ("CAFÉ.example",)})) is False
+
 
 class TestCrossBackendErrorParity:
     """Verify that user-error messages are identical between dfilter and predicate backends.

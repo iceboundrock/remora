@@ -161,7 +161,7 @@ class TestSemanticsTableGoldensValidate:
         dfilters = [case.dfilter for case in CASES if case.dfilter is not None]
         # Exact count: a case losing its golden string must fail loudly here.
         # Update deliberately when the table grows.
-        assert len(dfilters) == 24
+        assert len(dfilters) == 25
         _assert_all_valid(
             [
                 (f"semantics[{case.id}]: {case.expr!r}", case.dfilter)
@@ -293,6 +293,7 @@ class TestMatchesSemanticsParity:
             pytest.param(
                 DNS_MULTI, DNS.qry_name.matches("a{2,}|beta"), id="quantifier-alternation"
             ),
+            pytest.param(DNS_MULTI, DNS.qry_name.matches(r"\bexample\b"), id="word-boundary"),
             pytest.param(TCP_MIXED, ~DNS.qry_name.matches("alpha"), id="negation-absent-field"),
         ],
     )

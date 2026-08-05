@@ -277,13 +277,19 @@ class Contains(Expr):
 
 
 #: Escapes with identical meaning in Python ``re`` and PCRE2, inside a class.
-_SHARED_CLASS_ESCAPES = frozenset("dDwWsSnrtfv")
+#: ``\v`` is deliberately absent: Python ``re`` reads it as the vertical-tab
+#: character, PCRE2 as the vertical-whitespace *class* (and ``[\v-z]``, legal
+#: in Python, is a PCRE2 compile error).
+_SHARED_CLASS_ESCAPES = frozenset("dDwWsSnrtf")
 #: Additional escapes shared outside a character class.
 _SHARED_ESCAPES = _SHARED_CLASS_ESCAPES | frozenset("bB")
 #: Group prefixes (after ``(``) with identical meaning in both dialects.
 _SHARED_GROUP_PREFIXES = ("?:", "?=", "?!", "?<=", "?<!")
 #: ``{m}`` / ``{m,}`` / ``{m,n}`` — the brace-quantifier forms both dialects share.
-_QUANTIFIER_BRACE = re.compile(r"\{\d+(?:,\d*)?\}")
+_QUANTIFIER_BRACE = re.compile(r"\{(\d+)(?:,(\d*))?\}")
+#: PCRE2's hard ceiling on brace repeat counts; Python ``re`` has none, so a
+#: larger count would compile here and abort the tshark capture.
+_MAX_REPEAT = 65535
 
 
 def _subset_error(pattern: str, position: int, reason: str) -> ValueError:
@@ -356,6 +362,13 @@ def _validate_matches_subset(pattern: str) -> None:
         elif ch == "[":
             in_class = True
             i += 1
+            # Both dialects read a leading '^' as negation and a ']' in first
+            # position as a literal class member, not the terminator; the
+            # scanner must skip them or it mis-parses the rest of the class.
+            if pattern[i : i + 1] == "^":
+                i += 1
+            if pattern[i : i + 1] == "]":
+                i += 1
         elif ch == "(":
             if pattern[i + 1 : i + 2] == "?" and not any(
                 pattern.startswith(prefix, i + 1) for prefix in _SHARED_GROUP_PREFIXES
@@ -370,6 +383,13 @@ def _validate_matches_subset(pattern: str) -> None:
                     i,
                     "unescaped '{' does not form a shared quantifier "
                     "({m}, {m,}, {m,n}); escape it as '\\{'",
+                )
+            if any(int(count) > _MAX_REPEAT for count in match.groups() if count):
+                raise _subset_error(
+                    pattern,
+                    i,
+                    f"quantifier repeat count exceeds the shared limit of {_MAX_REPEAT} "
+                    "(PCRE2 rejects larger counts; Python re accepts them)",
                 )
             i = match.end()
             was_quant = True
@@ -388,16 +408,18 @@ class Matches(Expr):
     """``field matches pattern`` — case-insensitive regex test (Wireshark default).
 
     Patterns are restricted at construction to the Python-re/PCRE2 common
-    subset, so a pattern means the same thing whether tshark (PCRE2) or the
-    Python predicate backend (``re``) evaluates it. Accepted: literals, ``.``,
-    ``^``/``$``, alternation ``|``, quantifiers ``*`` ``+`` ``?`` ``{m}``
-    ``{m,}`` ``{m,n}`` with the lazy ``?`` modifier, plain and ``(?:...)``
-    groups, lookarounds, character classes with ranges/negation, escaped
-    punctuation, and the escapes ``\\d \\D \\w \\W \\s \\S \\b \\B \\n \\r
-    \\t \\f \\v \\xHH``. Dialect-specific constructs — possessive/atomic
-    forms, inline flags, named groups, backreferences, branch reset,
-    conditionals, POSIX classes, ``\\x{...}``, ``\\A``/``\\p{...}``/``\\h``
-    — raise :class:`ValueError`.
+    subset, so a pattern has the same byte-level meaning whether tshark
+    (PCRE2) or the Python predicate backend (``re``) evaluates it — the
+    predicate backend matches over UTF-8 bytes precisely to mirror Wireshark's
+    non-UTF PCRE2 configuration. Accepted: literals, ``.``, ``^``/``$``,
+    alternation ``|``, quantifiers ``*`` ``+`` ``?`` ``{m}`` ``{m,}``
+    ``{m,n}`` (repeat counts up to 65535) with the lazy ``?`` modifier, plain
+    and ``(?:...)`` groups, lookarounds, character classes with
+    ranges/negation, escaped punctuation, and the escapes ``\\d \\D \\w \\W
+    \\s \\S \\b \\B \\n \\r \\t \\f \\xHH``. Dialect-specific constructs —
+    possessive/atomic forms, inline flags, named groups, backreferences,
+    branch reset, conditionals, POSIX classes, ``\\x{...}``,
+    ``\\A``/``\\p{...}``/``\\h``/``\\v`` — raise :class:`ValueError`.
     """
 
     field: FieldLike
