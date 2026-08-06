@@ -31,11 +31,18 @@ Budgets and rationale:
   laptop; 250 ms leaves ~200x headroom for slow shared CI runners.
 - ``FIRST_ACCESS_BUDGET_S``: cold first access materializes exactly one
   descriptor, measured ~2 us median; 25 ms is ~10000x headroom.
-- Sublinearity: the wlan/vlan field-count ratio is ~391x, while the measured
-  import-time ratio is ~32x (a fixed per-import overhead plus dict-literal
-  execution that is cheap per entry). Asserting the time ratio stays under
-  half the field-count ratio demonstrates import cost is governed by the
-  fixed overhead and cheap table construction, not per-field work.
+- Field-count independence is enforced two ways. Exactly:
+  ``test_import_materializes_no_descriptors`` asserts importing does zero
+  per-field descriptor work — the guard for cheap per-field regressions
+  (descriptor construction costs only ~2 us/field, too little for a
+  flake-safe timing ceiling). Measurably: ``PER_FIELD_IMPORT_BUDGET_S``
+  bounds the marginal wall-clock cost per field — the slope between the
+  smallest (vlan, 10 fields) and largest (wlan) committed generated
+  modules — at 5 us/field. The measured slope is ~0.33 us/field (executing
+  one more precompiled ``_table_`` dict entry), so the budget has ~15x
+  headroom for slow CI runners while still failing on any added per-field
+  import-time work (parsing, I/O, object construction) beyond raw table
+  entry cost.
 """
 
 from __future__ import annotations
@@ -55,28 +62,40 @@ RUNS = 15
 
 IMPORT_BUDGET_S = 0.250
 FIRST_ACCESS_BUDGET_S = 0.025
+PER_FIELD_IMPORT_BUDGET_S = 5e-6
 
 #: Largest committed generated protocol module (remora-wireless workspace
 #: package, always installed via the dev dependency group — do not skip when
 #: missing, a skip would silently disable this guard).
 LARGEST_MODULE = "remora.proto.wlan"
 LARGEST_CLASS = "WLAN"
-#: Smallest committed generated core module, the sublinearity baseline.
+#: Smallest committed generated core module, the field-count-independence baseline.
 SMALLEST_MODULE = "remora.proto.vlan"
 SMALLEST_CLASS = "VLAN"
 
 
 @contextmanager
 def _restore_module(name: str) -> Iterator[None]:
-    """Undo re-imports afterwards so other test files see the original module."""
+    """Undo re-imports afterwards so other test files see the original state.
+
+    Restores both places the import system mutates: the ``sys.modules`` entry
+    and the attribute on the parent package. When the module was absent on
+    entry, both are removed again — a run of this file leaves no trace either
+    way, regardless of test order.
+    """
+    parent_name, _, child = name.rpartition(".")
     original = sys.modules.get(name)
     try:
         yield
     finally:
+        parent = sys.modules[parent_name]
         if original is not None:
             sys.modules[name] = original
-            parent, _, child = name.rpartition(".")
-            setattr(sys.modules[parent], child, original)
+            setattr(parent, child, original)
+        else:
+            sys.modules.pop(name, None)
+            if child in vars(parent):
+                delattr(parent, child)
 
 
 def _reimport(name: str) -> ModuleType:
@@ -134,17 +153,16 @@ def test_cold_first_field_access_within_budget() -> None:
     )
 
 
-def test_import_cost_far_sublinear_in_field_count() -> None:
+def test_import_cost_independent_of_field_count() -> None:
     largest_s = _median_import_s(LARGEST_MODULE)
     smallest_s = _median_import_s(SMALLEST_MODULE)
     with _restore_module(LARGEST_MODULE), _restore_module(SMALLEST_MODULE):
-        field_ratio = len(_table_of(_reimport(LARGEST_MODULE), LARGEST_CLASS)) / len(
-            _table_of(_reimport(SMALLEST_MODULE), SMALLEST_CLASS)
-        )
-    time_ratio = largest_s / smallest_s
-    assert time_ratio < field_ratio / 2, (
-        f"import-time ratio {time_ratio:.1f}x approaches the field-count ratio "
-        f"{field_ratio:.0f}x — import cost is no longer sublinear in field count"
+        largest_fields = len(_table_of(_reimport(LARGEST_MODULE), LARGEST_CLASS))
+        smallest_fields = len(_table_of(_reimport(SMALLEST_MODULE), SMALLEST_CLASS))
+    per_field_s = (largest_s - smallest_s) / (largest_fields - smallest_fields)
+    assert per_field_s < PER_FIELD_IMPORT_BUDGET_S, (
+        f"marginal import cost is {per_field_s * 1e6:.2f} us per field "
+        f"(budget {PER_FIELD_IMPORT_BUDGET_S * 1e6:.0f} us) — importing is doing per-field work"
     )
 
 
