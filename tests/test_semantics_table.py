@@ -32,6 +32,8 @@ PORT = FieldRef[int]("tcp.port", "FT_UINT16", True)
 TTL = FieldRef[int]("ip.ttl", "FT_UINT8", False)
 HOST = FieldRef[str]("http.host", "FT_STRING", False)
 TIME = FieldRef[datetime]("frame.time", "FT_ABSOLUTE_TIME", False)
+QNAME = FieldRef[str]("dns.qry.name", "FT_STRING", True)
+PAYLOAD = FieldRef[bytes]("tcp.payload", "FT_BYTES", False)
 
 EMPTY = FakePacket({})
 
@@ -200,6 +202,151 @@ CASES: tuple[Case, ...] = (
             (FakePacket({"http.host": ('say "hi"',)}), True),
             (FakePacket({"http.host": ("say hi",)}), False),
             (EMPTY, False),
+        ),
+    ),
+    Case(
+        id="in-scalar-set",
+        expr=PORT.in_([80, 443]),
+        dfilter="tcp.port in {80, 443}",
+        rows=(
+            (FakePacket({"tcp.port": ("443",)}), True),
+            (FakePacket({"tcp.port": ("8080",)}), False),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
+        # Any-occurrence semantics under membership, like every operator.
+        id="in-multi-value-any-occurrence",
+        expr=PORT.in_([443]),
+        dfilter="tcp.port in {443}",
+        rows=(
+            (FakePacket({"tcp.port": ("52034", "443")}), True),
+            (FakePacket({"tcp.port": ("52034", "8080")}), False),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
+        # Python range(8000, 8081) is half-open; the set element is the
+        # inclusive 8000 .. 8080, matching Wireshark's `..` semantics.
+        id="in-range-inclusive",
+        expr=PORT.in_([443, range(8000, 8081)]),
+        dfilter="tcp.port in {443, 8000 .. 8080}",
+        rows=(
+            (FakePacket({"tcp.port": ("8000",)}), True),
+            (FakePacket({"tcp.port": ("8080",)}), True),
+            (FakePacket({"tcp.port": ("8081",)}), False),
+            (FakePacket({"tcp.port": ("443",)}), True),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
+        id="in-ipv4-range",
+        expr=SRC.in_([("10.0.0.5", "10.0.0.9"), "10.0.0.1"]),
+        dfilter="ip.src in {10.0.0.5 .. 10.0.0.9, 10.0.0.1}",
+        rows=(
+            (FakePacket({"ip.src": ("10.0.0.7",)}), True),
+            (FakePacket({"ip.src": ("10.0.0.1",)}), True),
+            (FakePacket({"ip.src": ("10.0.0.10",)}), False),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
+        # ~in_ mirrors the != contract: true iff NO occurrence is in the set,
+        # including the absent-field row.
+        id="not-in",
+        expr=~PORT.in_([80, 443]),
+        dfilter="!(tcp.port in {80, 443})",
+        rows=(
+            (FakePacket({"tcp.port": ("443", "52034")}), False),
+            (FakePacket({"tcp.port": ("8080",)}), True),
+            (EMPTY, True),
+        ),
+    ),
+    Case(
+        # Time literals stay residual under membership too (M1 policy).
+        id="in-time-residual",
+        expr=TIME.in_([_MOMENT]),
+        dfilter=None,
+        rows=(
+            (FakePacket({"frame.time": ("1625097600",)}), True),
+            (FakePacket({"frame.time": ("1625097601",)}), False),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
+        id="contains-str",
+        expr=HOST.contains("ample"),
+        dfilter='http.host contains "ample"',
+        rows=(
+            (FakePacket({"http.host": ("example.com",)}), True),
+            (FakePacket({"http.host": ("other.org",)}), False),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
+        id="contains-multi-value-any-occurrence",
+        expr=QNAME.contains("example"),
+        dfilter='dns.qry.name contains "example"',
+        rows=(
+            (FakePacket({"dns.qry.name": ("alpha.example", "beta.io")}), True),
+            (FakePacket({"dns.qry.name": ("beta.io", "gamma.net")}), False),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
+        id="contains-bytes",
+        expr=PAYLOAD.contains(b"\xbb\xcc"),
+        dfilter="tcp.payload contains bb:cc",
+        rows=(
+            (FakePacket({"tcp.payload": ("aa:bb:cc:dd",)}), True),
+            (FakePacket({"tcp.payload": ("aa:bb",)}), False),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
+        # Wireshark's `matches` is case-insensitive by default — pinned here
+        # via the EXAMPLE.COM row on both backends.
+        id="matches-case-insensitive",
+        expr=HOST.matches("^ex.*com$"),
+        dfilter='http.host matches "^ex.*com$"',
+        rows=(
+            (FakePacket({"http.host": ("example.com",)}), True),
+            (FakePacket({"http.host": ("EXAMPLE.COM",)}), True),
+            (FakePacket({"http.host": ("other.org",)}), False),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
+        # PCRE2 without UTF mode counts bytes, not characters; the predicate
+        # backend mirrors that ("café" is 5 UTF-8 bytes).
+        id="matches-byte-oriented",
+        expr=HOST.matches("^.{5}$"),
+        dfilter='http.host matches "^.{5}$"',
+        rows=(
+            (FakePacket({"http.host": ("café",)}), True),
+            (FakePacket({"http.host": ("abcde",)}), True),
+            (FakePacket({"http.host": ("abcd",)}), False),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
+        # Any-occurrence under matches, like every operator (PR #73 review).
+        id="matches-multi-value-any-occurrence",
+        expr=QNAME.matches("^alpha"),
+        dfilter='dns.qry.name matches "^alpha"',
+        rows=(
+            (FakePacket({"dns.qry.name": ("beta.io", "alpha.example")}), True),
+            (FakePacket({"dns.qry.name": ("beta.io", "gamma.net")}), False),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
+        id="not-matches-absent-is-true",
+        expr=~HOST.matches("com"),
+        dfilter='!(http.host matches "com")',
+        rows=(
+            (FakePacket({"http.host": ("example.com",)}), False),
+            (EMPTY, True),
         ),
     ),
 )

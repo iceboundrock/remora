@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from dfilter_corpus import DELTA, GOLDEN, PAYLOAD, PORT, SRC, TIME, GoldenCase, StubField
+from dfilter_corpus import DELTA, GOLDEN, HOST, PAYLOAD, PORT, SRC, TIME, GoldenCase, StubField
 from remora.compile.dfilter import UnsupportedExprError, compile_dfilter
 from remora.expr import Expr
 
@@ -78,3 +78,35 @@ class TestUnsupported:
 
         with pytest.raises(UnsupportedExprError, match="FutureNode"):
             compile_dfilter(FutureNode())
+
+
+class TestExtendedOperatorErrors:
+    """User errors (TypeError/ValueError), never UnsupportedExprError — the
+    same compile-time policy as malformed literals."""
+
+    def test_contains_needle_type_must_match_field_type(self) -> None:
+        with pytest.raises(TypeError, match="needle"):
+            compile_dfilter(HOST.contains(b"ab"))
+        with pytest.raises(TypeError, match="needle"):
+            compile_dfilter(PAYLOAD.contains("GET"))
+
+    def test_contains_on_non_string_non_bytes_field_raises_type_error(self) -> None:
+        with pytest.raises(TypeError, match="needle"):
+            compile_dfilter(PORT.contains("80"))
+
+    def test_matches_on_non_string_field_raises_type_error(self) -> None:
+        with pytest.raises(TypeError, match="string fields"):
+            compile_dfilter(PORT.matches("443"))
+
+    def test_inverted_range_raises_value_error(self) -> None:
+        with pytest.raises(ValueError, match="inverted"):
+            compile_dfilter(PORT.in_([(443, 80)]))
+
+    def test_bad_element_literal_raises_value_error(self) -> None:
+        with pytest.raises(ValueError, match="not-an-ip"):
+            compile_dfilter(SRC.in_(["not-an-ip"]))
+
+    def test_time_membership_raises_unsupported(self) -> None:
+        moment = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        with pytest.raises(UnsupportedExprError, match="time comparisons"):
+            compile_dfilter(TIME.in_([moment]))

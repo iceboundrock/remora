@@ -143,7 +143,7 @@ class TestGoldenCorpusValidates:
         # Size guard, exact so silent shrinkage is impossible: dropping a
         # golden case must fail here rather than quietly validate less.
         # Update deliberately when cases are added.
-        assert len(GOLDEN) == 34
+        assert len(GOLDEN) == 44
         cases: list[tuple[str, str]] = []
         for case in GOLDEN:
             # Validate what the compiler emits, not just the literal golden
@@ -161,7 +161,7 @@ class TestSemanticsTableGoldensValidate:
         dfilters = [case.dfilter for case in CASES if case.dfilter is not None]
         # Exact count: a case losing its golden string must fail loudly here.
         # Update deliberately when the table grows.
-        assert len(dfilters) == 13
+        assert len(dfilters) == 25
         _assert_all_valid(
             [
                 (f"semantics[{case.id}]: {case.expr!r}", case.dfilter)
@@ -179,7 +179,7 @@ class TestPlannerAndCaptureGoldensValidate:
     def test_planner_and_capture_goldens_are_accepted_by_tshark(self) -> None:
         # Exact counts, so a golden dropped from either tuple fails here rather
         # than quietly validating less. Update deliberately when they grow.
-        assert len(PLANNER_DFILTER_GOLDENS) == 5
+        assert len(PLANNER_DFILTER_GOLDENS) == 6
         assert len(CAPTURE_DFILTER_GOLDENS) == 3
         cases: list[tuple[str, str]] = [
             (f"planner[{i}]", dfilter) for i, dfilter in enumerate(PLANNER_DFILTER_GOLDENS)
@@ -191,7 +191,7 @@ class TestPlannerAndCaptureGoldensValidate:
             deduped.setdefault(dfilter, description)
         # Exact count after dedup (capture repeats two planner strings).
         # Update deliberately when a distinct composed string is added.
-        assert len(deduped) == 6
+        assert len(deduped) == 7
         _assert_all_valid([(description, dfilter) for dfilter, description in deduped.items()])
 
 
@@ -274,4 +274,30 @@ class TestNeSemanticsParity:
     def test_ne_row_set_matches_predicate_backend(self, pcap: Path, expr: Expr) -> None:
         dfilter = compile_dfilter(expr)
         assert dfilter.startswith("!(")  # sanity: != really is negated ==
+        assert _tshark_matching_frames(pcap, dfilter) == _predicate_matching_frames(pcap, expr)
+
+
+class TestMatchesSemanticsParity:
+    """The row set tshark selects for ``field matches "p"`` must equal the
+    predicate backend's row set for the same Expr — pinning case-insensitive
+    matching, per-occurrence anchoring on multi-value fields, and the
+    absent-field negation contract against a real PCRE2, not just our reading
+    of it (PR #73 review: the common-subset guarantee needs parity evidence)."""
+
+    @pytest.mark.parametrize(
+        ("pcap", "expr"),
+        [
+            pytest.param(DNS_MULTI, DNS.qry_name.matches("^alpha"), id="anchored-multi-occurrence"),
+            pytest.param(DNS_MULTI, DNS.qry_name.matches("ALPHA"), id="case-insensitive"),
+            pytest.param(DNS_MULTI, DNS.qry_name.matches("example$"), id="dollar-anchor"),
+            pytest.param(
+                DNS_MULTI, DNS.qry_name.matches("a{2,}|beta"), id="quantifier-alternation"
+            ),
+            pytest.param(DNS_MULTI, DNS.qry_name.matches(r"\bexample\b"), id="word-boundary"),
+            pytest.param(TCP_MIXED, ~DNS.qry_name.matches("alpha"), id="negation-absent-field"),
+        ],
+    )
+    def test_matches_row_set_matches_predicate_backend(self, pcap: Path, expr: Expr) -> None:
+        dfilter = compile_dfilter(expr)
+        assert " matches " in dfilter
         assert _tshark_matching_frames(pcap, dfilter) == _predicate_matching_frames(pcap, expr)
