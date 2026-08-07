@@ -1,4 +1,4 @@
-"""Compile :class:`~remora.expr.Expr` trees to Python predicate functions.
+r"""Compile :class:`~remora.expr.Expr` trees to Python predicate functions.
 
 This is the fallback backend: anything the display-filter backend cannot push
 down (it raises :class:`~remora.compile.dfilter.UnsupportedExprError`) is
@@ -30,8 +30,8 @@ Semantics (mirror Wireshark display filters exactly)
   string fields only. Dialect note: construction restricts patterns to the
   Python-re/PCRE2 common subset (see :class:`remora.expr.Matches`), and
   matching here is **byte-oriented** — the pattern and each value are encoded
-  to UTF-8 and matched as ``bytes``, so ``.``/``{m,n}`` count bytes, ``\\w``/
-  ``\\d``/``\\s``/``\\b`` are ASCII, and case folding is ASCII-only. That
+  to UTF-8 and matched as ``bytes``, so ``.``/``{m,n}`` count bytes, ``\w``/
+  ``\d``/``\s``/``\b`` are ASCII, and case folding is ASCII-only. That
   mirrors Wireshark, which compiles ``matches`` with ``PCRE2_CASELESS`` but
   without UTF/UCP. One irreducible caveat remains: field text tshark could not
   decode as UTF-8 reaches us as U+FFFD replacement characters, which cannot

@@ -1,4 +1,4 @@
-"""Two-level pushdown query planner.
+r"""Two-level pushdown query planner.
 
 Architecture decision: pushable conjuncts become a ``-Y`` display filter;
 when the query's field set is statically known the reader projects with
@@ -26,7 +26,7 @@ Planning algorithm
 5. Mode: ``"ek"`` if any opaque callable is present OR ``select`` is None
    (M1's Capture has no projection API yet, so the consumer may access
    arbitrary fields); otherwise ``"fields"`` with a projection of the
-   selected fields plus the fields referenced by residual ``Expr``\\s,
+   selected fields plus the fields referenced by residual ``Expr``\s,
    deduplicated by field name (select order first, then residual-field
    order). Fields of *pushed* conjuncts are not projected — tshark already
    filtered on them — unless they are also selected: no over-projection.

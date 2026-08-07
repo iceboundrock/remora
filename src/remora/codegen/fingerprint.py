@@ -269,7 +269,7 @@ def _emit_protocols(
 def generate_artifacts(
     config: CodegenConfig, dump: str, *, plugins_dump: str = ""
 ) -> tuple[tuple[Artifact, ...], tuple[ParseWarning | EmitWarning, ...]]:
-    """Emit fingerprinted ``.py``/``.pyi`` pairs for every configured protocol.
+    r"""Emit fingerprinted ``.py``/``.pyi`` pairs for every configured protocol.
 
     One flat artifact set for ``config.protocols`` only — extras and the
     ``_extras.py`` map are :func:`generate_distributions`'s business. ``psdsl
@@ -277,8 +277,8 @@ def generate_artifacts(
     stays on this entry point.
 
     Returns the artifacts and every diagnostic the run produced: the dump's
-    :class:`~remora.codegen.parse.ParseWarning`\\ s first (in input-line order),
-    then each protocol's :class:`~remora.codegen.emit.EmitWarning`\\ s. Nothing
+    :class:`~remora.codegen.parse.ParseWarning`\ s first (in input-line order),
+    then each protocol's :class:`~remora.codegen.emit.EmitWarning`\ s. Nothing
     the parser skipped is ever silently dropped.
 
     Raises ValueError if a configured protocol abbrev is not in the dump or if

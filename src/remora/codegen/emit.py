@@ -154,10 +154,10 @@ def _resolve_attrs(
 
 
 def _wrap_escaped(text: str, width: int) -> list[str]:
-    """Greedy word-wrap of ``text``, measured on the *escaped* width.
+    r"""Greedy word-wrap of ``text``, measured on the *escaped* width.
 
     Lines are assembled from atomic per-character escape units, so a
-    ``\\\\`` / ``\\"`` escape pair is never split across lines; a word whose
+    ``\\`` / ``\"`` escape pair is never split across lines; a word whose
     escaped form exceeds ``width`` is broken at unit boundaries. Runs of
     whitespace collapse to single spaces (as ``textwrap.wrap`` did).
     """

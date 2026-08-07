@@ -77,8 +77,11 @@ __all__ = ["UnsupportedExprError", "compile_dfilter"]
 
 
 class UnsupportedExprError(Exception):
-    """Expr shape the dfilter backend cannot render; the planner catches this
-    and routes the conjunct to the Python predicate backend instead."""
+    """Expr shape the dfilter backend cannot render.
+
+    The planner catches this and routes the conjunct to the Python predicate
+    backend instead.
+    """
 
 
 def compile_dfilter(expr: Expr) -> str:
@@ -152,8 +155,11 @@ _NAMED_ESCAPES = {
 
 
 def _render_set_item(ftype: str, item: MembershipItem) -> str:
-    """Render one membership element; ranges render spaced (``lo .. hi``) so
-    IPv4 endpoints cannot mis-lex around the dots."""
+    """Render one membership element.
+
+    Ranges render spaced (``lo .. hi``) so IPv4 endpoints cannot mis-lex around
+    the dots.
+    """
     if isinstance(item, ValueRange):
         lo: Any = values.coerce_literal(ftype, item.lo)
         hi: Any = values.coerce_literal(ftype, item.hi)
@@ -164,9 +170,12 @@ def _render_set_item(ftype: str, item: MembershipItem) -> str:
 
 
 def _render_needle(ftype: str, needle: str | bytes) -> str:
-    """Render a contains needle; its type must match the field's Python type
-    (str fields take str, bytes fields take bytes) — anything else is a user
-    error (TypeError), mirrored exactly by the predicate backend."""
+    """Render a contains needle.
+
+    Its type must match the field's Python type (str fields take str, bytes
+    fields take bytes) — anything else is a user error (TypeError), mirrored
+    exactly by the predicate backend.
+    """
     py_type = values.get_info(ftype).py_type
     if py_type is str and isinstance(needle, str):
         return _render_str(needle)
@@ -179,10 +188,12 @@ def _render_needle(ftype: str, needle: str | bytes) -> str:
 
 
 def _render_str(value: str) -> str:
-    """Double-quote a string literal, escaping quotes, backslashes, and
-    control characters (named C escapes where Wireshark defines them, ``\\xHH``
-    for the rest of C0 and DEL). Other characters — including non-ASCII —
-    pass through as UTF-8."""
+    r"""Double-quote a string literal, escaping quotes, backslashes, and control characters.
+
+    Named C escapes are used where Wireshark defines them, ``\xHH`` for the
+    rest of C0 and DEL. Other characters — including non-ASCII — pass through
+    as UTF-8.
+    """
     out: list[str] = []
     for ch in value:
         escape = _NAMED_ESCAPES.get(ch)
