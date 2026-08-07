@@ -22,21 +22,43 @@ cap = pyshark.FileCapture(               cap = Capture("x.pcap").filter(
 pip install remora
 ```
 
+Remora is pre-1.0 and not on PyPI yet; until the first release, install from git:
+
+```sh
+pip install "remora @ git+https://github.com/iceboundrock/remora"
+```
+
 Requirements:
 
 - Python ≥ 3.10.
 - A `tshark` binary on `PATH` (or point at one with `$TSHARK`, or `Capture(..., tshark="/path/to/tshark")`). tshark ships with [Wireshark](https://www.wireshark.org/download.html); on macOS `brew install --cask wireshark` or `brew install tshark`, on Debian/Ubuntu `apt install tshark`.
 
-The core package ships typed modules for ~30 everyday protocols (`eth`, `ip`, `ipv6`, `tcp`, `udp`, `dns`, `http`, `http2`, `tls`, `quic`, `icmp`, `arp`, `dhcp`, `ntp`, `ssh`, `sip`, `rtp`, `sctp`, …). Domain-specific sets are extras:
+### Where protocol classes live
 
-| Install | Adds protocols |
+The core package ships typed modules for ~30 everyday protocols (`eth`, `ip`, `ipv6`, `tcp`, `udp`, `dns`, `http`, `http2`, `tls`, `quic`, `icmp`, `arp`, `dhcp`, `ntp`, `ssh`, `sip`, `rtp`, `sctp`, …). **They all live in `remora.proto`.** The top level re-exports only `Capture` and the five most common protocols (`ETH`, `IP`, `TCP`, `UDP`, `DNS`) as a convenience — everything else, including every extras protocol, is imported from `remora.proto`:
+
+<!-- The ci: comment markers below opt a fence into tests/test_readme.py, which
+     mypy-checks it (and, for the run mode, executes it) in CI. A marker must
+     sit on its own line immediately above its ```python fence. -->
+<!-- ci:typecheck -->
+```python
+from remora import IP, Capture  # top-level convenience re-exports
+from remora.proto import HTTP, QUIC, TLS  # everything else
+
+query = (IP.src == "10.0.0.1") & (HTTP.request_method == "GET")
+handshake = QUIC.long_packet_type.present() | TLS.handshake_type.present()
+```
+
+Domain-specific protocol sets are packaged as extras:
+
+| Install | Adds to `remora.proto` |
 |---|---|
 | `pip install "remora[wireless]"` | `WLAN`, `RADIOTAP` |
 | `pip install "remora[industrial]"` | `MODBUS`, `MBTCP`, `DNP3` |
 | `pip install "remora[telecom]"` | `GTP`, `DIAMETER` |
 | `pip install "remora[all]"` | everything above |
 
-Importing an extras protocol without its extra installed raises an `ImportError` that names the exact `pip install` command. Anything not shipped at all can be generated locally — see [Local generation](#local-generation-psdsl-gen).
+They import exactly like core protocols — `from remora.proto import WLAN` — and grafting happens at install time, so no import path changes when you add an extra. Importing an extras protocol without its extra installed raises an `ImportError` that names the exact `pip install` command. Anything not shipped at all can be generated locally — see [Local generation](#local-generation-psdsl-gen).
 
 ## Quickstart
 
@@ -59,7 +81,7 @@ That's pcap → typed query → results:
 - `pkt[IP].src` (instance access) returns a parsed `IPv4Address | None` — never a bare string, never an exception for an absent field.
 - Opaque Python predicates work too — `cap.filter(lambda pkt: some_check(pkt))` — Remora runs what it can't push down as a residual filter in Python.
 
-This snippet is executed by CI against a test pcap on every push (see `tests/test_readme.py`), so it cannot rot.
+This snippet is executed by CI against a test pcap on every pull request and every push to `main` (see `tests/test_readme.py`), so it cannot rot.
 
 ## Two rules to learn before anything else
 

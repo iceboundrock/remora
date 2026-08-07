@@ -25,10 +25,18 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 README = REPO_ROOT / "README.md"
 SAMPLE_PCAP = REPO_ROOT / "tests" / "data" / "sample.pcap"
 
+# The mypy floor the package supports (pyproject requires-python >= 3.10). The
+# snippet subprocess runs from a tmp dir, so [tool.mypy] never loads — pin it here.
+PYTHON_VERSION = "3.10"
+
 _MARKED_FENCE = re.compile(
     r"<!-- ci:(?P<mode>run|typecheck) -->\n```python\n(?P<code>.*?)```",
     re.DOTALL,
 )
+#: Every marker line, valid mode or not. Counted against _MARKED_FENCE so a
+#: marker that stops being followed by a fence fails loudly instead of
+#: silently dropping its snippet out of CI.
+_MARKER_LINE = re.compile(r"^<!-- ci:.*-->$", re.MULTILINE)
 
 
 def _snippets() -> list[tuple[str, str]]:
@@ -43,13 +51,31 @@ def test_readme_has_marked_snippets() -> None:
     assert "typecheck" in modes, "README must keep <!-- ci:typecheck --> fences"
 
 
+def test_every_marker_line_is_extracted() -> None:
+    markers = _MARKER_LINE.findall(README.read_text(encoding="utf-8"))
+    assert len(_snippets()) == len(markers), (
+        f"{len(markers)} ci: marker line(s) in README.md but "
+        f"{len(_snippets())} extracted snippet(s) — a marker must sit on its own "
+        "line immediately above a ```python fence, and its mode must be "
+        "'run' or 'typecheck'"
+    )
+
+
 @pytest.mark.parametrize(("index", "snippet"), list(enumerate(_snippets())))
 def test_marked_snippet_typechecks(tmp_path: Path, index: int, snippet: tuple[str, str]) -> None:
     _, code = snippet
     source = tmp_path / f"readme_snippet_{index}.py"
     source.write_text(code, encoding="utf-8")
     result = subprocess.run(
-        [sys.executable, "-m", "mypy", "--strict", source.name],
+        [
+            sys.executable,
+            "-m",
+            "mypy",
+            "--strict",
+            "--python-version",
+            PYTHON_VERSION,
+            source.name,
+        ],
         cwd=tmp_path,
         capture_output=True,
         text=True,
