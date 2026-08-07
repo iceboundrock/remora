@@ -60,17 +60,26 @@ Domain-specific protocol sets ship as separate distributions, selected with an e
 | `telecom` | `GTP`, `DIAMETER` |
 | `all` | everything above |
 
-Install one the same way, with the extra in brackets:
+The extras *distributions* are unpublished too, so `pip install "remora[wireless]"` cannot resolve — the extra points at a `remora-wireless` distribution that no index carries. Until they ship, install one from a checkout, alongside core:
 
 ```sh
-pip install "remora[wireless] @ git+https://github.com/iceboundrock/remora"
+git clone https://github.com/iceboundrock/remora
+pip install ./remora ./remora/packages/remora-wireless
 ```
 
-An extras distribution grafts its modules into `remora.proto` at install time, so no import path changes when you add one. Two spellings, and the difference matters:
+Working inside the repository, there is nothing to do: `uv sync` already installs all three extras as workspace members.
 
+An extras distribution grafts its modules into `remora.proto` at install time, so no import path changes when you add one. Two import spellings, and the difference matters — the convenient one:
+
+<!-- ci:exec -->
 ```python
 from remora.proto import WLAN  # runtime convenience — a type checker sees `object`
-from remora.proto.wlan import WLAN  # typed: resolves the shipped .pyi stub
+```
+
+and the typed one:
+
+```python
+from remora.proto.wlan import WLAN  # resolves the shipped .pyi stub
 ```
 
 `remora.proto` reaches extras through a module-level `__getattr__`, which a type checker cannot follow, so prefer the submodule import in typed code. (Core protocols have no such caveat — they are re-exported by name.) Importing an extras protocol without its extra installed raises an `ImportError` naming the exact extra to install. Anything not shipped at all can be generated locally — see [Local generation](#local-generation-psdsl-gen).
