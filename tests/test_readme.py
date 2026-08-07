@@ -1,10 +1,17 @@
 """README code fences are CI-checked so the quickstart can never rot (issue #24).
 
 Marker contract: an HTML comment line immediately before a ```python fence
-in README.md opts that fence into CI:
+in README.md opts that fence into CI. Every marked fence is typechecked; the
+mode says what else happens to it.
 
-- ``<!-- ci:typecheck -->`` — the fence must pass ``mypy --strict`` as a
-  standalone module.
+- ``<!-- ci:typecheck -->`` — ``mypy --strict`` only. The weakest mode, and
+  the fallback for a snippet that must not execute.
+- ``<!-- ci:exec -->`` — typechecked AND executed in-process, with no tshark
+  and no capture file. This is what catches protocol and field rot:
+  ``ProtocolMeta.__getattr__`` types any attribute as ``Any`` and
+  ``remora.proto.__getattr__`` returns ``object``, so mypy accepts
+  ``IP.no_such_field`` and ``from remora.proto import NOSUCHPROTO`` — only
+  running the snippet raises ``AttributeError``/``ImportError``.
 - ``<!-- ci:run -->`` — typechecked AND executed against a real tshark
   (integration) with ``capture.pcap`` (a copy of ``tests/data/sample.pcap``)
   in the working directory.
@@ -29,14 +36,20 @@ SAMPLE_PCAP = REPO_ROOT / "tests" / "data" / "sample.pcap"
 # snippet subprocess runs from a tmp dir, so [tool.mypy] never loads — pin it here.
 PYTHON_VERSION = "3.10"
 
+MODES = ("run", "exec", "typecheck")
+
+# Trailing spaces/CRLF on a marker line must not silently drop its fence, so
+# both patterns tolerate them — and _MARKER_LINE stays deliberately loose about
+# the mode so a typo'd mode is counted and reported rather than ignored.
 _MARKED_FENCE = re.compile(
-    r"<!-- ci:(?P<mode>run|typecheck) -->\n```python\n(?P<code>.*?)```",
+    r"<!-- ci:(?P<mode>" + "|".join(MODES) + r") -->[ \t]*\r?\n"
+    r"```python[ \t]*\r?\n(?P<code>.*?)```",
     re.DOTALL,
 )
 #: Every marker line, valid mode or not. Counted against _MARKED_FENCE so a
 #: marker that stops being followed by a fence fails loudly instead of
 #: silently dropping its snippet out of CI.
-_MARKER_LINE = re.compile(r"^<!-- ci:.*-->$", re.MULTILINE)
+_MARKER_LINE = re.compile(r"^<!-- ci:.*-->[ \t]*\r?$", re.MULTILINE)
 
 
 def _snippets() -> list[tuple[str, str]]:
@@ -45,10 +58,15 @@ def _snippets() -> list[tuple[str, str]]:
     return [(m["mode"], m["code"]) for m in _MARKED_FENCE.finditer(text)]
 
 
+def _snippets_for(mode: str) -> list[tuple[int, str]]:
+    """(README-order index, code) for every fence in *mode*."""
+    return [(i, code) for i, (m, code) in enumerate(_snippets()) if m == mode]
+
+
 def test_readme_has_marked_snippets() -> None:
     modes = [mode for mode, _ in _snippets()]
     assert "run" in modes, "README must keep a <!-- ci:run --> quickstart fence"
-    assert "typecheck" in modes, "README must keep <!-- ci:typecheck --> fences"
+    assert "exec" in modes, "README must keep <!-- ci:exec --> fences"
 
 
 def test_every_marker_line_is_extracted() -> None:
@@ -56,8 +74,8 @@ def test_every_marker_line_is_extracted() -> None:
     assert len(_snippets()) == len(markers), (
         f"{len(markers)} ci: marker line(s) in README.md but "
         f"{len(_snippets())} extracted snippet(s) — a marker must sit on its own "
-        "line immediately above a ```python fence, and its mode must be "
-        "'run' or 'typecheck'"
+        "line immediately above a ```python fence, and its mode must be one of "
+        f"{', '.join(MODES)}"
     )
 
 
@@ -82,6 +100,21 @@ def test_marked_snippet_typechecks(tmp_path: Path, index: int, snippet: tuple[st
         check=False,
     )
     assert result.returncode == 0, f"snippet {index}:\n{code}\n{result.stdout}"
+
+
+@pytest.mark.parametrize(
+    ("index", "code"),
+    _snippets_for("exec"),
+    ids=[f"snippet{index}" for index, _ in _snippets_for("exec")],
+)
+def test_exec_snippet_runs(index: int, code: str) -> None:
+    """Executing an expression-building fence is what catches renamed fields.
+
+    mypy cannot: ``ProtocolMeta.__getattr__`` types every protocol attribute as
+    ``Any`` and ``remora.proto.__getattr__`` returns ``object``, so a stale
+    field or protocol name typechecks clean and only fails at runtime.
+    """
+    exec(compile(code, f"<README ci:exec snippet {index}>", "exec"), {"__name__": "__main__"})
 
 
 @pytest.mark.integration

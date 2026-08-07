@@ -18,15 +18,13 @@ cap = pyshark.FileCapture(               cap = Capture("x.pcap").filter(
 
 ## Installation
 
-```sh
-pip install remora
-```
-
-Remora is pre-1.0 and not on PyPI yet; until the first release, install from git:
+Remora is pre-1.0 and is **not** on PyPI. Do not `pip install remora` — that name on PyPI belongs to an unrelated 2015 project ("a replacement for NRPE"). Install from git:
 
 ```sh
 pip install "remora @ git+https://github.com/iceboundrock/remora"
 ```
+
+The distribution name is not settled yet, so the eventual PyPI install command may differ. The repository is also private for now, so an anonymous clone of that URL 404s — use an authenticated remote (`git+ssh://git@github.com/iceboundrock/remora`) until it opens up.
 
 Requirements:
 
@@ -38,9 +36,9 @@ Requirements:
 The core package ships typed modules for ~30 everyday protocols (`eth`, `ip`, `ipv6`, `tcp`, `udp`, `dns`, `http`, `http2`, `tls`, `quic`, `icmp`, `arp`, `dhcp`, `ntp`, `ssh`, `sip`, `rtp`, `sctp`, …). **They all live in `remora.proto`.** The top level re-exports only `Capture` and the five most common protocols (`ETH`, `IP`, `TCP`, `UDP`, `DNS`) as a convenience — everything else, including every extras protocol, is imported from `remora.proto`:
 
 <!-- The ci: comment markers below opt a fence into tests/test_readme.py, which
-     mypy-checks it (and, for the run mode, executes it) in CI. A marker must
-     sit on its own line immediately above its ```python fence. -->
-<!-- ci:typecheck -->
+     mypy-checks it and — in the exec and run modes — executes it in CI. A
+     marker must sit on its own line immediately above its ```python fence. -->
+<!-- ci:exec -->
 ```python
 from remora import IP, Capture  # top-level convenience re-exports
 from remora.proto import HTTP, QUIC, TLS  # everything else
@@ -49,16 +47,33 @@ query = (IP.src == "10.0.0.1") & (HTTP.request_method == "GET")
 handshake = QUIC.long_packet_type.present() | TLS.handshake_type.present()
 ```
 
-Domain-specific protocol sets are packaged as extras:
+Core protocols are re-exported by name from `remora.proto`, so that import is fully typed.
 
-| Install | Adds to `remora.proto` |
+### Protocol extras
+
+Domain-specific protocol sets ship as separate distributions, selected with an extra:
+
+| Extra | Adds to `remora.proto` |
 |---|---|
-| `pip install "remora[wireless]"` | `WLAN`, `RADIOTAP` |
-| `pip install "remora[industrial]"` | `MODBUS`, `MBTCP`, `DNP3` |
-| `pip install "remora[telecom]"` | `GTP`, `DIAMETER` |
-| `pip install "remora[all]"` | everything above |
+| `wireless` | `WLAN`, `RADIOTAP` |
+| `industrial` | `MODBUS`, `MBTCP`, `DNP3` |
+| `telecom` | `GTP`, `DIAMETER` |
+| `all` | everything above |
 
-They import exactly like core protocols — `from remora.proto import WLAN` — and grafting happens at install time, so no import path changes when you add an extra. Importing an extras protocol without its extra installed raises an `ImportError` that names the exact `pip install` command. Anything not shipped at all can be generated locally — see [Local generation](#local-generation-psdsl-gen).
+Install one the same way, with the extra in brackets:
+
+```sh
+pip install "remora[wireless] @ git+https://github.com/iceboundrock/remora"
+```
+
+An extras distribution grafts its modules into `remora.proto` at install time, so no import path changes when you add one. Two spellings, and the difference matters:
+
+```python
+from remora.proto import WLAN  # runtime convenience — a type checker sees `object`
+from remora.proto.wlan import WLAN  # typed: resolves the shipped .pyi stub
+```
+
+`remora.proto` reaches extras through a module-level `__getattr__`, which a type checker cannot follow, so prefer the submodule import in typed code. (Core protocols have no such caveat — they are re-exported by name.) Importing an extras protocol without its extra installed raises an `ImportError` naming the exact extra to install. Anything not shipped at all can be generated locally — see [Local generation](#local-generation-psdsl-gen).
 
 ## Quickstart
 
@@ -89,7 +104,7 @@ This snippet is executed by CI against a test pcap on every pull request and eve
 
 Python's `and`/`or`/`not` (and chained comparisons like `80 <= TCP.port <= 90`) need a boolean *now*; a Remora expression is a tree to be compiled *later*. Truth-testing an expression raises `TypeError` immediately — you can't silently get the wrong filter. Use the operator forms, and parenthesize comparisons (`&`/`|` bind tighter than `==`):
 
-<!-- ci:typecheck -->
+<!-- ci:exec -->
 ```python
 from remora import IP, TCP
 
@@ -104,7 +119,7 @@ Some fields occur several times per packet — `tcp.port` dissects as *both* the
 
 Wireshark's own `!=` is a famous footgun: `tcp.port != 80` there means "any occurrence differs from 80", which still matches most packets *touching* port 80. Remora makes that pitfall unrepresentable — there is no `!=` node at all. `TCP.port != 80` compiles to `!(tcp.port == 80)`: *no* occurrence equals 80, i.e. genuinely "not port 80".
 
-<!-- ci:typecheck -->
+<!-- ci:exec -->
 ```python
 from remora import TCP
 
@@ -143,7 +158,7 @@ For a worked end-to-end example (non-core protocol, `--multi` curation, imports)
 
 ## Contributing: regenerating the committed protocols
 
-Protocol modules under `src/remora/proto/` (and the extras packages) are generated artifacts pinned to the tshark version in `codegen.toml`; CI re-checks byte equality on every push (`uv run python -m remora.codegen check`). How to regenerate them, and what to do when the drift check fails, is covered in [docs/codegen.md](docs/codegen.md).
+Protocol modules under `src/remora/proto/` (and the extras packages) are generated artifacts pinned to the tshark version in `codegen.toml`; CI re-checks byte equality on every pull request and every push to `main` (`uv run python -m remora.codegen check`). How to regenerate them, and what to do when the drift check fails, is covered in [docs/codegen.md](docs/codegen.md).
 
 ## Roadmap
 
