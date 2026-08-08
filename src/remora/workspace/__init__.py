@@ -16,7 +16,7 @@ from remora.workspace.errors import (
     SchemaVersionError,
     WorkspaceError,
 )
-from remora.workspace.naming import column_name, find_collisions
+from remora.workspace.naming import SKELETON_COLUMNS, column_name, find_collisions
 from remora.workspace.schema import (
     SCHEMA_VERSION,
     CacheKeyRecord,
@@ -34,6 +34,7 @@ from remora.workspace.schema import (
 
 __all__ = [
     "SCHEMA_VERSION",
+    "SKELETON_COLUMNS",
     "CacheKeyRecord",
     "ColumnNameCollisionError",
     "FieldRecord",

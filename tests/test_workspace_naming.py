@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from remora.workspace.naming import column_name, find_collisions
+from remora.workspace.naming import SKELETON_COLUMNS, column_name, find_collisions
 
 
 class TestColumnName:
@@ -34,6 +34,11 @@ class TestColumnName:
         assert column_name("frame.number") == "frame_number"
         assert column_name("frame.time") == "frame_time"
 
+    def test_non_ascii_alphanumerics_become_underscores(self) -> None:
+        # "µ".isalnum() is True but it is not ASCII, so the isascii() guard is
+        # what keeps it out of the identifier.
+        assert column_name("tcp.µs") == "tcp__s"
+
     def test_deterministic(self) -> None:
         assert column_name("tcp.analysis.flags") == column_name("tcp.analysis.flags")
 
@@ -59,3 +64,17 @@ class TestFindCollisions:
 
     def test_colliding_abbrevs_are_sorted(self) -> None:
         assert find_collisions(["b.x", "b_x", "a.b.x"]) == {"b_x": ("b.x", "b_x")}
+
+    def test_the_leading_digit_prefix_creates_its_own_collision(self) -> None:
+        # The f_ rule is not injective either: a real abbrev already starting
+        # with "f_" can claim the column a digit-leading abbrev is prefixed into.
+        assert find_collisions(["6lowpan.x", "f_6lowpan.x"]) == {
+            "f_6lowpan_x": ("6lowpan.x", "f_6lowpan.x"),
+        }
+
+
+class TestSkeletonColumns:
+    def test_matches_the_pkts_skeleton_under_the_policy(self) -> None:
+        # The pkts skeleton is built from these two abbrevs; if the policy ever
+        # changes, this fails rather than letting the skeleton drift out of it.
+        assert {column_name("frame.number"), column_name("frame.time")} == SKELETON_COLUMNS

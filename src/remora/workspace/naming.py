@@ -30,8 +30,9 @@ layer cannot disagree about column names.
 from __future__ import annotations
 
 from collections.abc import Iterable
+from typing import Final
 
-__all__ = ["column_name", "find_collisions"]
+__all__ = ["SKELETON_COLUMNS", "column_name", "find_collisions"]
 
 
 def column_name(abbrev: str) -> str:
@@ -52,6 +53,17 @@ def column_name(abbrev: str) -> str:
     if name[0].isdigit():
         name = "f_" + name
     return name
+
+
+SKELETON_COLUMNS: Final[frozenset[str]] = frozenset({"frame_number", "frame_time"})
+"""Columns ``pkts`` is created with — the row key, reserved from materializing.
+
+These are the ``frame.number`` / ``frame.time`` columns of the ``pkts``
+skeleton, already present in every workspace, so a field set asking for them
+needs no column added. :func:`find_collisions` will not flag them (they collide
+with nothing), which is why the reservation is stated here rather than left for
+``ALTER TABLE`` to discover.
+"""
 
 
 def find_collisions(abbrevs: Iterable[str]) -> dict[str, tuple[str, ...]]:

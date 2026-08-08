@@ -108,9 +108,11 @@ def test_optional_dependencies_cover_every_extra_and_all_is_the_union() -> None:
     version = project["version"]
     optional = project["optional-dependencies"]
     assert isinstance(optional, dict)
-    # Protocol extras plus "all" (union) are required; workspace and other
-    # non-protocol extras are allowed but not required to follow the pattern.
-    assert {*EXTRA_NAMES, "all"}.issubset(optional.keys())
+    # A closed world: every protocol extra, "all" (their union), and
+    # "workspace". The last is exempt from the remora-<extra>==<version> shape
+    # because it is not a generated protocol distribution — it pulls in the
+    # third-party duckdb dependency instead.
+    assert set(optional) == {*EXTRA_NAMES, "all", "workspace"}
     for extra in EXTRA_NAMES:
         assert optional[extra] == [f"remora-{extra}=={version}"]
     assert sorted(optional["all"]) == sorted(f"remora-{extra}=={version}" for extra in EXTRA_NAMES)

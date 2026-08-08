@@ -47,12 +47,12 @@ psdsl = "remora.codegen.cli:main"
 
 [dependency-groups]
 dev = [
+    "duckdb>=1.1",
     "mypy>=1.14",
     "pytest>=8.0",
     "ruff>=0.9",
     "tomli>=2.0",
     "typing-extensions>=4.4",
-    "duckdb>=1.1",
     "remora-wireless",
     "remora-industrial",
     "remora-telecom",

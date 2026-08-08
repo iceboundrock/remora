@@ -33,7 +33,12 @@ Column types are ``VARCHAR`` placeholders until the FType -> column-type map
 lands (#26); nothing here invents a type mapping.
 
 Timestamps are UTC. DuckDB ``TIMESTAMP`` is timezone-naive, so aware datetimes
-are converted to naive UTC on write and re-tagged as UTC on read.
+are converted to naive UTC on write and re-tagged as UTC on read; a naive
+datetime handed in is assumed to already be UTC.
+
+There is exactly one layout version and no migration path: a file whose
+recorded version differs from :data:`SCHEMA_VERSION` in either direction is
+refused by :func:`check_compatible`.
 
 Connections are supplied by the caller — this module never opens one, because
 connection and lock ownership belongs to ``Workspace`` (#28). It therefore
@@ -42,7 +47,6 @@ imports duckdb only for typing and stays importable without it.
 
 from __future__ import annotations
 
-import json
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -50,6 +54,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Final
 
 from remora.workspace.errors import SchemaVersionError, WorkspaceError
+from remora.workspace.naming import SKELETON_COLUMNS
 
 if TYPE_CHECKING:
     from duckdb import DuckDBPyConnection
@@ -113,7 +118,7 @@ _DDL: Final[tuple[str, ...]] = (
     """
     CREATE TABLE IF NOT EXISTS meta.fields (
         abbrev          VARCHAR PRIMARY KEY,
-        column_name     VARCHAR NOT NULL,
+        column_name     VARCHAR NOT NULL UNIQUE,
         ftype           VARCHAR NOT NULL,
         multi           BOOLEAN NOT NULL,
         column_type     VARCHAR NOT NULL,
@@ -125,10 +130,10 @@ _DDL: Final[tuple[str, ...]] = (
         key              VARCHAR PRIMARY KEY,
         pcap_path        VARCHAR NOT NULL,
         pcap_fingerprint VARCHAR NOT NULL,
-        fields           VARCHAR NOT NULL,
+        fields           VARCHAR[] NOT NULL,
         dfilter          VARCHAR,
         tshark_version   VARCHAR NOT NULL,
-        argv             VARCHAR NOT NULL,
+        argv             VARCHAR[] NOT NULL,
         created_at       TIMESTAMP NOT NULL
     )
     """,
@@ -150,6 +155,11 @@ def create_schema(con: DuckDBPyConnection) -> None:
     Idempotent: every statement is ``IF NOT EXISTS`` and the version row is
     inserted only when absent, so this is the one open-or-create code path.
     Existing data is left untouched.
+
+    This does **not** imply :func:`check_compatible`. Because every statement is
+    ``IF NOT EXISTS``, running it against a workspace written by a different
+    layout version silently no-ops on the stale tables; an opener (#28) must
+    call :func:`check_compatible` on an existing file before trusting it.
 
     Args:
         con: An open DuckDB connection to the workspace.
@@ -175,8 +185,14 @@ def read_schema_version(con: DuckDBPyConnection) -> int:
         SchemaVersionError: If the catalog or the version row is missing, or
             the recorded value is not an integer.
     """
+    # duckdb_tables() spans every attached database, so pin the probe to the
+    # current one — otherwise an unrelated workspace attached alongside makes a
+    # blank database look like a workspace and the next statement escapes as a
+    # raw duckdb.CatalogException.
     catalog = con.execute(
-        "SELECT count(*) FROM duckdb_tables() WHERE schema_name = 'meta' AND table_name = 'info'"
+        "SELECT count(*) FROM duckdb_tables() "
+        "WHERE database_name = current_database() "
+        "AND schema_name = 'meta' AND table_name = 'info'"
     ).fetchone()
     if catalog is None or catalog[0] == 0:
         raise SchemaVersionError("not a remora workspace: the meta.info catalog table is missing")
@@ -192,20 +208,30 @@ def read_schema_version(con: DuckDBPyConnection) -> int:
 def check_compatible(con: DuckDBPyConnection) -> None:
     """Verify this library can read the workspace opened on ``con``.
 
+    Only the exact :data:`SCHEMA_VERSION` is accepted. There is no migration
+    path in either direction, and an older file must be refused loudly rather
+    than half-upgraded: :func:`create_schema` is ``IF NOT EXISTS``-only, so it
+    would no-op on the stale tables and hand back a workspace whose layout
+    silently disagrees with this library.
+
     Args:
         con: An open DuckDB connection to the workspace.
 
     Raises:
-        SchemaVersionError: If the file's schema version is newer than
-            :data:`SCHEMA_VERSION`, or the workspace catalog is missing. Older
-            versions are accepted — only version 1 exists, so there is nothing
-            to migrate yet.
+        SchemaVersionError: If the file's schema version is not
+            :data:`SCHEMA_VERSION`, or the workspace catalog is missing.
     """
     found = read_schema_version(con)
     if found > SCHEMA_VERSION:
         raise SchemaVersionError(
             f"workspace schema version {found} is newer than this remora "
             f"supports ({SCHEMA_VERSION}); upgrade remora to open it"
+        )
+    if found < SCHEMA_VERSION:
+        raise SchemaVersionError(
+            f"workspace schema version {found} was written by an older remora "
+            f"than this one ({SCHEMA_VERSION}); there is no migration path, so "
+            f"recreate the workspace"
         )
 
 
@@ -266,7 +292,11 @@ class CacheKeyRecord:
 
 
 def _to_db_time(value: datetime) -> datetime:
-    """Convert an aware datetime to the naive UTC DuckDB stores."""
+    """Convert an aware datetime to the naive UTC DuckDB stores.
+
+    A naive datetime is assumed to already be UTC and passes through unchanged
+    — it is never interpreted as local time.
+    """
     if value.tzinfo is None:
         return value
     return value.astimezone(timezone.utc).replace(tzinfo=None)
@@ -368,10 +398,10 @@ def record_cache_key(con: DuckDBPyConnection, record: CacheKeyRecord) -> None:
             record.key,
             record.pcap_path,
             record.pcap_fingerprint,
-            json.dumps(list(record.fields)),
+            list(record.fields),
             record.dfilter,
             record.tshark_version,
-            json.dumps(list(record.argv)),
+            list(record.argv),
             _to_db_time(record.created_at),
         ],
     )
@@ -401,10 +431,10 @@ def read_cache_key(con: DuckDBPyConnection, key: str) -> CacheKeyRecord | None:
         key=row[0],
         pcap_path=row[1],
         pcap_fingerprint=row[2],
-        fields=tuple(json.loads(row[3])),
+        fields=tuple(row[3]),
         dfilter=row[4],
         tshark_version=row[5],
-        argv=tuple(json.loads(row[6])),
+        argv=tuple(row[6]),
         created_at=_from_db_time(row[7]),
     )
 
@@ -419,13 +449,24 @@ def add_field_column(con: DuckDBPyConnection, column: str, sql_type: str = "VARC
         sql_type: SQL type for the column. ``"VARCHAR"`` is the placeholder
             until #26 supplies the FType map. Types cannot be bound as
             parameters, so the value is validated against a conservative
-            pattern (identifier, optional precision, optional ``[]`` suffixes).
+            pattern: letters, digits, underscores and *spaces* (multi-word
+            types such as ``DOUBLE PRECISION`` are real), then an optional
+            precision and any number of ``[]`` suffixes. Spaces mean the
+            pattern also admits type-and-modifier strings like
+            ``"BIGINT NOT NULL"``; what it excludes is punctuation, and with
+            it every way out of the type position.
 
     Raises:
         ValueError: If ``sql_type`` is not a plain SQL type.
-        WorkspaceError: If ``pkts`` already has that column.
+        WorkspaceError: If ``column`` is a ``pkts`` skeleton column, or ``pkts``
+            already has that column.
     """
-    if not _SQL_TYPE_RE.match(sql_type):
+    if column in SKELETON_COLUMNS:
+        raise WorkspaceError(
+            f"{column!r} is already the pkts row key and does not need "
+            f"materializing; drop it from the field set"
+        )
+    if not _SQL_TYPE_RE.fullmatch(sql_type):
         raise ValueError(f"not a plain SQL type: {sql_type!r}")
     existing = con.execute(
         "SELECT count(*) FROM duckdb_columns() "
