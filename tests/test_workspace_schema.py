@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
@@ -16,11 +18,39 @@ from remora.workspace.schema import (
 )
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from duckdb import DuckDBPyConnection
 
 duckdb = pytest.importorskip("duckdb")
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SCHEMA_MODULE = REPO_ROOT / "src" / "remora" / "workspace" / "schema.py"
+
+# Matches a DDL statement head. "\s+" is a literal backslash-s in this source,
+# so this pattern does not match its own definition.
+DDL_STATEMENT = re.compile(r"CREATE\s+(?:TABLE|SCHEMA|VIEW|INDEX)\b", re.IGNORECASE)
+
+EXPECTED_TABLES = {
+    ("main", "pkts"),
+    ("main", "streams"),
+    ("main", "annotations"),
+    ("meta", "info"),
+    ("meta", "fields"),
+    ("meta", "cache_keys"),
+}
+
+
+def files_declaring_ddl() -> set[Path]:
+    """Every .py file under src/ and tests/ that contains a DDL statement head."""
+    found: set[Path] = set()
+    for tree in (REPO_ROOT / "src", REPO_ROOT / "tests"):
+        for path in tree.rglob("*.py"):
+            raw = path.read_bytes()
+            # Cheap prefilter: the generated proto tree is ~1 MB and has no DDL.
+            if b"create" not in raw.lower():
+                continue
+            if DDL_STATEMENT.search(raw.decode("utf-8", errors="replace")):
+                found.add(path)
+    return found
 
 
 @pytest.fixture
@@ -46,31 +76,24 @@ def column_names(connection: DuckDBPyConnection, schema: str, table: str) -> lis
 
 
 class TestCreateSchema:
-    def test_creates_all_core_tables(self, con: DuckDBPyConnection) -> None:
-        assert table_names(con) >= {
-            ("main", "pkts"),
-            ("main", "streams"),
-            ("main", "annotations"),
-            ("meta", "info"),
-            ("meta", "fields"),
-            ("meta", "cache_keys"),
-        }
+    def test_creates_exactly_the_core_tables(self, con: DuckDBPyConnection) -> None:
+        # Cross-checks the DDL against the live catalog: no table is missing, and
+        # none is created that the layout does not document.
+        assert table_names(con) == EXPECTED_TABLES
 
     def test_pkts_skeleton_columns(self, con: DuckDBPyConnection) -> None:
         assert column_names(con, "main", "pkts") == ["frame_number", "frame_time"]
 
     def test_ddl_is_the_only_source(self) -> None:
-        # Every table the schema creates is created by a statement in iter_ddl().
-        ddl = "\n".join(iter_ddl())
-        for table in (
-            "pkts",
-            "streams",
-            "annotations",
-            "meta.info",
-            "meta.fields",
-            "meta.cache_keys",
-        ):
-            assert table in ddl
+        # schema.py is the one file in src/ and tests/ allowed to contain DDL.
+        assert files_declaring_ddl() == {SCHEMA_MODULE}
+
+    def test_schema_module_keeps_all_ddl_in_the_constant(self) -> None:
+        # Within schema.py, every DDL statement belongs to iter_ddl() — none is
+        # built inline by a helper (the risk when #31 adds add_field_column).
+        in_source = len(DDL_STATEMENT.findall(SCHEMA_MODULE.read_text(encoding="utf-8")))
+        in_constant = sum(len(DDL_STATEMENT.findall(statement)) for statement in iter_ddl())
+        assert in_source == in_constant > 0
 
     def test_idempotent(self, con: DuckDBPyConnection) -> None:
         con.execute("INSERT INTO pkts VALUES (1, TIMESTAMP '2026-08-08 00:00:00')")
