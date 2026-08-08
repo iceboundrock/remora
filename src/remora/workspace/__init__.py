@@ -17,11 +17,37 @@ from remora.workspace.errors import (
     WorkspaceError,
 )
 from remora.workspace.naming import column_name, find_collisions
+from remora.workspace.schema import (
+    SCHEMA_VERSION,
+    CacheKeyRecord,
+    FieldRecord,
+    add_field_column,
+    check_compatible,
+    create_schema,
+    iter_ddl,
+    read_cache_key,
+    read_fields,
+    read_schema_version,
+    record_cache_key,
+    register_fields,
+)
 
 __all__ = [
+    "SCHEMA_VERSION",
+    "CacheKeyRecord",
     "ColumnNameCollisionError",
+    "FieldRecord",
     "SchemaVersionError",
     "WorkspaceError",
+    "add_field_column",
+    "check_compatible",
     "column_name",
+    "create_schema",
     "find_collisions",
+    "iter_ddl",
+    "read_cache_key",
+    "read_fields",
+    "read_schema_version",
+    "record_cache_key",
+    "register_fields",
 ]

@@ -3,18 +3,26 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
 
-from remora.workspace.errors import SchemaVersionError
+from remora.workspace.errors import SchemaVersionError, WorkspaceError
 from remora.workspace.schema import (
     SCHEMA_VERSION,
+    CacheKeyRecord,
+    FieldRecord,
+    add_field_column,
     check_compatible,
     create_schema,
     iter_ddl,
+    read_cache_key,
+    read_fields,
     read_schema_version,
+    record_cache_key,
+    register_fields,
 )
 
 if TYPE_CHECKING:
@@ -139,3 +147,165 @@ class TestSchemaVersion:
         second = duckdb.connect(path)
         assert read_schema_version(second) == SCHEMA_VERSION
         second.close()
+
+
+UTC_NOW = datetime(2026, 8, 8, 12, 30, 45, 123456, tzinfo=timezone.utc)
+
+
+def sample_fields() -> tuple[FieldRecord, ...]:
+    return (
+        FieldRecord(
+            abbrev="ip.src",
+            column_name="ip_src",
+            ftype="FT_IPv4",
+            multi=False,
+            column_type="VARCHAR",
+            materialized_at=UTC_NOW,
+        ),
+        FieldRecord(
+            abbrev="tcp.port",
+            column_name="tcp_port",
+            ftype="FT_UINT16",
+            multi=True,
+            column_type="VARCHAR",
+            materialized_at=UTC_NOW,
+        ),
+    )
+
+
+class TestFieldRegistry:
+    def test_round_trip_over_a_fresh_connection(self, con: DuckDBPyConnection) -> None:
+        register_fields(con, sample_fields())
+        # cursor() is a separate connection over the same in-memory database.
+        assert read_fields(con.cursor()) == sample_fields()
+
+    def test_round_trip_across_close_and_reopen(self, tmp_path: Path) -> None:
+        path = str(tmp_path / "ws.duckdb")
+        first = duckdb.connect(path)
+        create_schema(first)
+        register_fields(first, sample_fields())
+        first.close()
+        second = duckdb.connect(path)
+        assert read_fields(second) == sample_fields()
+        second.close()
+
+    def test_multiplicity_and_ftype_survive(self, con: DuckDBPyConnection) -> None:
+        register_fields(con, sample_fields())
+        by_abbrev = {record.abbrev: record for record in read_fields(con)}
+        assert by_abbrev["tcp.port"].multi is True
+        assert by_abbrev["ip.src"].multi is False
+        assert by_abbrev["ip.src"].ftype == "FT_IPv4"
+
+    def test_timestamp_comes_back_as_aware_utc(self, con: DuckDBPyConnection) -> None:
+        register_fields(con, sample_fields())
+        stored = read_fields(con)[0].materialized_at
+        assert stored.tzinfo is timezone.utc
+        assert stored == UTC_NOW
+
+    def test_ordered_by_abbrev(self, con: DuckDBPyConnection) -> None:
+        register_fields(con, reversed(sample_fields()))
+        assert [record.abbrev for record in read_fields(con)] == ["ip.src", "tcp.port"]
+
+    def test_reregistering_an_abbrev_updates_it(self, con: DuckDBPyConnection) -> None:
+        register_fields(con, sample_fields())
+        later = FieldRecord(
+            abbrev="ip.src",
+            column_name="ip_src",
+            ftype="FT_IPv4",
+            multi=False,
+            column_type="UINTEGER",
+            materialized_at=UTC_NOW,
+        )
+        register_fields(con, [later])
+        assert len(read_fields(con)) == 2
+        assert read_fields(con)[0].column_type == "UINTEGER"
+
+    def test_empty_registry_reads_empty(self, con: DuckDBPyConnection) -> None:
+        assert read_fields(con) == ()
+
+
+class TestCacheKeys:
+    def make_record(self) -> CacheKeyRecord:
+        return CacheKeyRecord(
+            key="deadbeef",
+            pcap_path="/caps/a.pcapng",
+            pcap_fingerprint="size=12:head=aa:tail=bb",
+            fields=("ip.src", "tcp.port"),
+            dfilter="tcp.port == 80",
+            tshark_version="4.6.7",
+            argv=("tshark", "-r", "/caps/a.pcapng", "-Y", "tcp.port == 80"),
+            created_at=UTC_NOW,
+        )
+
+    def test_round_trip(self, con: DuckDBPyConnection) -> None:
+        record = self.make_record()
+        record_cache_key(con, record)
+        assert read_cache_key(con.cursor(), "deadbeef") == record
+
+    def test_unfiltered_dfilter_is_none(self, con: DuckDBPyConnection) -> None:
+        record = self.make_record()
+        unfiltered = CacheKeyRecord(**{**record.__dict__, "dfilter": None})
+        record_cache_key(con, unfiltered)
+        assert read_cache_key(con, "deadbeef") == unfiltered
+
+    def test_unknown_key_is_none(self, con: DuckDBPyConnection) -> None:
+        assert read_cache_key(con, "nope") is None
+
+    def test_rerecording_a_key_updates_it(self, con: DuckDBPyConnection) -> None:
+        record = self.make_record()
+        record_cache_key(con, record)
+        record_cache_key(con, CacheKeyRecord(**{**record.__dict__, "tshark_version": "4.7.0"}))
+        stored = read_cache_key(con, "deadbeef")
+        assert stored is not None
+        assert stored.tshark_version == "4.7.0"
+
+
+class TestAddFieldColumn:
+    def test_adds_a_column_to_pkts(self, con: DuckDBPyConnection) -> None:
+        add_field_column(con, "tcp_port")
+        assert "tcp_port" in column_names(con, "main", "pkts")
+
+    def test_explicit_type_is_used(self, con: DuckDBPyConnection) -> None:
+        add_field_column(con, "ip_src", "UINTEGER")
+        rows = con.execute(
+            "SELECT data_type FROM duckdb_columns() "
+            "WHERE table_name = 'pkts' AND column_name = 'ip_src'"
+        ).fetchall()
+        assert rows[0][0] == "UINTEGER"
+
+    def test_list_type_is_accepted(self, con: DuckDBPyConnection) -> None:
+        add_field_column(con, "tcp_port", "UINTEGER[]")
+        assert "tcp_port" in column_names(con, "main", "pkts")
+
+    def test_duplicate_column_raises_workspace_error(self, con: DuckDBPyConnection) -> None:
+        add_field_column(con, "tcp_port")
+        with pytest.raises(WorkspaceError, match="tcp_port"):
+            add_field_column(con, "tcp_port")
+
+    def test_a_column_in_another_attached_database_is_not_a_duplicate(
+        self, con: DuckDBPyConnection
+    ) -> None:
+        # duckdb_columns() spans every attached database, so the existence check
+        # must be pinned to the current one — otherwise an unrelated workspace
+        # attached alongside would make every column look like a duplicate.
+        con.execute("ATTACH ':memory:' AS other")
+        con.execute("USE other")
+        create_schema(con)
+        add_field_column(con, "tcp_port")
+        con.execute("USE memory")
+        add_field_column(con, "tcp_port")  # must not raise
+        rows = con.execute(
+            "SELECT count(*) FROM duckdb_columns() WHERE database_name = 'memory' "
+            "AND schema_name = 'main' AND table_name = 'pkts' AND column_name = 'tcp_port'"
+        ).fetchone()
+        assert rows is not None
+        assert rows[0] == 1
+
+    def test_hostile_column_name_cannot_inject(self, con: DuckDBPyConnection) -> None:
+        add_field_column(con, 'evil"; DROP TABLE pkts; --')
+        assert ("main", "pkts") in table_names(con)
+
+    def test_hostile_sql_type_is_rejected(self, con: DuckDBPyConnection) -> None:
+        with pytest.raises(ValueError, match="SQL type"):
+            add_field_column(con, "x", "VARCHAR; DROP TABLE pkts")
+        assert ("main", "pkts") in table_names(con)

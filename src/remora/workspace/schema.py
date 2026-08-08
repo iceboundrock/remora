@@ -42,19 +42,31 @@ imports duckdb only for typing and stays importable without it.
 
 from __future__ import annotations
 
+import json
+import re
+from collections.abc import Iterable
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Final
 
-from remora.workspace.errors import SchemaVersionError
+from remora.workspace.errors import SchemaVersionError, WorkspaceError
 
 if TYPE_CHECKING:
     from duckdb import DuckDBPyConnection
 
 __all__ = [
     "SCHEMA_VERSION",
+    "CacheKeyRecord",
+    "FieldRecord",
+    "add_field_column",
     "check_compatible",
     "create_schema",
     "iter_ddl",
+    "read_cache_key",
+    "read_fields",
     "read_schema_version",
+    "record_cache_key",
+    "register_fields",
 ]
 
 SCHEMA_VERSION: Final[int] = 1
@@ -195,3 +207,232 @@ def check_compatible(con: DuckDBPyConnection) -> None:
             f"workspace schema version {found} is newer than this remora "
             f"supports ({SCHEMA_VERSION}); upgrade remora to open it"
         )
+
+
+_SQL_TYPE_RE: Final[re.Pattern[str]] = re.compile(
+    r"^[A-Za-z][A-Za-z0-9_ ]*(\(\s*\d+(\s*,\s*\d+)?\s*\))?(\[\])*$"
+)
+
+
+@dataclass(frozen=True)
+class FieldRecord:
+    """One materialized field in the ``meta.fields`` registry.
+
+    Attributes:
+        abbrev: Full tshark field name, e.g. ``"tcp.port"``.
+        column_name: Column in ``pkts``, from
+            :func:`remora.workspace.naming.column_name`.
+        ftype: tshark ftype name, e.g. ``"FT_UINT16"``.
+        multi: Whether the field can occur more than once per packet.
+        column_type: SQL type of the column. ``"VARCHAR"`` placeholder until
+            the FType -> column-type map lands (#26).
+        materialized_at: When the column was materialized (aware, UTC).
+    """
+
+    abbrev: str
+    column_name: str
+    ftype: str
+    multi: bool
+    column_type: str
+    materialized_at: datetime
+
+
+@dataclass(frozen=True)
+class CacheKeyRecord:
+    """A materialization cache key and the components it was computed from.
+
+    This module stores the record; #27 computes the key and #32 decides
+    hit/miss. Components are kept individually for diagnostics.
+
+    Attributes:
+        key: The cache-key digest.
+        pcap_path: Capture file the materialization read.
+        pcap_fingerprint: Cheap identity of that file's contents.
+        fields: tshark field abbrevs that were projected.
+        dfilter: Display filter pushed down, or ``None`` when unfiltered.
+        tshark_version: Version string of the tshark that produced the data.
+        argv: The exact tshark argv that was run.
+        created_at: When the entry was recorded (aware, UTC).
+    """
+
+    key: str
+    pcap_path: str
+    pcap_fingerprint: str
+    fields: tuple[str, ...]
+    dfilter: str | None
+    tshark_version: str
+    argv: tuple[str, ...]
+    created_at: datetime
+
+
+def _to_db_time(value: datetime) -> datetime:
+    """Convert an aware datetime to the naive UTC DuckDB stores."""
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _from_db_time(value: datetime) -> datetime:
+    """Re-tag a naive UTC timestamp read from DuckDB as aware UTC."""
+    return value.replace(tzinfo=timezone.utc)
+
+
+def _quote_identifier(name: str) -> str:
+    """Quote a SQL identifier, escaping embedded double quotes."""
+    escaped = name.replace('"', '""')
+    return f'"{escaped}"'
+
+
+def register_fields(con: DuckDBPyConnection, records: Iterable[FieldRecord]) -> None:
+    """Write field registry entries, replacing any entry with the same abbrev.
+
+    Args:
+        con: A read-write connection to the workspace.
+        records: Registry entries to upsert, keyed by ``abbrev``.
+    """
+    for record in records:
+        con.execute(
+            """
+            INSERT INTO meta.fields
+                (abbrev, column_name, ftype, multi, column_type, materialized_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT (abbrev) DO UPDATE SET
+                column_name = excluded.column_name,
+                ftype = excluded.ftype,
+                multi = excluded.multi,
+                column_type = excluded.column_type,
+                materialized_at = excluded.materialized_at
+            """,
+            [
+                record.abbrev,
+                record.column_name,
+                record.ftype,
+                record.multi,
+                record.column_type,
+                _to_db_time(record.materialized_at),
+            ],
+        )
+
+
+def read_fields(con: DuckDBPyConnection) -> tuple[FieldRecord, ...]:
+    """Read the whole field registry, ordered by abbrev.
+
+    Args:
+        con: An open connection to the workspace.
+
+    Returns:
+        Every registry entry, ascending by ``abbrev``.
+    """
+    rows = con.execute(
+        """
+        SELECT abbrev, column_name, ftype, multi, column_type, materialized_at
+        FROM meta.fields ORDER BY abbrev
+        """
+    ).fetchall()
+    return tuple(
+        FieldRecord(
+            abbrev=abbrev,
+            column_name=column,
+            ftype=ftype,
+            multi=bool(multi),
+            column_type=column_type,
+            materialized_at=_from_db_time(materialized_at),
+        )
+        for abbrev, column, ftype, multi, column_type, materialized_at in rows
+    )
+
+
+def record_cache_key(con: DuckDBPyConnection, record: CacheKeyRecord) -> None:
+    """Store a materialization cache key, replacing any entry with the same key.
+
+    Args:
+        con: A read-write connection to the workspace.
+        record: The cache key and the components it was computed from.
+    """
+    con.execute(
+        """
+        INSERT INTO meta.cache_keys
+            (key, pcap_path, pcap_fingerprint, fields, dfilter, tshark_version,
+             argv, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (key) DO UPDATE SET
+            pcap_path = excluded.pcap_path,
+            pcap_fingerprint = excluded.pcap_fingerprint,
+            fields = excluded.fields,
+            dfilter = excluded.dfilter,
+            tshark_version = excluded.tshark_version,
+            argv = excluded.argv,
+            created_at = excluded.created_at
+        """,
+        [
+            record.key,
+            record.pcap_path,
+            record.pcap_fingerprint,
+            json.dumps(list(record.fields)),
+            record.dfilter,
+            record.tshark_version,
+            json.dumps(list(record.argv)),
+            _to_db_time(record.created_at),
+        ],
+    )
+
+
+def read_cache_key(con: DuckDBPyConnection, key: str) -> CacheKeyRecord | None:
+    """Read one cache key by digest, or ``None`` when it is not stored.
+
+    Args:
+        con: An open connection to the workspace.
+        key: The cache-key digest to look up.
+
+    Returns:
+        The stored record, or ``None`` when the key is not present.
+    """
+    row = con.execute(
+        """
+        SELECT key, pcap_path, pcap_fingerprint, fields, dfilter, tshark_version,
+               argv, created_at
+        FROM meta.cache_keys WHERE key = ?
+        """,
+        [key],
+    ).fetchone()
+    if row is None:
+        return None
+    return CacheKeyRecord(
+        key=row[0],
+        pcap_path=row[1],
+        pcap_fingerprint=row[2],
+        fields=tuple(json.loads(row[3])),
+        dfilter=row[4],
+        tshark_version=row[5],
+        argv=tuple(json.loads(row[6])),
+        created_at=_from_db_time(row[7]),
+    )
+
+
+def add_field_column(con: DuckDBPyConnection, column: str, sql_type: str = "VARCHAR") -> None:
+    """Add a projected field column to ``pkts``.
+
+    Args:
+        con: Read-write connection.
+        column: Column name from :func:`remora.workspace.naming.column_name`.
+            Quoted, so a hostile name cannot inject SQL.
+        sql_type: SQL type for the column. ``"VARCHAR"`` is the placeholder
+            until #26 supplies the FType map. Types cannot be bound as
+            parameters, so the value is validated against a conservative
+            pattern (identifier, optional precision, optional ``[]`` suffixes).
+
+    Raises:
+        ValueError: If ``sql_type`` is not a plain SQL type.
+        WorkspaceError: If ``pkts`` already has that column.
+    """
+    if not _SQL_TYPE_RE.match(sql_type):
+        raise ValueError(f"not a plain SQL type: {sql_type!r}")
+    existing = con.execute(
+        "SELECT count(*) FROM duckdb_columns() "
+        "WHERE database_name = current_database() AND schema_name = 'main' "
+        "AND table_name = 'pkts' AND column_name = ?",
+        [column],
+    ).fetchone()
+    if existing is not None and existing[0] > 0:
+        raise WorkspaceError(f"pkts already has a column named {column!r}")
+    con.execute(f"ALTER TABLE main.pkts ADD COLUMN {_quote_identifier(column)} {sql_type}")
