@@ -59,7 +59,7 @@ _MISSING: Any = object()
 
 
 def ek_argv() -> list[str]:
-    """tshark argv fragment selecting ek output: ``["-T", "ek"]``."""
+    """The tshark argv fragment selecting ek output: ``["-T", "ek"]``."""
     return ["-T", "ek"]
 
 

@@ -59,7 +59,9 @@ class RawPacket(Protocol):
     - present, multi-value  -> ``("v1", "v2")``
     """
 
-    def get_raw(self, field_name: str) -> tuple[str, ...]: ...
+    def get_raw(self, field_name: str) -> tuple[str, ...]:
+        """Raw string occurrences of *field_name* in wire order (``()`` if absent)."""
+        ...
 
 
 class Packet(RawPacket, Protocol):
@@ -105,7 +107,7 @@ class FieldRef(FieldExprOps, Generic[T]):
 
     @property
     def ftype(self) -> str:
-        """tshark field type name, e.g. ``"FT_IPv4"``."""
+        """The tshark field type name, e.g. ``"FT_IPv4"``."""
         return self._ftype
 
     @property

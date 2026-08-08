@@ -77,14 +77,23 @@ select = [
     "B",   # flake8-bugbear
     "SIM", # flake8-simplify
     "RUF", # ruff-specific
+    "D",   # pydocstyle — public API docstrings (issue #24)
 ]
+# D105/D107: magic methods and __init__ are documented at class level.
+ignore = ["D105", "D107"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
 
 [tool.ruff.lint.per-file-ignores]
 # Generated protocol tables (issue #19) keep one field entry per line no
 # matter how long the abbrev is; the emitter never wraps (see the line-length
 # note in src/remora/codegen/emit.py).
-"src/remora/proto/*" = ["E501"]
-"packages/*/src/remora/proto/*" = ["E501"]
+"src/remora/proto/*" = ["E501", "D"]
+"packages/*/src/remora/proto/*" = ["E501", "D"]
+# Docstring enforcement targets the public API; tests and CI scripts are exempt.
+"tests/*" = ["D"]
+".github/scripts/*" = ["D"]
 
 [tool.ruff.format]
 # Generated protocol modules are byte-exact emitter output; reformatting them

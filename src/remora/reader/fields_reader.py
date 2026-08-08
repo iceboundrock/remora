@@ -1,4 +1,4 @@
-"""The ``-T fields`` projection reader: parse tshark's columnar field output.
+r"""The ``-T fields`` projection reader: parse tshark's columnar field output.
 
 When the query's field set is statically known, projection pushdown via
 ``-T fields`` makes tshark emit only the needed columns. Field values can
@@ -16,7 +16,7 @@ tshark's ``-E separator=``/``-E aggregator=`` options accept only ``/t``
 ``/xNN`` hex-escape form. A live probe with ``separator=/x1f`` did not
 error but silently set the separator to a literal backslash (``0x5c``),
 which would corrupt parsing. :func:`fields_argv` therefore embeds the raw
-control bytes directly in the argv strings (``"separator=\\x1f"`` with the
+control bytes directly in the argv strings (``"separator=\x1f"`` with the
 actual ``0x1f`` byte); this is safe because argv is passed to ``exec``
 without a shell. Verified by running the exact argv against a hand-crafted
 pcap and observing ``0x1f``/``0x1e`` bytes in stdout.

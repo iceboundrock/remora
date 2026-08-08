@@ -83,7 +83,7 @@ class FieldLike(Protocol):
 
     @property
     def ftype(self) -> str:
-        """tshark field type name, e.g. ``"FT_IPv4"``."""
+        """The tshark field type name, e.g. ``"FT_IPv4"``."""
         ...
 
     @property
@@ -300,11 +300,13 @@ def _subset_error(pattern: str, position: int, reason: str) -> ValueError:
 
 
 def _consume_escape(pattern: str, i: int, in_class: bool) -> int:
-    """Validate the escape starting at ``pattern[i] == '\\'``; return the index
-    after it. Escaped punctuation is literal in both dialects; alphanumeric
-    escapes are allowed only from the shared whitelist (``\\xHH`` with exactly
-    two hex digits; ``\\p{...}``, ``\\x{...}``, ``\\A``, ``\\h``, backreferences
-    etc. are dialect-specific and rejected)."""
+    r"""Validate the escape starting at ``pattern[i] == '\'``; return the index after it.
+
+    Escaped punctuation is literal in both dialects; alphanumeric escapes are
+    allowed only from the shared whitelist (``\xHH`` with exactly two hex
+    digits; ``\p{...}``, ``\x{...}``, ``\A``, ``\h``, backreferences etc. are
+    dialect-specific and rejected).
+    """
     if i + 1 >= len(pattern):
         return i + 1  # trailing backslash: re.compile reports it as a syntax error
     nxt = pattern[i + 1]
@@ -322,14 +324,14 @@ def _consume_escape(pattern: str, i: int, in_class: bool) -> int:
 
 
 def _validate_matches_subset(pattern: str) -> None:
-    """Reject regex constructs outside the Python-re/PCRE2 common subset.
+    r"""Reject regex constructs outside the Python-re/PCRE2 common subset.
 
     A ``matches`` pattern is compiled by Wireshark's PCRE2 when the expression
     is pushed down and by Python ``re`` when it lands in the residual
     predicate. The two dialects agree only on a common core; anything outside
     it (possessive quantifiers, atomic groups, branch reset, inline flags,
-    named groups, backreferences, conditionals, POSIX classes, ``\\x{...}``,
-    ``\\A``/``\\p{...}``/``\\h``, ...) would change meaning — or validity —
+    named groups, backreferences, conditionals, POSIX classes, ``\x{...}``,
+    ``\A``/``\p{...}``/``\h``, ...) would change meaning — or validity —
     depending on which backend evaluates the expression, so construction
     rejects it loudly. Structural syntax errors (unbalanced brackets and the
     like) are left for ``re.compile`` to report.
@@ -405,7 +407,7 @@ def _validate_matches_subset(pattern: str) -> None:
 
 @dataclass(frozen=True, eq=False, slots=True)
 class Matches(Expr):
-    """``field matches pattern`` — case-insensitive regex test (Wireshark default).
+    r"""``field matches pattern`` — case-insensitive regex test (Wireshark default).
 
     Patterns are restricted at construction to the Python-re/PCRE2 common
     subset, so a pattern has the same byte-level meaning whether tshark
@@ -415,11 +417,11 @@ class Matches(Expr):
     alternation ``|``, quantifiers ``*`` ``+`` ``?`` ``{m}`` ``{m,}``
     ``{m,n}`` (repeat counts up to 65535) with the lazy ``?`` modifier, plain
     and ``(?:...)`` groups, lookarounds, character classes with
-    ranges/negation, escaped punctuation, and the escapes ``\\d \\D \\w \\W
-    \\s \\S \\b \\B \\n \\r \\t \\f \\xHH``. Dialect-specific constructs —
+    ranges/negation, escaped punctuation, and the escapes ``\d \D \w \W
+    \s \S \b \B \n \r \t \f \xHH``. Dialect-specific constructs —
     possessive/atomic forms, inline flags, named groups, backreferences,
-    branch reset, conditionals, POSIX classes, ``\\x{...}``,
-    ``\\A``/``\\p{...}``/``\\h``/``\\v`` — raise :class:`ValueError`.
+    branch reset, conditionals, POSIX classes, ``\x{...}``,
+    ``\A``/``\p{...}``/``\h``/``\v`` — raise :class:`ValueError`.
     """
 
     field: FieldLike
@@ -437,6 +439,8 @@ class Matches(Expr):
 
 @dataclass(frozen=True, eq=False, slots=True)
 class And(Expr):
+    """Logical AND of two subexpressions (built by the ``&`` operator)."""
+
     left: Expr
     right: Expr
 
@@ -447,6 +451,8 @@ class And(Expr):
 
 @dataclass(frozen=True, eq=False, slots=True)
 class Or(Expr):
+    """Logical OR of two subexpressions (built by the ``|`` operator)."""
+
     left: Expr
     right: Expr
 
@@ -457,6 +463,8 @@ class Or(Expr):
 
 @dataclass(frozen=True, eq=False, slots=True)
 class Not(Expr):
+    """Logical negation of a subexpression (built by the ``~`` operator)."""
+
     operand: Expr
 
     def __post_init__(self) -> None:
@@ -528,8 +536,10 @@ class FieldExprOps:
         return Contains(self._self_field(), needle)
 
     def matches(self, pattern: str) -> Matches:
-        """Case-insensitive regex test: ``HOST.matches(r"^ex.*com$")`` (Python-re/PCRE2
-        common subset only — see :class:`Matches`)."""
+        """Case-insensitive regex test: ``HOST.matches(r"^ex.*com$")``.
+
+        Python-re/PCRE2 common subset only — see :class:`Matches`.
+        """
         return Matches(self._self_field(), pattern)
 
     def __contains__(self, item: object) -> NoReturn:
