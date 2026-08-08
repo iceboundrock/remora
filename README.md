@@ -53,18 +53,27 @@ Core protocols are re-exported by name from `remora.proto`, so that import is fu
 
 Domain-specific protocol sets ship as separate distributions, selected with an extra:
 
-| Extra | Adds to `remora.proto` |
-|---|---|
-| `wireless` | `WLAN`, `RADIOTAP` |
-| `industrial` | `MODBUS`, `MBTCP`, `DNP3` |
-| `telecom` | `GTP`, `DIAMETER` |
-| `all` | everything above |
+| Extra | Adds to `remora.proto` | Distribution |
+|---|---|---|
+| `wireless` | `WLAN`, `RADIOTAP` | `remora-wireless` |
+| `industrial` | `MODBUS`, `MBTCP`, `DNP3` | `remora-industrial` |
+| `telecom` | `GTP`, `DIAMETER` | `remora-telecom` |
+| `all` | everything above | all three |
 
-The extras *distributions* are unpublished too, so `pip install "remora[wireless]"` cannot resolve — the extra points at a `remora-wireless` distribution that no index carries. Until they ship, install one from a checkout, alongside core:
+The extras *distributions* are unpublished too, so `pip install "remora[wireless]"` cannot resolve — the extra points at a `remora-wireless` distribution that no index carries. Until they ship, install them from a checkout, alongside core. Each extra lives at `packages/<distribution>`, so name the ones you want:
 
 ```sh
 git clone https://github.com/iceboundrock/remora
 pip install ./remora ./remora/packages/remora-wireless
+```
+
+Listing all three is the equivalent of `remora[all]`:
+
+```sh
+pip install ./remora \
+  ./remora/packages/remora-wireless \
+  ./remora/packages/remora-industrial \
+  ./remora/packages/remora-telecom
 ```
 
 Working inside the repository, there is nothing to do: `uv sync` already installs all three extras as workspace members.

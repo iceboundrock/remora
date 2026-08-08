@@ -126,6 +126,6 @@ for pkt in Capture("broker.pcap").filter(MQTT.topic == "sensors/temp"):
 
 `MQTT.topic == "sensors/temp"` compiles to the display filter `mqtt.topic == "sensors/temp"` and is pushed down to tshark exactly like a shipped protocol; the any-occurrence semantics of multi-value fields apply unchanged.
 
-Locally generated modules are yours to keep — they are not committed to this repository, and `python -m remora.codegen check` ignores them (it only looks at the destinations `codegen.toml` names). If a protocol deserves to ship, add it to `[generate] protocols` (or an `[extras.*]` set), regenerate under the pin, and commit the artifacts.
+Locally generated modules are yours to keep — they are not committed to this repository, and `uv run python -m remora.codegen check` ignores them (it only looks at the destinations `codegen.toml` names). If a protocol deserves to ship, add it to `[generate] protocols` (or an `[extras.*]` set), regenerate under the pin, and commit the artifacts.
 
 For the user-facing version of this section — output layout, `mypy_path` for out-of-tree output — see the [README's Local generation section](../README.md#local-generation-psdsl-gen).
