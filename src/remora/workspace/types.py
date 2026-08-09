@@ -41,10 +41,25 @@ Arrow ``list<T>``) — see :func:`column_sql_type`.
 The Arrow column is documentation for issue #31, which may build record
 batches; this module deliberately imports neither duckdb nor pyarrow, so it
 names SQL types as plain strings and encodes to plain Python values. One
-warning for #31: DuckDB exports ``UHUGEINT`` as ``decimal128(38, 0)``, which is
-narrower than 128 bits — on duckdb 1.5.5 a full-width IPv6 address comes back
-through Arrow as ``Decimal('-1')``. Bind IPv6 columns through DuckDB itself
-until that is confirmed fixed.
+warning for #31: DuckDB exports ``UHUGEINT`` through Arrow as
+``decimal128(38, 0)``, and the export reads the value as **signed**. On duckdb
+1.5.5 + pyarrow 25, every ``FT_IPv6`` address with the high bit set — anything
+in ``8000::/1`` — comes back reinterpreted as its two's-complement negative:
+``8000::`` as ``-170141183460469231731687303715884105728`` and
+``ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff`` as ``-1``.
+
+The boundary is 2^127, not decimal128's 38-digit range:
+``7fff:ffff:ffff:ffff:ffff:ffff:ffff:ffff`` is 1.70e38, already past 10^38, and
+round-trips exactly, while ``8000::`` — one larger — does not. So this is not a
+top-of-the-range corner case. It is all of ``fe80::/10`` link-local and all of
+``ff00::/8`` multicast, which appear in essentially every real capture: an
+``ff02::1`` row silently arrives as a negative integer.
+
+The hazard is the Arrow export path only. Stored and read back through DuckDB
+itself the same values are exact (``tests/test_workspace_types.py`` pins the
+full-width address), so ``UHUGEINT`` is the right column type; #31 must simply
+not route ``FT_IPv6`` columns through an Arrow record batch until this is
+confirmed fixed upstream.
 
 Frozen decisions
 ----------------
@@ -182,7 +197,7 @@ _INT_WIDTHS: Final[Mapping[str, tuple[str, ...]]] = {
     "BIGINT": ("FT_INT40", "FT_INT48", "FT_INT56", "FT_INT64"),
 }
 
-COLUMN_TYPES: Mapping[str, ColumnType] = {
+COLUMN_TYPES: Final[Mapping[str, ColumnType]] = {
     "FT_IPv4": ColumnType("UINTEGER", _to_address_int, _to_ipv4),
     "FT_IPv6": ColumnType("UHUGEINT", _to_address_int, _to_ipv6),
     "FT_ETHER": _BLOB,

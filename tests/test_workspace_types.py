@@ -131,7 +131,17 @@ class TestThroughStorage:
 
     @pytest.mark.parametrize(
         "text",
-        ["0.0.0.0", "255.255.255.255", "10.0.0.1", "127.0.0.1"],
+        # Both ends of the range and the values either side of them, plus the
+        # 2^31 boundary: the IPv4 analogue of the sign hazard that makes
+        # DuckDB's Arrow export of UHUGEINT wrong above 2^127.
+        [
+            "0.0.0.0",
+            "0.0.0.1",
+            "127.255.255.255",
+            "128.0.0.0",
+            "255.255.255.254",
+            "255.255.255.255",
+        ],
     )
     def test_ipv4_edge_values_survive_storage(self, con: DuckDBPyConnection, text: str) -> None:
         address = IPv4Address(text)
@@ -144,7 +154,17 @@ class TestThroughStorage:
 
     @pytest.mark.parametrize(
         "text",
-        ["::", "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", "2001:db8::1", "::1"],
+        # Both ends, and the pair straddling 2^127. DuckDB's Arrow export reads
+        # UHUGEINT as signed and mangles everything in 8000::/1 (see the module
+        # docstring of remora.workspace.types); the native path pinned here is
+        # exact, which is what makes UHUGEINT the right column type anyway.
+        [
+            "::",
+            "::1",
+            "7fff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+            "8000::",
+            "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+        ],
     )
     def test_ipv6_edge_values_survive_storage(self, con: DuckDBPyConnection, text: str) -> None:
         address = IPv6Address(text)
@@ -154,6 +174,39 @@ class TestThroughStorage:
         row = con.execute("SELECT v FROM t").fetchone()
         assert row is not None
         assert entry.decode(row[0]) == address
+
+    @pytest.mark.parametrize(
+        "delta",
+        [
+            timedelta(seconds=-1, microseconds=-500000),
+            timedelta(seconds=-3600),
+            timedelta(microseconds=-1),
+        ],
+    )
+    def test_negative_relative_times_survive_an_interval_column(
+        self, con: DuckDBPyConnection, delta: timedelta
+    ) -> None:
+        # tshark relative times go backwards too (values.py parses a leading
+        # "-"), and INTERVAL is only the right choice if it carries the sign.
+        entry = get_column_type("FT_RELATIVE_TIME")
+        scratch_column(con, "INTERVAL")
+        con.execute("INSERT INTO t VALUES (?)", [entry.encode(delta)])
+        row = con.execute("SELECT v FROM t").fetchone()
+        assert row is not None
+        assert entry.decode(row[0]) == delta
+
+    def test_an_offset_timestamp_lands_as_utc_in_the_column(self, con: DuckDBPyConnection) -> None:
+        # The codec pair converts the zone away, but only writing it proves the
+        # naive UTC instant is what the TIMESTAMP column actually holds — a
+        # TIMESTAMPTZ column would render it back through the session zone.
+        entry = get_column_type("FT_ABSOLUTE_TIME")
+        aware = datetime(2026, 8, 9, 1, 2, 3, 123456, tzinfo=timezone(timedelta(hours=8)))
+        scratch_column(con, "TIMESTAMP")
+        con.execute("INSERT INTO t VALUES (?)", [entry.encode(aware)])
+        row = con.execute("SELECT v FROM t").fetchone()
+        assert row is not None
+        assert row[0] == datetime(2026, 8, 8, 17, 2, 3, 123456)
+        assert entry.decode(row[0]) == aware
 
     def test_subnet_membership_is_an_integer_range(self, con: DuckDBPyConnection) -> None:
         # The reason IPs are integers at all (epic #43): subnet matching must
