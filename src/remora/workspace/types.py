@@ -11,10 +11,10 @@ the next, so changing a column type is a storage-format change, not a tweak.
 Type mapping
 ------------
 ========================  ===========  =========================  ==================
-ftype                     DuckDB       Arrow (for #31)            Stored value
+ftype                     DuckDB       Arrow (for #31)            Encoded (bound)
 ========================  ===========  =========================  ==================
 FT_IPv4                   UINTEGER     uint32                     int(address)
-FT_IPv6                   UHUGEINT     decimal128(38, 0)          int(address)
+FT_IPv6                   UHUGEINT     decimal128(38, 0)          str(int(address))
 FT_ETHER, FT_BYTES        BLOB         binary                     bytes
 FT_BOOLEAN                BOOLEAN      bool                       bool
 FT_ABSOLUTE_TIME          TIMESTAMP    timestamp[us]              naive UTC datetime
@@ -55,11 +55,15 @@ top-of-the-range corner case. It is all of ``fe80::/10`` link-local and all of
 ``ff00::/8`` multicast, which appear in essentially every real capture: an
 ``ff02::1`` row silently arrives as a negative integer.
 
-The hazard is the Arrow export path only. Stored and read back through DuckDB
-itself the same values are exact (``tests/test_workspace_types.py`` pins the
-full-width address), so ``UHUGEINT`` is the right column type; #31 must simply
-not route ``FT_IPv6`` columns through an Arrow record batch until this is
-confirmed fixed upstream.
+That hazard is the Arrow export path only, so #31 must simply not route
+``FT_IPv6`` columns through an Arrow record batch until it is confirmed fixed
+upstream.
+
+The DuckDB-native path is exact — which is what keeps ``UHUGEINT`` the right
+column type — but not for free: ``FT_IPv6`` is the one ftype whose encoder
+emits a **string** rather than the integer its column type suggests, for the
+reason spelled out on :func:`_ipv6_to_decimal_text`. Both positions are pinned
+through real columns in ``tests/test_workspace_types.py``.
 
 Frozen decisions
 ----------------
@@ -68,7 +72,9 @@ as their integer form so subnet matching is a ``BETWEEN`` over an ordered
 column, which DuckDB's zone maps can skip row groups on (epic #43); a text
 column would force a per-row parse. Narrow ftypes keep narrow column types for
 the same reason — a blanket ``BIGINT`` would cost 8x the bytes on ``FT_UINT8``
-and widen every zone map's range.
+and widen every zone map's range. The *column* is what that decision is about;
+``FT_IPv6`` alone binds the integer as decimal text (see
+:func:`_ipv6_to_decimal_text`), which changes nothing about the stored type.
 
 **FT_FLOAT is DOUBLE, not FLOAT.** :mod:`remora.values` parses ``FT_FLOAT``
 with :func:`float`, i.e. to a Python double. Storing it as ``FLOAT`` would
@@ -78,7 +84,13 @@ round every value on the way in and make the round trip lossy.
 :class:`datetime.timedelta` natively, and a ``timedelta`` never carries a month
 component — the part of an interval whose length depends on the date it is
 added to — so the ambiguity that usually argues against ``INTERVAL`` cannot
-arise here.
+arise here. One note for #32's aggregates: on duckdb 1.5.5 ``avg``, ``min``,
+``max`` and ``median`` all take an ``INTERVAL`` directly, but ``sum`` and
+``quantile_cont`` do not (``Binder Error: No function matches the given name
+and argument types 'sum(INTERVAL)'``), so a total or a p95 of a delta has to go
+through ``epoch(v)`` — seconds as a ``DOUBLE`` — first. That is a query-side
+detail, not a reason to store seconds: ``epoch()`` is available on every read
+and would be a lossy, unit-erased column.
 
 **FT_ETHER is BLOB.** :mod:`remora.values` yields exactly 6 raw bytes, not
 text; ``BLOB`` stores them as they are, so equality and ordering stay byte-exact
@@ -100,7 +112,7 @@ type degrades to text instead of failing.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from ipaddress import IPv4Address, IPv6Address
@@ -124,6 +136,11 @@ __all__ = [
 @dataclass(frozen=True)
 class ColumnType:
     """DuckDB column type and codec for one tshark ftype.
+
+    Neither codec is NULL-safe: both assume a present value. Absence is
+    :class:`ColumnSpec`'s job — :meth:`ColumnSpec.encode_raw` and
+    :meth:`ColumnSpec.decode` guard it — so a caller reaching for this pair
+    directly has to guard ``None`` itself.
 
     Attributes:
         sql_type: DuckDB type of the scalar column, e.g. ``"UINTEGER"``.
@@ -170,8 +187,33 @@ def from_db_timestamp(value: datetime) -> datetime:
 
 
 def _to_address_int(value: Any) -> int:
-    """Encode an IPv4Address/IPv6Address as the integer the column holds."""
+    """Encode an IPv4Address as the integer its ``UINTEGER`` column holds."""
     return int(value)
+
+
+def _ipv6_to_decimal_text(value: Any) -> str:
+    """Encode an IPv6Address as decimal text for its ``UHUGEINT`` column.
+
+    Text, not :class:`int`, and deliberately so — do not "simplify" this back.
+    DuckDB unifies a Python list's **inferred** element types before casting
+    them to the column type, and an element below 2^63 infers as signed 64-bit;
+    unified with an element above 2^127 the common type comes out as signed
+    ``HUGEINT``, which cannot hold it, and binding the list fails with
+    ``Failed to cast value: Type UINT128 ... out of range ... INT64``. An
+    explicit ``?::UHUGEINT[]`` cast does not rescue it, because the unification
+    happens before the cast.
+
+    That pair is ordinary traffic, not a corner case: a DAD Neighbour
+    Solicitation has source ``::`` and a solicited-node multicast destination in
+    ``ff02::/16``, so one ``ipv6.addr`` list (curated multi-value in
+    ``codegen.toml``) holds both. ``VARCHAR`` casts to ``UHUGEINT`` in scalar
+    and list position alike, so the column type stays ``UHUGEINT``, read-back is
+    still an ``int``, and ``list_contains(v, <int>)`` still works — only the
+    bound representation differs. No other ftype needs this: no other column
+    type can reach 2^127, and mixed-magnitude ``UBIGINT[]``/``UINTEGER[]`` lists
+    bind fine.
+    """
+    return str(int(value))
 
 
 def _to_ipv4(value: Any) -> IPv4Address:
@@ -202,7 +244,7 @@ _INT_WIDTHS: Final[Mapping[str, tuple[str, ...]]] = {
 
 COLUMN_TYPES: Final[Mapping[str, ColumnType]] = {
     "FT_IPv4": ColumnType("UINTEGER", _to_address_int, _to_ipv4),
-    "FT_IPv6": ColumnType("UHUGEINT", _to_address_int, _to_ipv6),
+    "FT_IPv6": ColumnType("UHUGEINT", _ipv6_to_decimal_text, _to_ipv6),
     "FT_ETHER": _BLOB,
     "FT_BYTES": _BLOB,
     "FT_BOOLEAN": ColumnType("BOOLEAN", _identity, _identity),
@@ -273,11 +315,14 @@ class ColumnSpec:
     multi: bool
     sql_type: str
 
-    def encode_raw(self, raw: Sequence[str]) -> Any:
+    def encode_raw(self, raw: tuple[str, ...]) -> Any:
         """Encode a field's raw tshark occurrences into one column value.
 
-        ``raw`` is what :meth:`remora.fields.RawPacket.get_raw` returns, so
-        ``()`` means the field is absent.
+        ``raw`` is exactly what :meth:`remora.fields.RawPacket.get_raw` returns,
+        so ``()`` means the field is absent. The annotation is the tuple rather
+        than ``Sequence[str]`` on purpose: ``str`` satisfies ``Sequence[str]``,
+        so a bare ``"80"`` would typecheck and silently encode one value per
+        character.
 
         Absence is ``None`` for a scalar column and ``[]`` for a multi column —
         never ``NULL`` in a list column, because ``list_contains(NULL, x)`` is

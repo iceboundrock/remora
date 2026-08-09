@@ -287,6 +287,16 @@ class TestColumnSpec:
         assert spec.decode(None) is None
         assert spec.decode(int(IPv4Address("10.0.0.1"))) == IPv4Address("10.0.0.1")
 
+    def test_ipv6_encodes_to_a_decimal_string(self) -> None:
+        # Deliberately asserting the representation, not just the round trip:
+        # the column is UHUGEINT but the bound value is text, because DuckDB
+        # unifies a list's inferred element types before casting (see
+        # test_an_ipv6_multi_column_survives_mixed_magnitudes). An int here
+        # typechecks and reads fine in scalar position, so only pinning the
+        # string stops the encoder being "simplified" back into the bug.
+        spec = column_spec("ipv6.src", "FT_IPv6")
+        assert spec.encode_raw(("ff02::1:2",)) == str(int(IPv6Address("ff02::1:2")))
+
     def test_malformed_raw_text_raises_from_values(self) -> None:
         spec = column_spec("ip.src", "FT_IPv4")
         with pytest.raises(ValueError):
@@ -304,6 +314,44 @@ class TestMultiColumnThroughStorage:
         rows = con.execute("SELECT v, list_contains(v, 80) FROM t").fetchall()
         assert [spec.decode(stored) for stored, _ in rows] == [(80, 443), ()]
         assert [hit for _, hit in rows] == [True, False]
+
+    def test_an_ipv6_multi_column_survives_mixed_magnitudes(self, con: DuckDBPyConnection) -> None:
+        # A DAD Neighbour Solicitation carries source :: and a solicited-node
+        # multicast destination, so ipv6.addr (curated multi in codegen.toml)
+        # holds one address below 2^63 and one above 2^127 in the same list.
+        # DuckDB unifies a Python list's *inferred* element types before casting
+        # to the column type, so encoding these as Python ints unifies them to
+        # signed HUGEINT and the insert fails outright — hence the decimal-string
+        # encoding, which this pins through a real UHUGEINT[] column.
+        spec = column_spec("ipv6.addr", "FT_IPv6", multi=True)
+        scratch_column(con, spec.sql_type)
+        con.execute("INSERT INTO t VALUES (?)", [spec.encode_raw(("::", "ff02::1:2"))])
+        row = con.execute("SELECT v FROM t").fetchone()
+        assert row is not None
+        assert spec.decode(row[0]) == (IPv6Address("::"), IPv6Address("ff02::1:2"))
+        # The string is a binding detail, not a query one: #29 still probes the
+        # column with a plain Python int.
+        hit = con.execute(
+            "SELECT list_contains(v, ?) FROM t", [int(IPv6Address("ff02::1:2"))]
+        ).fetchone()
+        assert hit is not None
+        assert hit[0] is True
+
+    def test_an_ipv6_scalar_column_round_trips_through_a_column_spec(
+        self, con: DuckDBPyConnection
+    ) -> None:
+        # The string encoding has to hold in scalar position too, where the
+        # bound value meets UHUGEINT directly rather than through a LIST.
+        spec = column_spec("ipv6.src", "FT_IPv6")
+        scratch_column(con, spec.sql_type)
+        for raw in (("ff02::1:2",), ("::",), ()):
+            con.execute("INSERT INTO t VALUES (?)", [spec.encode_raw(raw)])
+        rows = con.execute("SELECT v FROM t").fetchall()
+        assert [spec.decode(stored) for (stored,) in rows] == [
+            IPv6Address("ff02::1:2"),
+            IPv6Address("::"),
+            None,
+        ]
 
     def test_a_null_list_would_not_have_answered_false(self, con: DuckDBPyConnection) -> None:
         # The counterfactual the frozen absence rule rests on: had encode_raw
@@ -331,4 +379,7 @@ class TestEveryTypeIsAcceptedByTheSchemaLayer:
             "SELECT data_type FROM duckdb_columns() "
             "WHERE table_name = 'pkts' AND column_name = 'probe'"
         ).fetchall()
-        assert len(rows) == 1
+        # Asserting the reported type, not just that a column appeared: a
+        # column_sql_type that answered "VARCHAR" for everything would satisfy
+        # the schema layer perfectly and still be wrong.
+        assert rows == [(column_sql_type(ftype, multi),)]
