@@ -347,6 +347,7 @@ dependencies = [
 
 [package.optional-dependencies]
 all = [
+    { name = "duckdb" },
     { name = "remora-industrial" },
     { name = "remora-telecom" },
     { name = "remora-wireless" },
@@ -379,6 +380,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "duckdb", marker = "extra == 'all'", specifier = ">=1.1" },
     { name = "duckdb", marker = "extra == 'workspace'", specifier = ">=1.1" },
     { name = "remora-industrial", marker = "extra == 'all'", editable = "packages/remora-industrial" },
     { name = "remora-industrial", marker = "extra == 'industrial'", editable = "packages/remora-industrial" },
@@ -388,7 +390,7 @@ requires-dist = [
     { name = "remora-wireless", marker = "extra == 'wireless'", editable = "packages/remora-wireless" },
     { name = "tomli", marker = "python_full_version < '3.11'", specifier = ">=2.0" },
 ]
-provides-extras = ["wireless", "industrial", "telecom", "all", "workspace"]
+provides-extras = ["wireless", "industrial", "telecom", "workspace", "all"]
 
 [package.metadata.requires-dev]
 dev = [

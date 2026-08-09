@@ -58,16 +58,18 @@ Domain-specific protocol sets ship as separate distributions, selected with an e
 | `wireless` | `WLAN`, `RADIOTAP` | `remora-wireless` |
 | `industrial` | `MODBUS`, `MBTCP`, `DNP3` | `remora-industrial` |
 | `telecom` | `GTP`, `DIAMETER` | `remora-telecom` |
-| `all` | everything above | all three |
+| `all` | everything above, plus `workspace` | all three, plus `duckdb` |
 
-The extras *distributions* are unpublished too, so `pip install "remora[wireless]"` cannot resolve — the extra points at a `remora-wireless` distribution that no index carries. Until they ship, install them from a checkout, alongside core. Each extra lives at `packages/<distribution>`, so name the ones you want:
+One extra is not a protocol set: `workspace` pulls in DuckDB for the materialized workspace (M4 — the storage layer is landing ahead of the `Workspace`/`Query` API, so there is nothing to import yet). `all` means everything, so it includes that one too.
+
+The protocol extras' *distributions* are unpublished, so `pip install "remora[wireless]"` cannot resolve — the extra points at a `remora-wireless` distribution that no index carries. Until they ship, install them from a checkout, alongside core. Each extra lives at `packages/<distribution>`, so name the ones you want:
 
 ```sh
 git clone https://github.com/iceboundrock/remora
 pip install ./remora ./remora/packages/remora-wireless
 ```
 
-Listing all three is the equivalent of `remora[all]`:
+Listing all three covers the protocol half of `remora[all]`; add `duckdb` for the other half:
 
 ```sh
 pip install ./remora \

@@ -34,13 +34,16 @@ Issues = "https://github.com/iceboundrock/remora/issues"
 wireless = ["remora-wireless==0.1.0"]
 industrial = ["remora-industrial==0.1.0"]
 telecom = ["remora-telecom==0.1.0"]
+# DuckDB workspace (M4). Core stays dependency-free for tshark-only users.
+workspace = ["duckdb>=1.1"]
+# "all" means everything: every protocol extra plus the workspace. Keep it the
+# exact union of the extras above — tests/test_packaging.py enforces that.
 all = [
     "remora-wireless==0.1.0",
     "remora-industrial==0.1.0",
     "remora-telecom==0.1.0",
+    "duckdb>=1.1",
 ]
-# DuckDB workspace (M4). Core stays dependency-free for tshark-only users.
-workspace = ["duckdb>=1.1"]
 
 [project.scripts]
 psdsl = "remora.codegen.cli:main"
