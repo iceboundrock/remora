@@ -34,7 +34,9 @@ from remora.workspace.schema import (
 )
 from remora.workspace.types import (
     COLUMN_TYPES,
+    ColumnSpec,
     ColumnType,
+    column_spec,
     column_sql_type,
     from_db_timestamp,
     get_column_type,
@@ -47,6 +49,7 @@ __all__ = [
     "SKELETON_COLUMNS",
     "CacheKeyRecord",
     "ColumnNameCollisionError",
+    "ColumnSpec",
     "ColumnType",
     "FieldRecord",
     "SchemaVersionError",
@@ -54,6 +57,7 @@ __all__ = [
     "add_field_column",
     "check_compatible",
     "column_name",
+    "column_spec",
     "column_sql_type",
     "create_schema",
     "find_collisions",

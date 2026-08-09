@@ -10,8 +10,12 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from remora.values import FTYPE_TABLE
+from remora.workspace.naming import column_name
+from remora.workspace.schema import add_field_column, create_schema
 from remora.workspace.types import (
     COLUMN_TYPES,
+    ColumnSpec,
+    column_spec,
     column_sql_type,
     from_db_timestamp,
     get_column_type,
@@ -241,3 +245,90 @@ class TestTimestampPolicy:
     def test_round_trip_is_identity_for_aware_utc(self) -> None:
         value = datetime(2026, 8, 9, 1, 2, 3, 123456, tzinfo=timezone.utc)
         assert from_db_timestamp(to_db_timestamp(value)) == value
+
+
+class TestColumnSpec:
+    def test_derives_the_column_name_from_the_policy(self) -> None:
+        spec: ColumnSpec = column_spec("tcp.port", "FT_UINT16", multi=True)
+        assert spec.column_name == column_name("tcp.port")
+        assert spec.sql_type == "USMALLINT[]"
+        assert spec.multi is True
+
+    def test_scalar_absent_is_none(self) -> None:
+        spec = column_spec("ip.src", "FT_IPv4")
+        assert spec.encode_raw(()) is None
+
+    def test_scalar_single_occurrence(self) -> None:
+        spec = column_spec("ip.src", "FT_IPv4")
+        assert spec.encode_raw(("10.0.0.1",)) == int(IPv4Address("10.0.0.1"))
+
+    def test_scalar_with_two_occurrences_raises(self) -> None:
+        spec = column_spec("ip.src", "FT_IPv4")
+        with pytest.raises(ValueError, match=r"ip\.src"):
+            spec.encode_raw(("10.0.0.1", "10.0.0.2"))
+
+    def test_multi_absent_is_an_empty_list(self) -> None:
+        # Not NULL: no occurrences is exactly what [] means, and
+        # list_contains([], x) is false — matching the predicate backend's rule
+        # that an absent field never satisfies a positive test.
+        spec = column_spec("tcp.port", "FT_UINT16", multi=True)
+        assert spec.encode_raw(()) == []
+
+    def test_multi_encodes_every_occurrence(self) -> None:
+        spec = column_spec("tcp.port", "FT_UINT16", multi=True)
+        assert spec.encode_raw(("80", "443")) == [80, 443]
+
+    def test_multi_decodes_to_a_tuple(self) -> None:
+        spec = column_spec("tcp.port", "FT_UINT16", multi=True)
+        assert spec.decode([80, 443]) == (80, 443)
+
+    def test_scalar_decode_passes_none_through(self) -> None:
+        spec = column_spec("ip.src", "FT_IPv4")
+        assert spec.decode(None) is None
+        assert spec.decode(int(IPv4Address("10.0.0.1"))) == IPv4Address("10.0.0.1")
+
+    def test_malformed_raw_text_raises_from_values(self) -> None:
+        spec = column_spec("ip.src", "FT_IPv4")
+        with pytest.raises(ValueError):
+            spec.encode_raw(("not-an-ip",))
+
+
+class TestMultiColumnThroughStorage:
+    def test_a_multi_column_round_trips_and_list_contains_works(
+        self, con: DuckDBPyConnection
+    ) -> None:
+        spec = column_spec("tcp.port", "FT_UINT16", multi=True)
+        scratch_column(con, spec.sql_type)
+        con.execute("INSERT INTO t VALUES (?)", [spec.encode_raw(("80", "443"))])
+        con.execute("INSERT INTO t VALUES (?)", [spec.encode_raw(())])
+        rows = con.execute("SELECT v, list_contains(v, 80) FROM t").fetchall()
+        assert [spec.decode(stored) for stored, _ in rows] == [(80, 443), ()]
+        assert [hit for _, hit in rows] == [True, False]
+
+    def test_a_null_list_would_not_have_answered_false(self, con: DuckDBPyConnection) -> None:
+        # The counterfactual the frozen absence rule rests on: had encode_raw
+        # returned None for an absent multi field, the predicate would go NULL
+        # instead of false and the row would drop out of a NOT filter too.
+        spec = column_spec("tcp.port", "FT_UINT16", multi=True)
+        scratch_column(con, spec.sql_type)
+        con.execute("INSERT INTO t VALUES (NULL)")
+        row = con.execute("SELECT list_contains(v, 80) FROM t").fetchone()
+        assert row is not None
+        assert row[0] is None
+
+
+class TestEveryTypeIsAcceptedByTheSchemaLayer:
+    @pytest.mark.parametrize("ftype", sorted(FTYPE_TABLE))
+    @pytest.mark.parametrize("multi", [False, True])
+    def test_add_field_column_accepts_it(
+        self, con: DuckDBPyConnection, ftype: str, multi: bool
+    ) -> None:
+        # A type this module emits that #25's validator refuses is a build-time
+        # bug; this is the test that keeps the two modules agreeing.
+        create_schema(con)
+        add_field_column(con, "probe", column_sql_type(ftype, multi))
+        rows = con.execute(
+            "SELECT data_type FROM duckdb_columns() "
+            "WHERE table_name = 'pkts' AND column_name = 'probe'"
+        ).fetchall()
+        assert len(rows) == 1

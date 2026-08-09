@@ -100,17 +100,20 @@ type degrades to text instead of failing.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from ipaddress import IPv4Address, IPv6Address
 from typing import Any, Final
 
-from remora.values import FTYPE_TABLE
+from remora.values import FTYPE_TABLE, convert
+from remora.workspace.naming import column_name
 
 __all__ = [
     "COLUMN_TYPES",
+    "ColumnSpec",
     "ColumnType",
+    "column_spec",
     "column_sql_type",
     "from_db_timestamp",
     "get_column_type",
@@ -244,3 +247,112 @@ def column_sql_type(ftype: str, multi: bool = False) -> str:
     """
     sql_type = get_column_type(ftype).sql_type
     return f"{sql_type}[]" if multi else sql_type
+
+
+@dataclass(frozen=True)
+class ColumnSpec:
+    """One projected field's column: name, type, and codec.
+
+    Built by :func:`column_spec`, which is the single call the materialize
+    pipeline (#31) needs per field. Collision checking is not done here —
+    :func:`remora.workspace.naming.find_collisions` covers a whole field set at
+    once, which is where that check belongs.
+
+    Attributes:
+        abbrev: Full tshark field abbrev, e.g. ``"tcp.port"``.
+        column_name: Column in ``pkts``, from
+            :func:`remora.workspace.naming.column_name`.
+        ftype: tshark ftype name, e.g. ``"FT_UINT16"``.
+        multi: Whether the field can occur more than once per packet.
+        sql_type: SQL type of the column, from :func:`column_sql_type`.
+    """
+
+    abbrev: str
+    column_name: str
+    ftype: str
+    multi: bool
+    sql_type: str
+
+    def encode_raw(self, raw: Sequence[str]) -> Any:
+        """Encode a field's raw tshark occurrences into one column value.
+
+        ``raw`` is what :meth:`remora.fields.RawPacket.get_raw` returns, so
+        ``()`` means the field is absent.
+
+        Absence is ``None`` for a scalar column and ``[]`` for a multi column —
+        never ``NULL`` in a list column, because ``list_contains(NULL, x)`` is
+        ``NULL`` while ``list_contains([], x)`` is ``false``, and the latter is
+        what the predicate backend means by "an absent field never matches".
+
+        Args:
+            raw: The field's occurrences as tshark emitted them, in order.
+
+        Returns:
+            The value to bind into the column.
+
+        Raises:
+            ValueError: If a scalar field has more than one occurrence (declare
+                it multi-value instead — keeping the first would silently drop
+                data), or if the raw text is malformed for the ftype.
+        """
+        encode = get_column_type(self.ftype).encode
+        if self.multi:
+            return [encode(convert(self.ftype, text)) for text in raw]
+        if not raw:
+            return None
+        if len(raw) > 1:
+            raise ValueError(
+                f"{self.abbrev} is declared scalar but occurred {len(raw)} times "
+                f"in one packet; declare it multi-value to keep every occurrence"
+            )
+        return encode(convert(self.ftype, raw[0]))
+
+    def decode(self, stored: Any) -> Any:
+        """Decode a value read back from this column into its Python form.
+
+        The inverse of :meth:`encode_raw` past the text stage: it yields the
+        Python value :mod:`remora.values` parses to, not the raw tshark text.
+
+        Absence survives the round trip — ``NULL`` in a scalar column decodes to
+        ``None``, and an empty list stays empty. A ``NULL`` read from a multi
+        column decodes to ``()`` as well: :meth:`encode_raw` never writes one,
+        but a column added to rows that predate it is back-filled with ``NULL``,
+        and callers should see that as "no occurrences" rather than ``None``.
+
+        Args:
+            stored: The value read from the column.
+
+        Returns:
+            ``T | None`` for a scalar column, ``tuple[T, ...]`` for a multi one
+            — the same shapes instance access on a protocol view returns.
+        """
+        entry = get_column_type(self.ftype)
+        if self.multi:
+            return () if stored is None else tuple(entry.decode(item) for item in stored)
+        return None if stored is None else entry.decode(stored)
+
+
+def column_spec(abbrev: str, ftype: str, multi: bool = False) -> ColumnSpec:
+    """Build the :class:`ColumnSpec` for one projected field.
+
+    Args:
+        abbrev: Full tshark field abbrev, e.g. ``"tcp.port"``.
+        ftype: tshark ftype name, e.g. ``"FT_UINT16"``. An unknown one degrades
+            to ``VARCHAR`` with identity codecs, as everywhere else here.
+        multi: Whether the field can occur more than once per packet.
+
+    Returns:
+        The column's name, type and codec, ready for
+        :func:`remora.workspace.schema.add_field_column`.
+
+    Raises:
+        ValueError: If ``abbrev`` is empty (from
+            :func:`remora.workspace.naming.column_name`).
+    """
+    return ColumnSpec(
+        abbrev=abbrev,
+        column_name=column_name(abbrev),
+        ftype=ftype,
+        multi=multi,
+        sql_type=column_sql_type(ftype, multi),
+    )
