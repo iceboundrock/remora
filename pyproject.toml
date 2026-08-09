@@ -39,12 +39,15 @@ all = [
     "remora-industrial==0.1.0",
     "remora-telecom==0.1.0",
 ]
+# DuckDB workspace (M4). Core stays dependency-free for tshark-only users.
+workspace = ["duckdb>=1.1"]
 
 [project.scripts]
 psdsl = "remora.codegen.cli:main"
 
 [dependency-groups]
 dev = [
+    "duckdb>=1.1",
     "mypy>=1.14",
     "pytest>=8.0",
     "ruff>=0.9",
