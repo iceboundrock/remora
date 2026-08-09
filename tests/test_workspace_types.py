@@ -27,13 +27,6 @@ if TYPE_CHECKING:
 
 duckdb = pytest.importorskip("duckdb")
 
-# tests/test_workspace_schema.py holds schema.py as the only file under src/ and
-# tests/ that contains a DDL statement head. The scratch tables below are real
-# DDL at runtime, so the head is assembled from parts and no literal head
-# appears in this source; DDL written the ordinary way anywhere else still trips
-# that guard.
-CREATE_TABLE = " ".join(("CREATE", "TABLE"))
-
 # One representative value per ftype, used for the through-storage round trip.
 SAMPLES: dict[str, Any] = {
     "FT_IPv4": IPv4Address("10.0.0.1"),
@@ -58,8 +51,13 @@ def sample_for(ftype: str) -> Any:
 
 
 def scratch_column(connection: DuckDBPyConnection, sql_type: str) -> None:
-    """Make a scratch table ``t`` with one column ``v`` of ``sql_type``."""
-    connection.execute(f"{CREATE_TABLE} t (v {sql_type})")
+    """Make a scratch table ``t`` with one column ``v`` of ``sql_type``.
+
+    This file is a declared scratch file in tests/test_workspace_schema.py: the
+    table is a throwaway probe on a bare in-memory connection, never part of the
+    workspace layout, which stays schema.py's alone.
+    """
+    connection.execute(f"CREATE TABLE t (v {sql_type})")
 
 
 @pytest.fixture
