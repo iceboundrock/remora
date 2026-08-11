@@ -39,6 +39,21 @@ SCHEMA_MODULE = REPO_ROOT / "src" / "remora" / "workspace" / "schema.py"
 # so this pattern does not match its own definition.
 DDL_STATEMENT = re.compile(r"CREATE\s+(?:TABLE|SCHEMA|VIEW|INDEX)\b", re.IGNORECASE)
 
+# The same head plus the name it creates, through the "OR REPLACE" and
+# "IF NOT EXISTS" spellings that appear in _DDL. Self-matching is avoided the
+# same way DDL_STATEMENT avoids it.
+DDL_TARGET = re.compile(
+    r"CREATE\s+(?:OR\s+REPLACE\s+)?(?:TABLE|SCHEMA|VIEW|INDEX)\s+"
+    r"(?:IF\s+NOT\s+EXISTS\s+)?([\w.\"]+)",
+    re.IGNORECASE,
+)
+
+# Files under src/ and tests/ exempt from the file-level DDL rule below. A file
+# qualifies only if every DDL statement in it creates a throwaway probe table on
+# a bare in-memory connection — never a workspace table, which the name-level
+# rule enforces separately and without exemption.
+DDL_SCRATCH_FILES = frozenset({REPO_ROOT / "tests" / "test_workspace_types.py"})
+
 EXPECTED_TABLES = {
     ("main", "pkts"),
     ("main", "streams"),
@@ -48,19 +63,48 @@ EXPECTED_TABLES = {
     ("meta", "cache_keys"),
 }
 
+# Schemas the layout creates. "main" is DuckDB's own default schema, not ours.
+WORKSPACE_SCHEMAS = {schema for schema, _ in EXPECTED_TABLES} - {"main"}
 
-def files_declaring_ddl() -> set[Path]:
-    """Every .py file under src/ and tests/ that contains a DDL statement head."""
-    found: set[Path] = set()
+# Every name the workspace layout owns, bare and schema-qualified, derived from
+# the layout itself so a table added to _DDL is protected without a second list.
+WORKSPACE_NAMES = frozenset(
+    {table for _, table in EXPECTED_TABLES}
+    | {f"{schema}.{table}" for schema, table in EXPECTED_TABLES}
+    | WORKSPACE_SCHEMAS
+)
+
+
+def py_sources() -> Iterator[tuple[Path, str]]:
+    """Every .py file under src/ and tests/ that could contain DDL, with its text."""
     for tree in (REPO_ROOT / "src", REPO_ROOT / "tests"):
-        for path in tree.rglob("*.py"):
+        for path in sorted(tree.rglob("*.py")):
             raw = path.read_bytes()
             # Cheap prefilter: the generated proto tree is ~1 MB and has no DDL.
             if b"create" not in raw.lower():
                 continue
-            if DDL_STATEMENT.search(raw.decode("utf-8", errors="replace")):
-                found.add(path)
-    return found
+            yield path, raw.decode("utf-8", errors="replace")
+
+
+def files_declaring_ddl() -> set[Path]:
+    """Every .py file under src/ and tests/ that contains a DDL statement head."""
+    return {path for path, text in py_sources() if DDL_STATEMENT.search(text)}
+
+
+def workspace_names_created_in(text: str) -> set[str]:
+    """Workspace-layout names that DDL in ``text`` creates.
+
+    Keyed on the name a statement *creates*, not on any mention of it: a query
+    against pkts is fine anywhere, a DDL statement making one is not.
+    """
+    hits: set[str] = set()
+    for match in DDL_TARGET.finditer(text):
+        parts = match.group(1).replace('"', "").lower().split(".")
+        # Bare ("pkts") and qualified ("main.pkts", and the trailing two parts
+        # of a database-qualified "memory.main.pkts") spellings alike.
+        candidates = {parts[-1]} | ({".".join(parts[-2:])} if len(parts) > 1 else set())
+        hits |= candidates & WORKSPACE_NAMES
+    return hits
 
 
 @pytest.fixture
@@ -98,11 +142,27 @@ class TestCreateSchema:
         assert column_names(con, "main", "pkts") == ["frame_number", "frame_time"]
 
     def test_ddl_is_the_only_source(self) -> None:
-        # schema.py is the one file in src/ and tests/ allowed to contain DDL.
-        # If this fails on a legitimate mention (a docstring, a test fixture),
-        # remove or rephrase the mention — do not widen the scan or allow-list
-        # the file: the point is that there is exactly one place to look.
-        assert files_declaring_ddl() == {SCHEMA_MODULE}
+        # Rule A, file level: a file in src/ or tests/ containing a DDL head is
+        # schema.py or a declared scratch file (DDL_SCRATCH_FILES — a test that
+        # creates only throwaway probe tables on a bare in-memory connection).
+        # Equality, not containment, so an exemption that stops being needed has
+        # to be removed. If this fails, the fix is almost always to delete the
+        # DDL or move it into iter_ddl(); adding an exemption is a decision to
+        # argue for, and it never buys the right to create a workspace name,
+        # which Rule B below forbids everywhere outside schema.py.
+        assert files_declaring_ddl() == {SCHEMA_MODULE} | DDL_SCRATCH_FILES
+
+    def test_no_workspace_name_is_created_outside_schema_module(self) -> None:
+        # Rule B, name level, no exemptions: nothing outside schema.py may
+        # create a name belonging to the layout — the tables of EXPECTED_TABLES
+        # bare or schema-qualified, and the meta schema itself. This is what
+        # makes Rule A's exemption safe: a scratch file may create t, never pkts.
+        offenders = {
+            str(path): sorted(names)
+            for path, text in py_sources()
+            if path != SCHEMA_MODULE and (names := workspace_names_created_in(text))
+        }
+        assert offenders == {}
 
     def test_schema_module_keeps_all_ddl_in_the_constant(self) -> None:
         # Within schema.py, every DDL statement belongs to iter_ddl() — none is

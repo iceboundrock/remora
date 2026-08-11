@@ -29,12 +29,13 @@ index that taxes exactly the bulk append path #31 must keep cheap.
 ascending in capture order. The small catalog tables keep their keys; they take
 single-row writes, and the constraint is the point.
 
-Column types are ``VARCHAR`` placeholders until the FType -> column-type map
-lands (#26); nothing here invents a type mapping.
+Column types come from the caller. :mod:`remora.workspace.types` maps an ftype
+to its column type; nothing here invents a type mapping.
 
-Timestamps are UTC. DuckDB ``TIMESTAMP`` is timezone-naive, so aware datetimes
-are converted to naive UTC on write and re-tagged as UTC on read; a naive
-datetime handed in is assumed to already be UTC.
+Timestamps follow the UTC convention stated in :mod:`remora.workspace.types`
+and use its :func:`~remora.workspace.types.to_db_timestamp` /
+:func:`~remora.workspace.types.from_db_timestamp` pair on every catalog
+column.
 
 There is exactly one layout version and no migration path: a file whose
 recorded version differs from :data:`SCHEMA_VERSION` in either direction is
@@ -50,11 +51,12 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import TYPE_CHECKING, Final
 
 from remora.workspace.errors import SchemaVersionError, WorkspaceError
 from remora.workspace.naming import SKELETON_COLUMNS
+from remora.workspace.types import from_db_timestamp, to_db_timestamp
 
 if TYPE_CHECKING:
     from duckdb import DuckDBPyConnection
@@ -250,8 +252,8 @@ class FieldRecord:
             :func:`remora.workspace.naming.column_name`.
         ftype: tshark ftype name, e.g. ``"FT_UINT16"``.
         multi: Whether the field can occur more than once per packet.
-        column_type: SQL type of the column. ``"VARCHAR"`` placeholder until
-            the FType -> column-type map lands (#26).
+        column_type: SQL type of the column, from
+            :func:`remora.workspace.types.column_sql_type`.
         materialized_at: When the column was materialized (aware, UTC).
     """
 
@@ -291,22 +293,6 @@ class CacheKeyRecord:
     created_at: datetime
 
 
-def _to_db_time(value: datetime) -> datetime:
-    """Convert an aware datetime to the naive UTC DuckDB stores.
-
-    A naive datetime is assumed to already be UTC and passes through unchanged
-    — it is never interpreted as local time.
-    """
-    if value.tzinfo is None:
-        return value
-    return value.astimezone(timezone.utc).replace(tzinfo=None)
-
-
-def _from_db_time(value: datetime) -> datetime:
-    """Re-tag a naive UTC timestamp read from DuckDB as aware UTC."""
-    return value.replace(tzinfo=timezone.utc)
-
-
 def _quote_identifier(name: str) -> str:
     """Quote a SQL identifier, escaping embedded double quotes."""
     escaped = name.replace('"', '""')
@@ -339,7 +325,7 @@ def register_fields(con: DuckDBPyConnection, records: Iterable[FieldRecord]) -> 
                 record.ftype,
                 record.multi,
                 record.column_type,
-                _to_db_time(record.materialized_at),
+                to_db_timestamp(record.materialized_at),
             ],
         )
 
@@ -366,7 +352,7 @@ def read_fields(con: DuckDBPyConnection) -> tuple[FieldRecord, ...]:
             ftype=ftype,
             multi=bool(multi),
             column_type=column_type,
-            materialized_at=_from_db_time(materialized_at),
+            materialized_at=from_db_timestamp(materialized_at),
         )
         for abbrev, column, ftype, multi, column_type, materialized_at in rows
     )
@@ -402,7 +388,7 @@ def record_cache_key(con: DuckDBPyConnection, record: CacheKeyRecord) -> None:
             record.dfilter,
             record.tshark_version,
             list(record.argv),
-            _to_db_time(record.created_at),
+            to_db_timestamp(record.created_at),
         ],
     )
 
@@ -435,7 +421,7 @@ def read_cache_key(con: DuckDBPyConnection, key: str) -> CacheKeyRecord | None:
         dfilter=row[4],
         tshark_version=row[5],
         argv=tuple(row[6]),
-        created_at=_from_db_time(row[7]),
+        created_at=from_db_timestamp(row[7]),
     )
 
 
@@ -446,8 +432,9 @@ def add_field_column(con: DuckDBPyConnection, column: str, sql_type: str = "VARC
         con: Read-write connection.
         column: Column name from :func:`remora.workspace.naming.column_name`.
             Quoted, so a hostile name cannot inject SQL.
-        sql_type: SQL type for the column. ``"VARCHAR"`` is the placeholder
-            until #26 supplies the FType map. Types cannot be bound as
+        sql_type: SQL type for the column, from
+            :func:`remora.workspace.types.column_sql_type`; ``"VARCHAR"`` is
+            the default because it holds anything. Types cannot be bound as
             parameters, so the value is validated against a conservative
             pattern: letters, digits, underscores and *spaces* (multi-word
             types such as ``DOUBLE PRECISION`` are real), then an optional
