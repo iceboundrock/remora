@@ -23,14 +23,20 @@ from __future__ import annotations
 
 import hashlib
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Final
 
+from remora.workspace.schema import CacheKeyRecord
+
 __all__ = [
+    "CACHE_KEY_VERSION",
     "FINGERPRINT_VERSION",
     "PROBE_BYTES",
     "PcapFingerprint",
     "fingerprint_pcap",
+    "make_cache_key",
 ]
 
 PROBE_BYTES: Final[int] = 64 * 1024
@@ -108,4 +114,115 @@ def fingerprint_pcap(path: str | os.PathLike[str]) -> PcapFingerprint:
         size=size,
         mtime_ns=stat.st_mtime_ns,
         probe_sha256=_probe_digest(head, tail),
+    )
+
+
+CACHE_KEY_VERSION: Final[str] = "ck1"
+"""Cache-key scheme version, prefixed onto every key.
+
+Stored keys carry it, so changing the scheme invalidates old entries visibly
+instead of letting two schemes share one namespace.
+"""
+
+
+def _encode(value: bytes) -> bytes:
+    """Length-prefix one component so no separator can be confused with data."""
+    return _to_bytes(f"{len(value)}:") + value
+
+
+def _encode_sequence(items: tuple[str, ...]) -> bytes:
+    """Encode an ordered sequence, count first, each element length-prefixed."""
+    parts = [_to_bytes(f"{len(items)}#")]
+    parts.extend(_encode(_to_bytes(item)) for item in items)
+    return b"".join(parts)
+
+
+def _encode_optional(value: str | None) -> bytes:
+    """Encode an optional component; absent digests differently from empty."""
+    if value is None:
+        return b"-"
+    return b"+" + _encode(_to_bytes(value))
+
+
+def _cache_key_digest(
+    *,
+    fingerprint: str,
+    fields: tuple[str, ...],
+    dfilter: str | None,
+    tshark_version: str,
+    argv: tuple[str, ...],
+) -> str:
+    """Digest the canonicalized components in a fixed order."""
+    hasher = hashlib.sha256()
+    hasher.update(_encode(_to_bytes(CACHE_KEY_VERSION)))
+    hasher.update(_encode(_to_bytes(fingerprint)))
+    hasher.update(_encode_sequence(fields))
+    hasher.update(_encode_optional(dfilter))
+    hasher.update(_encode(_to_bytes(tshark_version)))
+    hasher.update(_encode_sequence(argv))
+    return hasher.hexdigest()
+
+
+def make_cache_key(
+    *,
+    pcap: str | os.PathLike[str],
+    fields: Iterable[str],
+    dfilter: str | None,
+    tshark_version: str,
+    argv: Iterable[str],
+    fingerprint: PcapFingerprint | None = None,
+    created_at: datetime | None = None,
+) -> CacheKeyRecord:
+    """Compute a materialization cache key and the record that stores it.
+
+    The digest covers the capture's fingerprint, the canonicalized projection,
+    the display filter, the tshark version, and the **full effective argv**,
+    verbatim and order-sensitive — a different ``-X lua_script:``, ``-d`` or
+    ``-o`` dissects identical bytes differently, so it must produce a
+    different key.
+
+    ``pcap_path`` is stored for diagnostics but is **not** hashed: argv
+    already carries the path tshark was given, and hashing it a second time
+    would turn "same capture, different relative path" into a needless miss.
+
+    Args:
+        pcap: Capture file the materialization reads.
+        fields: tshark field abbrevs to project. Sorted and deduplicated, so
+            the same set in any order yields the same key — and so #32's
+            ``list_has_all`` subset test sees a canonical set.
+        dfilter: Display filter pushed down, or None when unfiltered. None and
+            ``""`` digest differently.
+        tshark_version: Version string of the tshark that produces the data.
+        argv: The exact argv that will be run.
+        fingerprint: Precomputed fingerprint of ``pcap``; computed here when
+            omitted. Pass one to avoid re-reading a capture already sampled.
+        created_at: Record timestamp; ``now`` in UTC when omitted. Not hashed.
+
+    Returns:
+        A :class:`~remora.workspace.schema.CacheKeyRecord` holding the digest
+        and every component it was computed from.
+
+    Raises:
+        OSError: If ``fingerprint`` is omitted and ``pcap`` cannot be read.
+    """
+    resolved = fingerprint if fingerprint is not None else fingerprint_pcap(pcap)
+    canonical_fields = tuple(sorted(set(fields)))
+    canonical_argv = tuple(argv)
+    rendered = resolved.render()
+    digest = _cache_key_digest(
+        fingerprint=rendered,
+        fields=canonical_fields,
+        dfilter=dfilter,
+        tshark_version=tshark_version,
+        argv=canonical_argv,
+    )
+    return CacheKeyRecord(
+        key=f"{CACHE_KEY_VERSION}:{digest}",
+        pcap_path=os.fsdecode(pcap),
+        pcap_fingerprint=rendered,
+        fields=canonical_fields,
+        dfilter=dfilter,
+        tshark_version=tshark_version,
+        argv=canonical_argv,
+        created_at=created_at if created_at is not None else datetime.now(timezone.utc),
     )

@@ -3,15 +3,21 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 from collections.abc import Callable
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import IO, Any
 
 import pytest
 
 from remora.workspace.cachekey import (
+    CACHE_KEY_VERSION,
     PROBE_BYTES,
+    PcapFingerprint,
     fingerprint_pcap,
+    make_cache_key,
 )
 
 LARGE = 300 * 1024  # comfortably past head + tail, so the middle is unsampled
@@ -155,3 +161,218 @@ class TestReadCeiling:
     ) -> None:
         small = write_pcap(tmp_path / "small.pcap", b"y" * 1000)
         assert count_reads(monkeypatch, lambda: fingerprint_pcap(small)) <= 1000
+
+
+BASE_ARGV = (
+    "tshark",
+    "-r",
+    "cap.pcap",
+    "-T",
+    "fields",
+    "-e",
+    "ip.src",
+    "-e",
+    "ip.dst",
+)
+
+# Pinned so an accidental change to the key scheme fails loudly. Regenerating
+# this value is a deliberate act: it means every stored key just went stale.
+GOLDEN_KEY = "ck1:fa6dcc3d30d9f05d80b69a56ac63fed117b7113a40cbbdcb56cdd43182d78b21"
+
+
+def key_for(path: Path, **overrides: Any) -> str:
+    """Build a cache key over a fixed baseline, with named overrides."""
+    kwargs: dict[str, Any] = {
+        "pcap": path,
+        "fields": ["ip.src", "ip.dst"],
+        "dfilter": "tcp",
+        "tshark_version": "4.6.7",
+        "argv": BASE_ARGV,
+    }
+    kwargs.update(overrides)
+    return make_cache_key(**kwargs).key
+
+
+@pytest.fixture
+def cap(tmp_path: Path) -> Path:
+    """A capture large enough that head, middle and tail are distinct."""
+    return write_pcap(tmp_path / "cap.pcap", bytes(large_payload()))
+
+
+class TestCacheKeyComponents:
+    def test_identical_inputs_give_identical_keys(self, cap: Path) -> None:
+        assert key_for(cap) == key_for(cap)
+
+    def test_key_carries_the_scheme_version(self, cap: Path) -> None:
+        key = key_for(cap)
+        assert key.startswith(f"{CACHE_KEY_VERSION}:")
+        assert len(key.split(":")[1]) == 64
+
+    def test_pcap_head_change_flips(self, cap: Path) -> None:
+        before = key_for(cap)
+        body = bytearray(cap.read_bytes())
+        body[:4] = b"XXXX"
+        cap.write_bytes(bytes(body))
+        assert key_for(cap) != before
+
+    def test_pcap_tail_change_flips(self, cap: Path) -> None:
+        before = key_for(cap)
+        body = bytearray(cap.read_bytes())
+        body[-4:] = b"ZZZZ"
+        cap.write_bytes(bytes(body))
+        assert key_for(cap) != before
+
+    def test_size_change_flips(self, cap: Path) -> None:
+        before = key_for(cap)
+        cap.write_bytes(cap.read_bytes() + b"!")
+        assert key_for(cap) != before
+
+    def test_mtime_change_flips(self, cap: Path) -> None:
+        before = key_for(cap)
+        stamp = cap.stat().st_mtime_ns + 1_000_000
+        os.utime(cap, ns=(stamp, stamp))
+        assert key_for(cap) != before
+
+    def test_projection_change_flips(self, cap: Path) -> None:
+        assert key_for(cap, fields=["ip.src"]) != key_for(cap)
+
+    def test_projection_is_order_insensitive(self, cap: Path) -> None:
+        assert key_for(cap, fields=["ip.dst", "ip.src"]) == key_for(cap)
+
+    def test_projection_is_deduplicated(self, cap: Path) -> None:
+        assert key_for(cap, fields=["ip.src", "ip.dst", "ip.src"]) == key_for(cap)
+
+    def test_dfilter_change_flips(self, cap: Path) -> None:
+        assert key_for(cap, dfilter="udp") != key_for(cap)
+
+    def test_absent_dfilter_differs_from_empty_dfilter(self, cap: Path) -> None:
+        assert key_for(cap, dfilter=None) != key_for(cap, dfilter="")
+
+    def test_tshark_version_change_flips(self, cap: Path) -> None:
+        assert key_for(cap, tshark_version="4.6.8") != key_for(cap)
+
+
+class TestArgvClasses:
+    """Every argument class that changes tshark's parse must flip the key."""
+
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            pytest.param(("-X", "lua_script:custom.lua"), id="lua-script"),
+            pytest.param(("-d", "tcp.port==8888,http"), id="decode-as"),
+            pytest.param(("-o", "tcp.desegment_tcp_streams:FALSE"), id="pref-override"),
+            pytest.param(("-Y", "http"), id="display-filter-arg"),
+            pytest.param(("--disable-protocol", "tls"), id="disable-protocol"),
+        ],
+    )
+    def test_added_argument_flips(self, cap: Path, extra: tuple[str, ...]) -> None:
+        assert key_for(cap, argv=(*BASE_ARGV, *extra)) != key_for(cap)
+
+    def test_changed_lua_script_flips(self, cap: Path) -> None:
+        one = key_for(cap, argv=(*BASE_ARGV, "-X", "lua_script:a.lua"))
+        two = key_for(cap, argv=(*BASE_ARGV, "-X", "lua_script:b.lua"))
+        assert one != two
+
+    def test_changed_decode_as_flips(self, cap: Path) -> None:
+        one = key_for(cap, argv=(*BASE_ARGV, "-d", "tcp.port==8888,http"))
+        two = key_for(cap, argv=(*BASE_ARGV, "-d", "tcp.port==9999,http"))
+        assert one != two
+
+    def test_removed_argument_flips(self, cap: Path) -> None:
+        assert key_for(cap, argv=BASE_ARGV[:-2]) != key_for(cap)
+
+    def test_reordered_argv_flips(self, cap: Path) -> None:
+        """argv order is meaningful to tshark, so it is meaningful to the key."""
+        reordered = ("tshark", "-T", "fields", "-r", "cap.pcap", "-e", "ip.src", "-e", "ip.dst")
+        assert key_for(cap, argv=reordered) != key_for(cap)
+
+    def test_argument_boundaries_are_unambiguous(self, cap: Path) -> None:
+        """Splitting one argument in two must not digest the same."""
+        joined = key_for(cap, argv=("tshark", "-rcap.pcap"))
+        split = key_for(cap, argv=("tshark", "-r", "cap.pcap"))
+        assert joined != split
+
+
+class TestRecordAndStability:
+    def test_record_stores_canonicalized_components(self, cap: Path) -> None:
+        stamp = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
+        record = make_cache_key(
+            pcap=cap,
+            fields=["ip.dst", "ip.src", "ip.dst"],
+            dfilter="tcp",
+            tshark_version="4.6.7",
+            argv=BASE_ARGV,
+            created_at=stamp,
+        )
+        assert record.fields == ("ip.dst", "ip.src")
+        assert record.argv == BASE_ARGV
+        assert record.dfilter == "tcp"
+        assert record.tshark_version == "4.6.7"
+        assert record.pcap_path == str(cap)
+        assert record.pcap_fingerprint == fingerprint_pcap(cap).render()
+        assert record.created_at == stamp
+
+    def test_created_at_defaults_to_aware_utc(self, cap: Path) -> None:
+        record = make_cache_key(
+            pcap=cap,
+            fields=["ip.src"],
+            dfilter=None,
+            tshark_version="4.6.7",
+            argv=BASE_ARGV,
+        )
+        assert record.created_at.tzinfo is not None
+        assert record.created_at.utcoffset() == timezone.utc.utcoffset(None)
+
+    def test_supplied_fingerprint_skips_the_file_read(
+        self, cap: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fingerprint = fingerprint_pcap(cap)
+
+        def build() -> str:
+            return make_cache_key(
+                pcap=cap,
+                fields=["ip.src"],
+                dfilter=None,
+                tshark_version="4.6.7",
+                argv=BASE_ARGV,
+                fingerprint=fingerprint,
+            ).pcap_fingerprint
+
+        assert count_reads(monkeypatch, build) == 0
+
+    def test_key_is_stable_across_processes(self, cap: Path) -> None:
+        """Randomized hashing must not reach the digest."""
+        expected = key_for(cap)
+        snippet = (
+            "import sys;"
+            "from remora.workspace.cachekey import make_cache_key;"
+            "print(make_cache_key("
+            "pcap=sys.argv[1], fields=['ip.dst','ip.src'], dfilter='tcp',"
+            f"tshark_version='4.6.7', argv={BASE_ARGV!r}).key)"
+        )
+        env = {**os.environ, "PYTHONHASHSEED": "random"}
+        result = subprocess.run(
+            [sys.executable, "-c", snippet, str(cap)],
+            capture_output=True,
+            text=True,
+            check=True,
+            env=env,
+        )
+        assert result.stdout.strip() == expected
+
+    def test_key_digest_is_pinned(self) -> None:
+        """Golden digest: an accidental change to the scheme fails loudly here."""
+        fingerprint = PcapFingerprint(
+            size=1234,
+            mtime_ns=1_700_000_000_000_000_000,
+            probe_sha256="a" * 64,
+        )
+        record = make_cache_key(
+            pcap="/captures/example.pcap",
+            fields=["ip.src", "ip.dst"],
+            dfilter="tcp",
+            tshark_version="4.6.7",
+            argv=BASE_ARGV,
+            fingerprint=fingerprint,
+        )
+        assert record.key == GOLDEN_KEY
