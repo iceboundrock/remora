@@ -28,7 +28,7 @@ Static typing assertions are part of the test suite: `assert_type(...)` calls in
 ## Workflow
 
 - One PR per issue. Branch `feat/issue-<n>-<slug>` (or `feat/<n>-<slug>`), PR body includes `Closes #<n>`. PRs are squash-merged, so merged local branches need `git branch -D`.
-- Implementation plans live in `docs/superpowers/plans/`.
+- **Process artifacts are issue comments, not repository files.** Design docs, specs, implementation plans, and progress notes go into the issue as `gh issue comment <n>` — they belong to the issue's history, not to the shipped tree. Only durable documentation (`docs/*.md`, ADRs, `AGENTS.md`) is committed. `docs/superpowers/specs/` and `docs/superpowers/plans/` hold pre-rule artifacts and take no new files.
 
 ## Architecture
 
