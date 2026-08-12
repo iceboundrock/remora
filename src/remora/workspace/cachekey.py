@@ -17,6 +17,20 @@ This module computes; it stores nothing. :func:`make_cache_key` returns the
 :func:`~remora.workspace.schema.record_cache_key` persists, so the components
 that were hashed and the components that get written cannot drift apart.
 Hit/miss and backfill are issue #32's.
+
+Hashing and storing draw their boundaries in different places, deliberately.
+Hashing tolerates any ``str``: :func:`_to_bytes` encodes with
+``surrogateescape``, so a path or argv element that :func:`os.fsdecode` turned
+into lone surrogates still digests. The *record* is stricter, because its
+string components land in DuckDB ``VARCHAR``/``VARCHAR[]`` columns and DuckDB
+refuses a string that is not valid UTF-8. :func:`make_cache_key` therefore
+rejects an unstorable component up front, naming it, rather than letting the
+write fail later inside pybind11 with a message that identifies neither the
+component nor the value. Ordinary non-ASCII Unicode is unaffected — only lone
+surrogates are refused. Encoding arbitrary bytes losslessly into ``VARCHAR``
+would need a reversible tag scheme, hence a storage-format change and a
+``SCHEMA_VERSION`` bump, at the cost of the workspace file staying directly
+queryable; narrowing the guarantee is the cheaper trade for a rare case.
 """
 
 from __future__ import annotations
@@ -47,8 +61,36 @@ FINGERPRINT_VERSION: Final[str] = "fp1"
 
 
 def _to_bytes(text: str) -> bytes:
-    """Encode a caller-supplied string, tolerating non-UTF-8 paths and argv."""
+    """Encode a caller-supplied string, tolerating non-UTF-8 paths and argv.
+
+    A hashing primitive, and total by design: it hashes anything and never
+    raises. Do not "simplify" it to strict UTF-8 — storability is a separate
+    concern, checked by :func:`_check_storable` with an error that names the
+    offending component. Tightening this instead would move the failure back
+    into the digest, where there is no such context.
+    """
     return text.encode("utf-8", "surrogateescape")
+
+
+def _check_storable(component: str, value: str) -> None:
+    """Refuse a string the workspace's ``VARCHAR`` columns cannot hold.
+
+    Args:
+        component: Name of the record component, used in the message.
+        value: The string to check.
+
+    Raises:
+        ValueError: If ``value`` is not encodable as strict UTF-8 — in
+            practice, a lone surrogate from :func:`os.fsdecode` of a non-UTF-8
+            path or argv element.
+    """
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError(
+            f"cache key {component} is not storable: DuckDB VARCHAR holds only "
+            f"valid UTF-8, and this string is not: {value!r}"
+        ) from exc
 
 
 @dataclass(frozen=True)
@@ -210,6 +252,10 @@ def make_cache_key(
         TypeError: If ``fields`` or ``argv`` is a ``str``. Both are iterables
             of strings, and a bare ``str`` iterates into characters — silently
             keying on six one-character "abbrevs" instead of ``"ip.src"``.
+        ValueError: If any string that lands in the record — ``pcap``, a field,
+            ``dfilter``, ``tshark_version`` or an argv element — is not valid
+            UTF-8 and so cannot be stored in a DuckDB ``VARCHAR``. Checked
+            before any file is read, so a doomed call costs no I/O.
         OSError: If ``fingerprint`` is omitted and ``pcap`` cannot be read.
     """
     if isinstance(fields, str) or isinstance(argv, str):
@@ -217,9 +263,19 @@ def make_cache_key(
             "fields and argv must be iterables of strings, not a single str: "
             "a bare str iterates into its characters"
         )
-    resolved = fingerprint if fingerprint is not None else fingerprint_pcap(pcap)
     canonical_fields = tuple(sorted(set(fields)))
     canonical_argv = tuple(argv)
+    pcap_path = os.fsdecode(pcap)
+    # Before the fingerprint, so an unstorable component costs no file read.
+    _check_storable("pcap_path", pcap_path)
+    for field in canonical_fields:
+        _check_storable("fields element", field)
+    if dfilter is not None:
+        _check_storable("dfilter", dfilter)
+    _check_storable("tshark_version", tshark_version)
+    for argument in canonical_argv:
+        _check_storable("argv element", argument)
+    resolved = fingerprint if fingerprint is not None else fingerprint_pcap(pcap)
     rendered = resolved.render()
     digest = _cache_key_digest(
         fingerprint=rendered,
@@ -230,7 +286,7 @@ def make_cache_key(
     )
     return CacheKeyRecord(
         key=f"{CACHE_KEY_VERSION}:{digest}",
-        pcap_path=os.fsdecode(pcap),
+        pcap_path=pcap_path,
         pcap_fingerprint=rendered,
         fields=canonical_fields,
         dfilter=dfilter,

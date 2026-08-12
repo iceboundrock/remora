@@ -255,6 +255,25 @@ class TestCacheKeyComponents:
         rewrite_keeping_mtime(cap, cap.read_bytes() + b"!")
         assert key_for(cap) != before
 
+    def test_truncation_flips(self, tmp_path: Path) -> None:
+        """Truncating the capture flips the key, with mtime pinned.
+
+        Uniform fill, and both halves still longer than head + tail, so the
+        sampled bytes are byte-identical before and after: size is the only
+        component that moves. Drop size from the fingerprint and this fails —
+        which is the point of pinning truncation separately from the append
+        case, where the appended byte lands in the tail sample anyway.
+        """
+        path = write_pcap(tmp_path / "trunc.pcap", b"x" * LARGE)
+        before_fp = fingerprint_pcap(path)
+        before = key_for(path)
+        rewrite_keeping_mtime(path, b"x" * (LARGE // 2))
+        after_fp = fingerprint_pcap(path)
+        assert after_fp.probe_sha256 == before_fp.probe_sha256
+        assert after_fp.mtime_ns == before_fp.mtime_ns
+        assert after_fp.size != before_fp.size
+        assert key_for(path) != before
+
     def test_mtime_change_flips(self, cap: Path) -> None:
         before = key_for(cap)
         stamp = cap.stat().st_mtime_ns + 1_000_000
@@ -287,6 +306,51 @@ class TestCacheKeyComponents:
 
     def test_tshark_version_change_flips(self, cap: Path) -> None:
         assert key_for(cap, tshark_version="4.6.8") != key_for(cap)
+
+
+SURROGATE = "\udcff"
+"""What os.fsdecode yields for a byte that is not valid UTF-8."""
+
+
+class TestUnstorableStrings:
+    """Hashing tolerates any str; the record refuses what VARCHAR cannot hold."""
+
+    def test_surrogate_pcap_path_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="pcap_path is not storable"):
+            key_for(tmp_path / f"bad{SURROGATE}.pcap")
+
+    def test_surrogate_pcap_path_is_rejected_before_any_file_read(self, cap: Path) -> None:
+        """A non-existent path proves the check runs first: OSError never gets a turn."""
+        with pytest.raises(ValueError, match="not storable"):
+            key_for(cap.parent / f"missing{SURROGATE}.pcap")
+
+    def test_surrogate_argv_element_is_rejected(self, cap: Path) -> None:
+        with pytest.raises(ValueError, match="argv element is not storable"):
+            key_for(cap, argv=(*BASE_ARGV, f"-X lua_script:{SURROGATE}.lua"))
+
+    def test_rejection_costs_no_file_read(self, cap: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        def build() -> None:
+            with pytest.raises(ValueError):
+                key_for(cap, argv=(*BASE_ARGV, SURROGATE))
+
+        assert count_reads(monkeypatch, build) == 0
+
+    def test_surrogate_field_is_rejected(self, cap: Path) -> None:
+        with pytest.raises(ValueError, match="fields element is not storable"):
+            key_for(cap, fields=["ip.src", f"ip.{SURROGATE}"])
+
+    def test_surrogate_dfilter_is_rejected(self, cap: Path) -> None:
+        with pytest.raises(ValueError, match="dfilter is not storable"):
+            key_for(cap, dfilter=f"ip.src == {SURROGATE}")
+
+    def test_surrogate_tshark_version_is_rejected(self, cap: Path) -> None:
+        with pytest.raises(ValueError, match="tshark_version is not storable"):
+            key_for(cap, tshark_version=f"4.6.{SURROGATE}")
+
+    def test_non_ascii_unicode_is_accepted(self, tmp_path: Path) -> None:
+        """Only lone surrogates are refused — ordinary Unicode still hashes."""
+        path = write_pcap(tmp_path / "捕获.pcap", bytes(large_payload()))
+        assert key_for(path, argv=("tshark", "-r", "/捕获/测试.pcap")).startswith("ck1:")
 
 
 class TestArgvClasses:
@@ -458,6 +522,34 @@ class TestStorageRoundTrip:
             created_at=datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc),
         )
         con = duckdb.connect(str(tmp_path / "ws.duckdb"))
+        try:
+            create_schema(con)
+            record_cache_key(con, record)
+            assert read_cache_key(con, record.key) == record
+        finally:
+            con.close()
+
+    def test_non_ascii_unicode_round_trips(self, tmp_path: Path) -> None:
+        """The narrowed guarantee covers only unstorable strings, not non-ASCII.
+
+        A CJK path and argv are perfectly valid UTF-8, so they must survive the
+        write intact — this is what stops the surrogate check from being
+        mistaken for an ASCII-only rule.
+        """
+        duckdb = pytest.importorskip("duckdb")
+        from remora.workspace.schema import create_schema, read_cache_key, record_cache_key
+
+        pcap = write_pcap(tmp_path / "捕获.pcap", bytes(large_payload()))
+        record = make_cache_key(
+            pcap=pcap,
+            fields=["ip.dst", "ip.src"],
+            dfilter='ip.host == "例え.jp"',
+            tshark_version="4.6.7",
+            argv=("tshark", "-r", "/捕获/测试.pcap", "-T", "fields", "-e", "ip.src"),
+            created_at=datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc),
+        )
+        assert "捕获" in record.pcap_path
+        con = duckdb.connect(str(tmp_path / "ws-unicode.duckdb"))
         try:
             create_schema(con)
             record_cache_key(con, record)
