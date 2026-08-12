@@ -154,13 +154,18 @@ class TestReadCeiling:
             handle.seek(512 * 1024 * 1024 - 4)
             handle.write(b"TAIL")
         assert big.stat().st_size == 512 * 1024 * 1024
-        assert count_reads(monkeypatch, lambda: fingerprint_pcap(big)) <= 2 * PROBE_BYTES
+        # The lower bound is not pedantry: count_reads instruments builtins.open,
+        # so a refactor to Path.read_bytes/mmap/os.pread would count 0 and pass
+        # this vacuously, silently unguarding the read ceiling.
+        count = count_reads(monkeypatch, lambda: fingerprint_pcap(big))
+        assert 0 < count <= 2 * PROBE_BYTES
 
     def test_small_file_reads_no_more_than_its_size(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         small = write_pcap(tmp_path / "small.pcap", b"y" * 1000)
-        assert count_reads(monkeypatch, lambda: fingerprint_pcap(small)) <= 1000
+        count = count_reads(monkeypatch, lambda: fingerprint_pcap(small))
+        assert 0 < count <= 1000
 
 
 BASE_ARGV = (
@@ -178,6 +183,18 @@ BASE_ARGV = (
 # Pinned so an accidental change to the key scheme fails loudly. Regenerating
 # this value is a deliberate act: it means every stored key just went stale.
 GOLDEN_KEY = "ck1:fa6dcc3d30d9f05d80b69a56ac63fed117b7113a40cbbdcb56cdd43182d78b21"
+
+
+def rewrite_keeping_mtime(path: Path, body: bytes) -> None:
+    """Replace a capture's bytes and restore its mtime.
+
+    mtime is part of the hashed fingerprint, so a plain `write_bytes` would
+    flip the key on its own — a content-blind fingerprint would still pass.
+    Restoring the stamp leaves content as the only difference.
+    """
+    stamp = path.stat().st_mtime_ns
+    path.write_bytes(body)
+    os.utime(path, ns=(stamp, stamp))
 
 
 def key_for(path: Path, **overrides: Any) -> str:
@@ -212,19 +229,19 @@ class TestCacheKeyComponents:
         before = key_for(cap)
         body = bytearray(cap.read_bytes())
         body[:4] = b"XXXX"
-        cap.write_bytes(bytes(body))
+        rewrite_keeping_mtime(cap, bytes(body))
         assert key_for(cap) != before
 
     def test_pcap_tail_change_flips(self, cap: Path) -> None:
         before = key_for(cap)
         body = bytearray(cap.read_bytes())
         body[-4:] = b"ZZZZ"
-        cap.write_bytes(bytes(body))
+        rewrite_keeping_mtime(cap, bytes(body))
         assert key_for(cap) != before
 
     def test_size_change_flips(self, cap: Path) -> None:
         before = key_for(cap)
-        cap.write_bytes(cap.read_bytes() + b"!")
+        rewrite_keeping_mtime(cap, cap.read_bytes() + b"!")
         assert key_for(cap) != before
 
     def test_mtime_change_flips(self, cap: Path) -> None:
@@ -376,3 +393,55 @@ class TestRecordAndStability:
             fingerprint=fingerprint,
         )
         assert record.key == GOLDEN_KEY
+
+
+class TestPackageSurface:
+    def test_public_names_are_exported(self) -> None:
+        import remora.workspace as workspace
+
+        for name in (
+            "CACHE_KEY_VERSION",
+            "FINGERPRINT_VERSION",
+            "PROBE_BYTES",
+            "PcapFingerprint",
+            "fingerprint_pcap",
+            "make_cache_key",
+        ):
+            assert name in workspace.__all__
+            assert hasattr(workspace, name)
+
+    def test_module_is_import_pure(self) -> None:
+        """The workspace layer never imports duckdb at runtime."""
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import sys; import remora.workspace.cachekey; "
+                "sys.exit(1 if 'duckdb' in sys.modules else 0)",
+            ],
+            capture_output=True,
+        )
+        assert result.returncode == 0, result.stderr.decode()
+
+
+class TestStorageRoundTrip:
+    def test_record_round_trips_through_the_workspace(self, tmp_path: Path) -> None:
+        duckdb = pytest.importorskip("duckdb")
+        from remora.workspace.schema import create_schema, read_cache_key, record_cache_key
+
+        pcap = write_pcap(tmp_path / "cap.pcap", bytes(large_payload()))
+        record = make_cache_key(
+            pcap=pcap,
+            fields=["ip.dst", "ip.src"],
+            dfilter="tcp",
+            tshark_version="4.6.7",
+            argv=BASE_ARGV,
+            created_at=datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc),
+        )
+        con = duckdb.connect(str(tmp_path / "ws.duckdb"))
+        try:
+            create_schema(con)
+            record_cache_key(con, record)
+            assert read_cache_key(con, record.key) == record
+        finally:
+            con.close()
