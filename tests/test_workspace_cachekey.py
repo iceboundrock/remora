@@ -53,6 +53,9 @@ class CountingHandle:
     def seek(self, offset: int, whence: int = 0) -> int:
         return self.handle.seek(offset, whence)
 
+    def fileno(self) -> int:
+        return self.handle.fileno()
+
     def __enter__(self) -> CountingHandle:
         return self
 
@@ -100,12 +103,20 @@ class TestFingerprint:
         assert before.probe_sha256 != after.probe_sha256
 
     def test_middle_change_does_not_flip(self, tmp_path: Path) -> None:
-        """The deliberate blind spot: this is a sample, not a whole-file digest."""
+        """The deliberate blind spot: this is a sample, not a whole-file digest.
+
+        Pinned on the *whole* fingerprint, which is what the docs claim: an
+        in-place middle edit that changes neither length nor mtime is
+        indistinguishable. Hence rewrite_keeping_mtime — a plain rewrite would
+        bump mtime and only the probe digest would still match.
+        """
         body = large_payload()
-        before = fingerprint_pcap(write_pcap(tmp_path / "e.pcap", bytes(body)))
+        path = write_pcap(tmp_path / "e.pcap", bytes(body))
+        before = fingerprint_pcap(path)
         body[LARGE // 2 : LARGE // 2 + 3] = b"ZAP"
-        after = fingerprint_pcap(write_pcap(tmp_path / "e.pcap", bytes(body)))
-        assert before.probe_sha256 == after.probe_sha256
+        rewrite_keeping_mtime(path, bytes(body))
+        after = fingerprint_pcap(path)
+        assert before == after
 
     def test_size_alone_flips_the_fingerprint(self, tmp_path: Path) -> None:
         """Uniform fill: head and tail bytes match, only the length differs."""
@@ -259,6 +270,15 @@ class TestCacheKeyComponents:
     def test_projection_is_deduplicated(self, cap: Path) -> None:
         assert key_for(cap, fields=["ip.src", "ip.dst", "ip.src"]) == key_for(cap)
 
+    def test_bare_str_fields_is_rejected(self, cap: Path) -> None:
+        """A str is an Iterable[str]; iterating it would key on characters."""
+        with pytest.raises(TypeError, match="fields and argv"):
+            key_for(cap, fields="ip.src")
+
+    def test_bare_str_argv_is_rejected(self, cap: Path) -> None:
+        with pytest.raises(TypeError, match="fields and argv"):
+            key_for(cap, argv="tshark -r cap.pcap")
+
     def test_dfilter_change_flips(self, cap: Path) -> None:
         assert key_for(cap, dfilter="udp") != key_for(cap)
 
@@ -337,8 +357,7 @@ class TestRecordAndStability:
             tshark_version="4.6.7",
             argv=BASE_ARGV,
         )
-        assert record.created_at.tzinfo is not None
-        assert record.created_at.utcoffset() == timezone.utc.utcoffset(None)
+        assert record.created_at.tzinfo is timezone.utc
 
     def test_supplied_fingerprint_skips_the_file_read(
         self, cap: Path, monkeypatch: pytest.MonkeyPatch

@@ -99,12 +99,15 @@ def fingerprint_pcap(path: str | os.PathLike[str]) -> PcapFingerprint:
         The file's fingerprint.
 
     Raises:
-        OSError: If the file cannot be stat-ed or read. Deliberately
+        OSError: If the file cannot be opened, stat-ed or read. Deliberately
             unwrapped — the caller wants the real errno.
     """
-    stat = os.stat(path)
-    size = stat.st_size
+    # Size, mtime and the sampled bytes all come from one descriptor: an
+    # os.stat before the open would let a growing or rotating capture pair a
+    # stale size with fresh bytes, and the fingerprint would describe neither.
     with open(path, "rb") as handle:
+        stat = os.fstat(handle.fileno())
+        size = stat.st_size
         head = handle.read(min(PROBE_BYTES, size))
         tail = b""
         if size > PROBE_BYTES:
@@ -181,9 +184,10 @@ def make_cache_key(
     ``-o`` dissects identical bytes differently, so it must produce a
     different key.
 
-    ``pcap_path`` is stored for diagnostics but is **not** hashed: argv
-    already carries the path tshark was given, and hashing it a second time
-    would turn "same capture, different relative path" into a needless miss.
+    ``pcap_path`` is stored for diagnostics but is **not** hashed: argv already
+    carries the path tshark was given, and ``pcap`` need not spell that same
+    file the same way argv's ``-r`` does. Hashing it too would add a second,
+    independent path dependence to a key that already has one.
 
     Args:
         pcap: Capture file the materialization reads.
@@ -203,8 +207,16 @@ def make_cache_key(
         and every component it was computed from.
 
     Raises:
+        TypeError: If ``fields`` or ``argv`` is a ``str``. Both are iterables
+            of strings, and a bare ``str`` iterates into characters — silently
+            keying on six one-character "abbrevs" instead of ``"ip.src"``.
         OSError: If ``fingerprint`` is omitted and ``pcap`` cannot be read.
     """
+    if isinstance(fields, str) or isinstance(argv, str):
+        raise TypeError(
+            "fields and argv must be iterables of strings, not a single str: "
+            "a bare str iterates into its characters"
+        )
     resolved = fingerprint if fingerprint is not None else fingerprint_pcap(pcap)
     canonical_fields = tuple(sorted(set(fields)))
     canonical_argv = tuple(argv)
