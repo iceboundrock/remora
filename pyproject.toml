@@ -53,7 +53,7 @@ dev = [
     "duckdb>=1.1",
     "mypy>=1.14",
     "pytest>=8.0",
-    "ruff>=0.9",
+    "ruff>=0.16.2",
     "tomli>=2.0",
     "typing-extensions>=4.4",
     "remora-wireless",
