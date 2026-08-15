@@ -206,6 +206,42 @@ class Workspace:
         finally:
             con.close()
 
+    def compact(self) -> None:
+        """Rewrite the workspace file to reclaim space.
+
+        Deleted data does not shrink a DuckDB file, so this copies every
+        schema, table and row into ``<name>.compacting`` beside the
+        original (same directory, so the final rename never crosses a
+        filesystem) and atomically swaps it in with :func:`os.replace`.
+        The original is only ever replaced whole: an interruption at any
+        point leaves it intact, and at worst a stale temp file that the
+        next compact removes.
+
+        Raises:
+            WorkspaceModeError: In ro mode; reopen with
+                ``Workspace(path, mode='rw')`` to compact.
+        """
+        self._require_open()
+        if self._mode == "ro":
+            raise WorkspaceModeError(
+                f"workspace {self._path} is open read-only; reopen with "
+                f"Workspace(path, mode='rw') to compact"
+            )
+        tmp = self._path.with_name(self._path.name + ".compacting")
+        tmp.unlink(missing_ok=True)
+        try:
+            con = _connect(":memory:", read_only=False)
+            try:
+                con.execute(f"ATTACH '{_quote_path(str(self._path))}' AS src (READ_ONLY)")
+                con.execute(f"ATTACH '{_quote_path(str(tmp))}' AS dst")
+                con.execute("COPY FROM DATABASE src TO dst")
+            finally:
+                con.close()
+            os.replace(tmp, self._path)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
+
     @staticmethod
     def _is_empty(con: DuckDBPyConnection) -> bool:
         """True when the current database holds no tables at all.

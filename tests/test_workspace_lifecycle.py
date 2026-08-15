@@ -189,3 +189,103 @@ class TestLockDiscipline:
             # process can read while this Workspace object still exists.
             result = _subprocess_read(path)
             assert result.stdout.strip() == b"1"
+
+
+class TestCompact:
+    @staticmethod
+    def _bulk_fill(ws: Workspace, rows: int) -> None:
+        with ws.write() as con:
+            con.execute(
+                "INSERT INTO pkts (frame_number, frame_time) "
+                "SELECT range, TIMESTAMP '2024-01-01 00:00:00' "
+                f"FROM range({rows})"
+            )
+
+    def test_compact_in_ro_mode_raises(self, tmp_path: Path) -> None:
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw"):
+            pass
+        with Workspace(path) as ws, pytest.raises(WorkspaceModeError, match="mode='rw'"):
+            ws.compact()
+
+    def test_compact_reclaims_space_after_delete(self, tmp_path: Path) -> None:
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw") as ws:
+            self._bulk_fill(ws, 500000)
+            size_full = path.stat().st_size
+            with ws.write() as con:
+                con.execute("DELETE FROM pkts")
+            # Deleted data does not shrink a DuckDB file.
+            size_after_delete = path.stat().st_size
+            assert size_after_delete >= size_full // 10
+            ws.compact()
+            size_after_compact = path.stat().st_size
+            assert size_after_compact < size_after_delete // 2
+            with ws.read() as con:
+                row = con.execute("SELECT count(*) FROM pkts").fetchone()
+                assert row is not None
+                assert row[0] == 0
+
+    def test_compact_preserves_data_and_catalog(self, tmp_path: Path) -> None:
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw") as ws:
+            with ws.write() as con:
+                con.execute(
+                    "INSERT INTO pkts (frame_number, frame_time) "
+                    "VALUES (7, TIMESTAMP '2024-01-01 00:00:00')"
+                )
+            ws.compact()
+            with ws.read() as con:
+                pkts = con.execute("SELECT frame_number FROM pkts").fetchall()
+                version = con.execute(
+                    "SELECT value FROM meta.info WHERE key = 'schema_version'"
+                ).fetchone()
+            assert pkts == [(7,)]
+            assert version is not None
+            assert int(version[0]) == SCHEMA_VERSION
+        # The compacted file is a workspace the ro opener accepts.
+        with Workspace(path) as ws, ws.read() as con:
+            row = con.execute("SELECT count(*) FROM pkts").fetchone()
+            assert row is not None
+            assert row[0] == 1
+
+    def test_compact_leaves_no_temp_file(self, tmp_path: Path) -> None:
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw") as ws:
+            ws.compact()
+        leftovers = [p.name for p in tmp_path.iterdir() if p.name != path.name]
+        assert leftovers == []
+
+    def test_interrupted_compact_leaves_original_intact(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw") as ws:
+            with ws.write() as con:
+                con.execute(
+                    "INSERT INTO pkts (frame_number, frame_time) "
+                    "VALUES (7, TIMESTAMP '2024-01-01 00:00:00')"
+                )
+
+            def boom(src: object, dst: object) -> None:
+                raise OSError("simulated crash before the swap")
+
+            monkeypatch.setattr("remora.workspace.workspace.os.replace", boom)
+            with pytest.raises(OSError, match="simulated crash"):
+                ws.compact()
+            monkeypatch.undo()
+            # Original untouched, temp cleaned up.
+            with ws.read() as con:
+                row = con.execute("SELECT count(*) FROM pkts").fetchone()
+                assert row is not None
+                assert row[0] == 1
+        leftovers = [p.name for p in tmp_path.iterdir() if p.name != path.name]
+        assert leftovers == []
+
+    def test_compact_removes_stale_temp_from_earlier_crash(self, tmp_path: Path) -> None:
+        path = tmp_path / "ws.duckdb"
+        stale = tmp_path / "ws.duckdb.compacting"
+        stale.write_bytes(b"garbage from an interrupted compact")
+        with Workspace(path, mode="rw") as ws:
+            ws.compact()
+        assert not stale.exists()
