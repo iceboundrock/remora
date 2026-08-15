@@ -209,13 +209,13 @@ class Workspace:
     def compact(self) -> None:
         """Rewrite the workspace file to reclaim space.
 
-        Deleted data does not shrink a DuckDB file, so this copies every
-        schema, table and row into ``<name>.compacting`` beside the
-        original (same directory, so the final rename never crosses a
-        filesystem) and atomically swaps it in with :func:`os.replace`.
-        The original is only ever replaced whole: an interruption at any
-        point leaves it intact, and at worst a stale temp file that the
-        next compact removes.
+        A checkpoint only truncates trailing free blocks, so a file stays
+        large after scattered deletes; this copies every schema, table and
+        row into ``<name>.compacting`` beside the original (same directory,
+        so the final rename never crosses a filesystem) and atomically
+        swaps it in with :func:`os.replace`. The original is only ever
+        replaced whole: an interruption at any point leaves it intact, and
+        at worst a stale temp file that the next compact removes.
 
         Raises:
             WorkspaceModeError: In ro mode; reopen with

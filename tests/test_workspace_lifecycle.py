@@ -197,7 +197,8 @@ class TestCompact:
         with ws.write() as con:
             con.execute(
                 "INSERT INTO pkts (frame_number, frame_time) "
-                "SELECT range, TIMESTAMP '2024-01-01 00:00:00' "
+                "SELECT (hash(range) >> 1)::BIGINT, "
+                "TIMESTAMP '2024-01-01 00:00:00' + INTERVAL (range % 86400) SECOND "
                 f"FROM range({rows})"
             )
 
@@ -211,20 +212,25 @@ class TestCompact:
     def test_compact_reclaims_space_after_delete(self, tmp_path: Path) -> None:
         path = tmp_path / "ws.duckdb"
         with Workspace(path, mode="rw") as ws:
-            self._bulk_fill(ws, 500000)
+            self._bulk_fill(ws, 2000000)
             size_full = path.stat().st_size
             with ws.write() as con:
-                con.execute("DELETE FROM pkts")
-            # Deleted data does not shrink a DuckDB file.
+                con.execute("DELETE FROM pkts WHERE frame_number % 128 != 0")
+                row = con.execute("SELECT count(*) FROM pkts").fetchone()
+                assert row is not None
+                kept = row[0]
+            assert 0 < kept < 100000
+            # A scattered delete leaves interior free blocks that a
+            # checkpoint cannot truncate, so the file stays large.
             size_after_delete = path.stat().st_size
-            assert size_after_delete >= size_full // 10
+            assert size_after_delete >= size_full // 2
             ws.compact()
             size_after_compact = path.stat().st_size
             assert size_after_compact < size_after_delete // 2
             with ws.read() as con:
                 row = con.execute("SELECT count(*) FROM pkts").fetchone()
                 assert row is not None
-                assert row[0] == 0
+                assert row[0] == kept
 
     def test_compact_preserves_data_and_catalog(self, tmp_path: Path) -> None:
         path = tmp_path / "ws.duckdb"
