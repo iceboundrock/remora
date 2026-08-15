@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from remora.workspace.errors import SchemaVersionError, WorkspaceError
+from remora.workspace.errors import SchemaVersionError, WorkspaceError, WorkspaceModeError
 from remora.workspace.schema import SCHEMA_VERSION
 from remora.workspace.workspace import Workspace
 
@@ -77,6 +77,15 @@ class TestLifecycle:
         with Workspace(path, mode="rw") as ws, pytest.raises(WorkspaceError, match="already open"):
             ws.open()
 
+    def test_reopen_after_close_raises(self, tmp_path: Path) -> None:
+        path = tmp_path / "ws.duckdb"
+        ws = Workspace(path, mode="rw")
+        with ws:
+            pass
+        with pytest.raises(WorkspaceError, match="not open"):  # noqa: SIM117
+            with ws.read():
+                pass
+
 
 class TestNoModuleLevelConnection:
     def test_import_does_not_import_duckdb(self) -> None:
@@ -93,3 +102,90 @@ class TestNoModuleLevelConnection:
         path = tmp_path / "ws.duckdb"
         Workspace(path, mode="rw")
         assert not path.exists()
+
+
+def _subprocess_read(path: Path) -> subprocess.CompletedProcess[bytes]:
+    """Read pkts from another process over a read-only connection."""
+    code = (
+        "import duckdb, sys; "
+        "con = duckdb.connect(sys.argv[1], read_only=True); "
+        "print(con.execute('SELECT count(*) FROM pkts').fetchone()[0]); "
+        "con.close()"
+    )
+    return subprocess.run(
+        [sys.executable, "-c", code, str(path)],
+        check=True,
+        capture_output=True,
+        timeout=60,
+    )
+
+
+class TestLockDiscipline:
+    def test_write_in_ro_mode_raises(self, tmp_path: Path) -> None:
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw"):
+            pass
+        with Workspace(path) as ws:  # noqa: SIM117
+            with pytest.raises(WorkspaceModeError, match="mode='rw'"):
+                with ws.write():
+                    pass
+
+    def test_read_in_ro_mode(self, tmp_path: Path) -> None:
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw"):
+            pass
+        with Workspace(path) as ws:  # noqa: SIM117
+            with ws.read() as con:
+                row = con.execute("SELECT count(*) FROM pkts").fetchone()
+                assert row is not None
+                assert row[0] == 0
+
+    def test_write_then_read_roundtrip(self, tmp_path: Path) -> None:
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw") as ws:
+            with ws.write() as con:
+                con.execute(
+                    "INSERT INTO pkts (frame_number, frame_time) "
+                    "VALUES (1, TIMESTAMP '2024-01-01 00:00:00')"
+                )
+            with ws.read() as con:
+                row = con.execute("SELECT count(*) FROM pkts").fetchone()
+                assert row is not None
+                assert row[0] == 1
+
+    def test_write_rolls_back_on_error(self, tmp_path: Path) -> None:
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw") as ws:
+            with pytest.raises(RuntimeError, match="boom"):  # noqa: SIM117
+                with ws.write() as con:
+                    con.execute(
+                        "INSERT INTO pkts (frame_number, frame_time) "
+                        "VALUES (1, TIMESTAMP '2024-01-01 00:00:00')"
+                    )
+                    raise RuntimeError("boom")
+            with ws.read() as con:
+                row = con.execute("SELECT count(*) FROM pkts").fetchone()
+                assert row is not None
+                assert row[0] == 0
+
+    def test_idle_ro_workspace_allows_second_process_read(self, tmp_path: Path) -> None:
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw"):
+            pass
+        with Workspace(path):
+            # The held read-only connection takes only a shared lock.
+            result = _subprocess_read(path)
+            assert result.stdout.strip() == b"0"
+
+    def test_idle_rw_workspace_allows_second_process_read(self, tmp_path: Path) -> None:
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw") as ws:
+            with ws.write() as con:
+                con.execute(
+                    "INSERT INTO pkts (frame_number, frame_time) "
+                    "VALUES (1, TIMESTAMP '2024-01-01 00:00:00')"
+                )
+            # The write lock was released at the end of write(): another
+            # process can read while this Workspace object still exists.
+            result = _subprocess_read(path)
+            assert result.stdout.strip() == b"1"

@@ -17,11 +17,13 @@ in, so an interrupted compact always leaves the original intact.
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from types import TracebackType
 from typing import TYPE_CHECKING, Literal
 
-from remora.workspace.errors import WorkspaceError
+from remora.workspace.errors import WorkspaceError, WorkspaceModeError
 from remora.workspace.schema import check_compatible, create_schema
 
 if TYPE_CHECKING:
@@ -151,6 +153,58 @@ class Workspace:
     def _require_open(self) -> None:
         if not self._opened:
             raise WorkspaceError("workspace is not open; use it as a context manager")
+
+    @contextmanager
+    def read(self) -> Iterator[DuckDBPyConnection]:
+        """Yield a connection for reading.
+
+        In ro mode this is the workspace's held read-only connection. In
+        rw mode it is a short-lived connection opened for this read and
+        closed on exit — opened read-write, not read-only, because DuckDB
+        refuses two live same-process connections to one file with
+        different configurations, and a caller may nest a read inside
+        :meth:`write`.
+        """
+        self._require_open()
+        if self._mode == "ro":
+            assert self._con is not None
+            yield self._con
+            return
+        con = _connect(str(self._path), read_only=False)
+        try:
+            yield con
+        finally:
+            con.close()
+
+    @contextmanager
+    def write(self) -> Iterator[DuckDBPyConnection]:
+        """Yield a short-lived read-write connection wrapping one transaction.
+
+        The transaction commits on clean exit and rolls back on exception;
+        the connection closes either way, releasing DuckDB's exclusive
+        write lock promptly so other processes can read between writes.
+
+        Raises:
+            WorkspaceModeError: In ro mode; reopen with
+                ``Workspace(path, mode='rw')`` to write.
+        """
+        self._require_open()
+        if self._mode == "ro":
+            raise WorkspaceModeError(
+                f"workspace {self._path} is open read-only; reopen with "
+                f"Workspace(path, mode='rw') to write"
+            )
+        con = _connect(str(self._path), read_only=False)
+        try:
+            con.execute("BEGIN")
+            try:
+                yield con
+            except BaseException:
+                con.execute("ROLLBACK")
+                raise
+            con.execute("COMMIT")
+        finally:
+            con.close()
 
     @staticmethod
     def _is_empty(con: DuckDBPyConnection) -> bool:
