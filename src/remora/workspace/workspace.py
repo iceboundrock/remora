@@ -9,9 +9,12 @@ processes between writes. Nothing at module level opens or caches a
 connection, and duckdb itself is imported lazily inside the connect
 helper, keeping the package import-pure like its siblings.
 
-Deleted data does not shrink a DuckDB file; :meth:`Workspace.compact`
-reclaims space by rewriting into a temp file and atomically swapping it
-in, so an interrupted compact always leaves the original intact.
+A DuckDB checkpoint truncates only *trailing* free blocks, so deleting
+everything largely shrinks the file on its own while scattered deletes
+leave interior free blocks the file keeps forever;
+:meth:`Workspace.compact` reclaims those by rewriting into a temp file
+and atomically swapping it in, so an interrupted compact always leaves
+the original intact.
 """
 
 from __future__ import annotations
@@ -215,7 +218,8 @@ class Workspace:
         so the final rename never crosses a filesystem) and atomically
         swaps it in with :func:`os.replace`. The original is only ever
         replaced whole: an interruption at any point leaves it intact, and
-        at worst a stale temp file that the next compact removes.
+        at worst a stale temp file — plus the ``.wal`` sidecar a hard kill
+        mid-copy can leave beside it — that the next compact removes.
 
         Raises:
             WorkspaceModeError: In ro mode; reopen with
@@ -228,7 +232,9 @@ class Workspace:
                 f"Workspace(path, mode='rw') to compact"
             )
         tmp = self._path.with_name(self._path.name + ".compacting")
+        tmp_wal = tmp.with_name(tmp.name + ".wal")
         tmp.unlink(missing_ok=True)
+        tmp_wal.unlink(missing_ok=True)
         try:
             con = _connect(":memory:", read_only=False)
             try:
@@ -240,6 +246,7 @@ class Workspace:
             os.replace(tmp, self._path)
         except BaseException:
             tmp.unlink(missing_ok=True)
+            tmp_wal.unlink(missing_ok=True)
             raise
 
     @staticmethod
