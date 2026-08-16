@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+import remora.workspace.workspace as workspace_module
 from remora.workspace.errors import SchemaVersionError, WorkspaceError, WorkspaceModeError
 from remora.workspace.schema import SCHEMA_VERSION
 from remora.workspace.workspace import Workspace
@@ -102,6 +105,15 @@ class TestNoModuleLevelConnection:
         path = tmp_path / "ws.duckdb"
         Workspace(path, mode="rw")
         assert not path.exists()
+
+    def test_missing_duckdb_raises_helpful_importerror(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A None entry in sys.modules makes `import duckdb` raise, which is
+        # what an uninstalled extra looks like from inside the helper.
+        monkeypatch.setitem(sys.modules, "duckdb", None)
+        with pytest.raises(ImportError, match=r"remora\[workspace\]"):
+            Workspace(tmp_path / "ws.duckdb", mode="rw").open()
 
 
 def _subprocess_read(path: Path) -> subprocess.CompletedProcess[bytes]:
@@ -291,7 +303,97 @@ class TestCompact:
     def test_compact_removes_stale_temp_from_earlier_crash(self, tmp_path: Path) -> None:
         path = tmp_path / "ws.duckdb"
         stale = tmp_path / "ws.duckdb.compacting"
+        stale_wal = tmp_path / "ws.duckdb.compacting.wal"
         stale.write_bytes(b"garbage from an interrupted compact")
+        stale_wal.write_bytes(b"garbage wal from an interrupted compact")
         with Workspace(path, mode="rw") as ws:
             ws.compact()
         assert not stale.exists()
+        assert not stale_wal.exists()
+
+    def test_compact_swap_holds_exclusive_lock(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw") as ws:
+            with ws.write() as con:
+                con.execute(
+                    "INSERT INTO pkts (frame_number, frame_time) "
+                    "VALUES (1, TIMESTAMP '2024-01-01 00:00:00')"
+                )
+            real_replace = os.replace
+            probed: list[bytes] = []
+
+            def probing_replace(src: object, dst: object) -> None:
+                # A second-process writer must be locked out at the moment
+                # of the swap; otherwise its commit could be overwritten.
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        "import duckdb, sys; duckdb.connect(sys.argv[1], read_only=False)",
+                        str(path),
+                    ],
+                    capture_output=True,
+                    timeout=60,
+                )
+                assert result.returncode != 0
+                assert b"lock" in result.stderr.lower()
+                probed.append(result.stderr)
+                real_replace(src, dst)  # type: ignore[arg-type]
+
+            monkeypatch.setattr("remora.workspace.workspace.os.replace", probing_replace)
+            ws.compact()
+            monkeypatch.undo()
+            assert len(probed) == 1
+            with ws.read() as con:
+                row = con.execute("SELECT count(*) FROM pkts").fetchone()
+                assert row is not None
+                assert row[0] == 1
+
+    def test_compact_refuses_inflight_write(self, tmp_path: Path) -> None:
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw") as ws:
+            with ws.write(), pytest.raises(WorkspaceError, match="in flight"):
+                ws.compact()
+            # The guard resets once the write finishes.
+            ws.compact()
+
+    def test_copy_stage_failure_leaves_original_intact(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw") as ws:
+            with ws.write() as con:
+                con.execute(
+                    "INSERT INTO pkts (frame_number, frame_time) "
+                    "VALUES (7, TIMESTAMP '2024-01-01 00:00:00')"
+                )
+            real_connect = workspace_module._connect
+
+            class _CopyBomb:
+                def __init__(self, real: Any) -> None:
+                    self._real = real
+
+                def execute(self, sql: str, *args: object) -> object:
+                    if sql.startswith("COPY FROM DATABASE"):
+                        raise RuntimeError("simulated crash during copy")
+                    return self._real.execute(sql, *args)
+
+                def close(self) -> None:
+                    self._real.close()
+
+            def bombed_connect(path_: str, *, read_only: bool) -> Any:
+                return _CopyBomb(real_connect(path_, read_only=read_only))
+
+            monkeypatch.setattr(workspace_module, "_connect", bombed_connect)
+            with pytest.raises(RuntimeError, match="simulated crash during copy"):
+                ws.compact()
+            monkeypatch.undo()
+            leftovers = [p.name for p in tmp_path.iterdir() if p.name != path.name]
+            assert leftovers == []
+            with ws.read() as con:
+                row = con.execute("SELECT count(*) FROM pkts").fetchone()
+                assert row is not None
+                assert row[0] == 1
+            ws.compact()

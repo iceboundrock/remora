@@ -13,8 +13,9 @@ A DuckDB checkpoint truncates only *trailing* free blocks, so deleting
 everything largely shrinks the file on its own while scattered deletes
 leave interior free blocks the file keeps forever;
 :meth:`Workspace.compact` reclaims those by rewriting into a temp file
-and atomically swapping it in, so an interrupted compact always leaves
-the original intact.
+and atomically swapping it in, holding the source's exclusive lock
+across both steps so a concurrent writer cannot slip a commit into the
+gap, and so an interrupted compact always leaves the original intact.
 """
 
 from __future__ import annotations
@@ -60,6 +61,11 @@ def _quote_path(path: str) -> str:
     return path.replace("'", "''")
 
 
+def _quote_ident(name: str) -> str:
+    """Quote a SQL identifier, escaping embedded double quotes."""
+    return '"' + name.replace('"', '""') + '"'
+
+
 class Workspace:
     """A remora workspace file and the discipline for connecting to it.
 
@@ -81,6 +87,10 @@ class Workspace:
         # Held only in ro mode; rw mode never keeps a connection open.
         self._con: DuckDBPyConnection | None = None
         self._opened = False
+        # Count of write()/rw-read() bodies currently executing; compact()
+        # refuses while nonzero, since it would swap the file out from
+        # under a connection this process is still using.
+        self._busy = 0
 
     @property
     def path(self) -> Path:
@@ -175,11 +185,15 @@ class Workspace:
             assert self._con is not None
             yield self._con
             return
-        con = _connect(str(self._path), read_only=False)
+        self._busy += 1
         try:
-            yield con
+            con = _connect(str(self._path), read_only=False)
+            try:
+                yield con
+            finally:
+                con.close()
         finally:
-            con.close()
+            self._busy -= 1
 
     @contextmanager
     def write(self) -> Iterator[DuckDBPyConnection]:
@@ -199,17 +213,21 @@ class Workspace:
                 f"workspace {self._path} is open read-only; reopen with "
                 f"Workspace(path, mode='rw') to write"
             )
-        con = _connect(str(self._path), read_only=False)
+        self._busy += 1
         try:
-            con.execute("BEGIN")
+            con = _connect(str(self._path), read_only=False)
             try:
-                yield con
-            except BaseException:
-                con.execute("ROLLBACK")
-                raise
-            con.execute("COMMIT")
+                con.execute("BEGIN")
+                try:
+                    yield con
+                except BaseException:
+                    con.execute("ROLLBACK")
+                    raise
+                con.execute("COMMIT")
+            finally:
+                con.close()
         finally:
-            con.close()
+            self._busy -= 1
 
     def compact(self) -> None:
         """Rewrite the workspace file to reclaim space.
@@ -223,14 +241,26 @@ class Workspace:
         at worst a stale temp file — plus the ``.wal`` sidecar a hard kill
         mid-copy can leave beside it — that the next compact removes.
 
-        This operation must not be called while a :meth:`write` (or
-        rw-mode :meth:`read`) on the same workspace is in flight; the
-        read-only attach of the source would fail against the live
-        connection's exclusive lock.
+        The copy runs on a read-write connection to the source and the
+        swap happens while that connection is still open, so the source's
+        exclusive lock is held across both. Other processes — readers as
+        well as writers — are locked out for compact's whole duration and
+        fail fast on the lock rather than losing data: a concurrent
+        writer either commits before compaction begins (and is copied) or
+        cannot connect until the swap is done, so no commit can land
+        between the snapshot and the rename and be silently discarded.
+
+        A :meth:`write` or rw-mode :meth:`read` in flight on this
+        workspace raises :class:`WorkspaceError` instead, since the
+        same-process connections share one DuckDB instance and would not
+        hit the lock. Other :class:`Workspace` objects or threads in this
+        process are still the caller's responsibility.
 
         Raises:
             WorkspaceModeError: In ro mode; reopen with
                 ``Workspace(path, mode='rw')`` to compact.
+            WorkspaceError: If a :meth:`write` or rw-mode :meth:`read` on
+                this workspace is in flight.
         """
         self._require_open()
         if self._mode == "ro":
@@ -238,19 +268,31 @@ class Workspace:
                 f"workspace {self._path} is open read-only; reopen with "
                 f"Workspace(path, mode='rw') to compact"
             )
+        if self._busy:
+            raise WorkspaceError(
+                f"workspace {self._path} has a write() or read() in flight; "
+                f"compact() would swap the file out from under it"
+            )
         tmp = self._path.with_name(self._path.name + ".compacting")
         tmp_wal = tmp.with_name(tmp.name + ".wal")
         tmp.unlink(missing_ok=True)
         tmp_wal.unlink(missing_ok=True)
         try:
-            con = _connect(":memory:", read_only=False)
+            # Hold the source's exclusive lock through both the copy and
+            # the swap: a writer in another process either commits before
+            # the lock is taken (and is copied) or cannot connect until the
+            # swap is done, so no commit can land between the snapshot and
+            # os.replace and be silently discarded.
+            con = _connect(str(self._path), read_only=False)
             try:
-                con.execute(f"ATTACH '{_quote_path(str(self._path))}' AS src (READ_ONLY)")
-                con.execute(f"ATTACH '{_quote_path(str(tmp))}' AS dst")
-                con.execute("COPY FROM DATABASE src TO dst")
+                row = con.execute("SELECT current_database()").fetchone()
+                assert row is not None
+                con.execute(f"ATTACH '{_quote_path(str(tmp))}' AS compact_dst")
+                con.execute(f"COPY FROM DATABASE {_quote_ident(str(row[0]))} TO compact_dst")
+                con.execute("DETACH compact_dst")
+                os.replace(tmp, self._path)
             finally:
                 con.close()
-            os.replace(tmp, self._path)
         except BaseException:
             tmp.unlink(missing_ok=True)
             tmp_wal.unlink(missing_ok=True)
