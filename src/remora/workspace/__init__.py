@@ -4,8 +4,8 @@ The workspace persists projected tshark output in DuckDB native storage. This
 package owns the storage layout (:mod:`remora.workspace.schema`), the
 column-name policy (:mod:`remora.workspace.naming`), the ftype -> column
 type map (:mod:`remora.workspace.types`) and the cache-key computation
-(:mod:`remora.workspace.cachekey`); connection and lock ownership
-(:mod:`remora.workspace.workspace`, the ``Workspace`` class).
+(:mod:`remora.workspace.cachekey`); connection and lock ownership lives in
+:mod:`remora.workspace.workspace`'s ``Workspace`` class (#28).
 
 DuckDB is an optional dependency — install it with ``pip install
 'remora[workspace]'``. The modules here are import-pure: they annotate

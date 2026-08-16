@@ -166,7 +166,9 @@ class Workspace:
         closed on exit — opened read-write, not read-only, because DuckDB
         refuses two live same-process connections to one file with
         different configurations, and a caller may nest a read inside
-        :meth:`write`.
+        :meth:`write`. Callers must not write through the yielded
+        connection; writes go through :meth:`write`, which owns the
+        one-transaction discipline.
         """
         self._require_open()
         if self._mode == "ro":
@@ -220,6 +222,11 @@ class Workspace:
         replaced whole: an interruption at any point leaves it intact, and
         at worst a stale temp file — plus the ``.wal`` sidecar a hard kill
         mid-copy can leave beside it — that the next compact removes.
+
+        This operation must not be called while a :meth:`write` (or
+        rw-mode :meth:`read`) on the same workspace is in flight; the
+        read-only attach of the source would fail against the live
+        connection's exclusive lock.
 
         Raises:
             WorkspaceModeError: In ro mode; reopen with
