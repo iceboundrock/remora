@@ -249,6 +249,9 @@ class Workspace:
         writer either commits before compaction begins (and is copied) or
         cannot connect until the swap is done, so no commit can land
         between the snapshot and the rename and be silently discarded.
+        Conversely, compaction needs sole access: if any other process —
+        even a read-only reader — is already connected when it starts, the
+        connect fails with DuckDB's lock error and nothing is modified.
 
         A :meth:`write` or rw-mode :meth:`read` in flight on this
         workspace raises :class:`WorkspaceError` instead, since the
