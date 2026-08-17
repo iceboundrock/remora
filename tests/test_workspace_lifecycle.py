@@ -78,6 +78,41 @@ class TestLifecycle:
         with pytest.raises(SchemaVersionError, match="newer"):
             Workspace(path, mode="rw").open()
 
+    @pytest.mark.parametrize(
+        "ddl",
+        [
+            "CREATE VIEW foreign_view AS SELECT 1",
+            "CREATE SEQUENCE foreign_seq",
+            "CREATE MACRO foreign_macro() AS 42",
+            "CREATE TYPE foreign_type AS ENUM ('x')",
+            "CREATE SCHEMA foreign_schema",
+        ],
+        ids=["view", "sequence", "macro", "type", "schema"],
+    )
+    def test_rw_rejects_foreign_database_without_tables(self, tmp_path: Path, ddl: str) -> None:
+        # A foreign database is not necessarily betrayed by a table: a file
+        # holding only a view (the reviewer's reproduction), a sequence, a
+        # macro, a type or a schema is foreign all the same, and _is_empty
+        # counting only duckdb_tables() used to classify it as fresh, graft
+        # the remora schema onto it, and accept it.
+        path = tmp_path / "foreign.duckdb"
+        con = duckdb.connect(str(path))
+        con.execute(ddl)
+        con.close()
+        with pytest.raises(SchemaVersionError, match="not a remora workspace"):
+            Workspace(path, mode="rw").open()
+        # Refused means untouched: no remora catalog was created.
+        con = duckdb.connect(str(path), read_only=True)
+        try:
+            row = con.execute(
+                "SELECT count(*) FROM duckdb_schemas() "
+                "WHERE database_name = current_database() AND schema_name = 'meta'"
+            ).fetchone()
+            assert row is not None
+            assert row[0] == 0
+        finally:
+            con.close()
+
     def test_double_open_raises(self, tmp_path: Path) -> None:
         path = tmp_path / "ws.duckdb"
         with Workspace(path, mode="rw") as ws, pytest.raises(WorkspaceError, match="already open"):

@@ -561,13 +561,39 @@ class Workspace:
 
     @staticmethod
     def _is_empty(con: DuckDBPyConnection) -> bool:
-        """True when the current database holds no tables at all.
+        """True when the current database holds no user objects at all.
 
-        Pinned to ``current_database()`` like every catalog probe in
+        A foreign database is not necessarily betrayed by a table: a file
+        holding only a view, sequence, macro, user type or schema is
+        foreign all the same, and counting only ``duckdb_tables()`` would
+        classify it as fresh and graft the remora schema onto it. So this
+        counts every user-creatable catalog object; ``internal`` objects
+        (the ``main`` schema itself, built-in functions and types) are
+        DuckDB's own and present in a truly fresh file. Indexes need a
+        table, so tables cover them. Every probe is pinned to
+        ``current_database()`` like the catalog probes in
         :mod:`remora.workspace.schema`, so an attached database cannot
         make a fresh file look populated.
         """
         row = con.execute(
-            "SELECT count(*) FROM duckdb_tables() WHERE database_name = current_database()"
+            """
+            SELECT count(*) FROM (
+                SELECT 1 FROM duckdb_tables() WHERE database_name = current_database()
+                UNION ALL
+                SELECT 1 FROM duckdb_views()
+                    WHERE database_name = current_database() AND NOT internal
+                UNION ALL
+                SELECT 1 FROM duckdb_sequences() WHERE database_name = current_database()
+                UNION ALL
+                SELECT 1 FROM duckdb_schemas()
+                    WHERE database_name = current_database() AND NOT internal
+                UNION ALL
+                SELECT 1 FROM duckdb_functions()
+                    WHERE database_name = current_database() AND NOT internal
+                UNION ALL
+                SELECT 1 FROM duckdb_types()
+                    WHERE database_name = current_database() AND NOT internal
+            )
+            """
         ).fetchone()
         return row is None or int(row[0]) == 0

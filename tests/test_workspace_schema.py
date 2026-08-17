@@ -49,10 +49,18 @@ DDL_TARGET = re.compile(
 )
 
 # Files under src/ and tests/ exempt from the file-level DDL rule below. A file
-# qualifies only if every DDL statement in it creates a throwaway probe table on
-# a bare in-memory connection — never a workspace table, which the name-level
-# rule enforces separately and without exemption.
-DDL_SCRATCH_FILES = frozenset({REPO_ROOT / "tests" / "test_workspace_types.py"})
+# qualifies only if every DDL statement in it creates a throwaway probe object —
+# never a workspace-layout name, which the name-level rule enforces separately
+# and without exemption. test_workspace_types.py probes column types on tables
+# it creates on a bare in-memory connection; test_workspace_lifecycle.py plants
+# foreign objects (a view, a schema) in throwaway files precisely to pin that
+# rw open() refuses a foreign database instead of grafting the layout onto it.
+DDL_SCRATCH_FILES = frozenset(
+    {
+        REPO_ROOT / "tests" / "test_workspace_types.py",
+        REPO_ROOT / "tests" / "test_workspace_lifecycle.py",
+    }
+)
 
 EXPECTED_TABLES = {
     ("main", "pkts"),
