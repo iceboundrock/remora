@@ -16,16 +16,23 @@ leave interior free blocks the file keeps forever;
 and atomically swapping it in, holding the source's exclusive lock
 across both steps so a concurrent writer cannot slip a commit into the
 gap, and so an interrupted compact always leaves the original intact.
+
+The file lock cannot arbitrate *within* one process — same-process
+connections to one file share DuckDB's database instance — so a
+module-level registry keyed by the file's real path makes writes and
+compaction mutually exclusive across every :class:`Workspace` object and
+thread here. It holds plain counters and flags, never a connection.
 """
 
 from __future__ import annotations
 
 import os
+import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from types import TracebackType
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Final, Literal
 
 from remora.workspace.errors import WorkspaceError, WorkspaceModeError
 from remora.workspace.schema import check_compatible, create_schema
@@ -38,6 +45,63 @@ __all__ = ["Workspace"]
 Mode = Literal["ro", "rw"]
 
 _MODES: tuple[Mode, ...] = ("ro", "rw")
+
+
+class _FileState:
+    """Per-file coordination shared by every Workspace in this process."""
+
+    __slots__ = ("busy", "compacting")
+
+    def __init__(self) -> None:
+        self.busy = 0  # write()/rw-read() bodies currently executing
+        self.compacting = False
+
+
+# Same-process connections to one file share DuckDB's database instance, so
+# the file lock cannot arbitrate between Workspace objects in this process.
+# This registry does; it holds plain counters and flags, never a connection.
+_FILE_STATES: Final[dict[str, _FileState]] = {}
+_FILE_STATES_GUARD: Final[threading.Lock] = threading.Lock()
+
+
+def _acquire_write_slot(key: str) -> None:
+    with _FILE_STATES_GUARD:
+        state = _FILE_STATES.setdefault(key, _FileState())
+        if state.compacting:
+            raise WorkspaceError(
+                f"a compact() is in progress on {key}; writes and rw-mode "
+                f"reads fail fast until it finishes"
+            )
+        state.busy += 1
+
+
+def _release_write_slot(key: str) -> None:
+    with _FILE_STATES_GUARD:
+        state = _FILE_STATES[key]
+        state.busy -= 1
+        if state.busy == 0 and not state.compacting:
+            del _FILE_STATES[key]
+
+
+def _begin_compact(key: str) -> None:
+    with _FILE_STATES_GUARD:
+        state = _FILE_STATES.setdefault(key, _FileState())
+        if state.busy:
+            raise WorkspaceError(
+                f"workspace {key} has a write() or read() in flight; "
+                f"compact() would swap the file out from under it"
+            )
+        if state.compacting:
+            raise WorkspaceError(f"another compact() is already in progress on {key}")
+        state.compacting = True
+
+
+def _end_compact(key: str) -> None:
+    with _FILE_STATES_GUARD:
+        state = _FILE_STATES[key]
+        state.compacting = False
+        if state.busy == 0:
+            del _FILE_STATES[key]
 
 
 def _connect(path: str, *, read_only: bool) -> DuckDBPyConnection:
@@ -87,10 +151,9 @@ class Workspace:
         # Held only in ro mode; rw mode never keeps a connection open.
         self._con: DuckDBPyConnection | None = None
         self._opened = False
-        # Count of write()/rw-read() bodies currently executing; compact()
-        # refuses while nonzero, since it would swap the file out from
-        # under a connection this process is still using.
-        self._busy = 0
+        # Symlink-stable identity, so two Workspace objects aliasing one
+        # file coordinate through the same registry entry.
+        self._key: str = os.path.realpath(self._path)
 
     @property
     def path(self) -> Path:
@@ -179,13 +242,18 @@ class Workspace:
         :meth:`write`. Callers must not write through the yielded
         connection; writes go through :meth:`write`, which owns the
         one-transaction discipline.
+
+        Raises:
+            WorkspaceError: In rw mode, if a :meth:`compact` on this file is
+                in progress anywhere in this process — mirroring the
+                fail-fast lock error a second process gets.
         """
         self._require_open()
         if self._mode == "ro":
             assert self._con is not None
             yield self._con
             return
-        self._busy += 1
+        _acquire_write_slot(self._key)
         try:
             con = _connect(str(self._path), read_only=False)
             try:
@@ -193,7 +261,7 @@ class Workspace:
             finally:
                 con.close()
         finally:
-            self._busy -= 1
+            _release_write_slot(self._key)
 
     @contextmanager
     def write(self) -> Iterator[DuckDBPyConnection]:
@@ -206,6 +274,9 @@ class Workspace:
         Raises:
             WorkspaceModeError: In ro mode; reopen with
                 ``Workspace(path, mode='rw')`` to write.
+            WorkspaceError: If a :meth:`compact` on this file is in progress
+                anywhere in this process — mirroring the fail-fast lock
+                error a second process gets.
         """
         self._require_open()
         if self._mode == "ro":
@@ -213,7 +284,7 @@ class Workspace:
                 f"workspace {self._path} is open read-only; reopen with "
                 f"Workspace(path, mode='rw') to write"
             )
-        self._busy += 1
+        _acquire_write_slot(self._key)
         try:
             con = _connect(str(self._path), read_only=False)
             try:
@@ -227,7 +298,7 @@ class Workspace:
             finally:
                 con.close()
         finally:
-            self._busy -= 1
+            _release_write_slot(self._key)
 
     def compact(self) -> None:
         """Rewrite the workspace file to reclaim space.
@@ -252,18 +323,28 @@ class Workspace:
         Conversely, compaction needs sole access: if any other process —
         even a read-only reader — is already connected when it starts, the
         connect fails with DuckDB's lock error and nothing is modified.
+        Cleanup of stale artifacts from an earlier crash happens only
+        *after* that exclusive lock is held, so a compact that loses the
+        lock modifies nothing at all — including another process's
+        in-flight temp file.
 
-        A :meth:`write` or rw-mode :meth:`read` in flight on this
-        workspace raises :class:`WorkspaceError` instead, since the
-        same-process connections share one DuckDB instance and would not
-        hit the lock. Other :class:`Workspace` objects or threads in this
-        process are still the caller's responsibility.
+        Within this process the file lock cannot arbitrate, since
+        same-process connections share one DuckDB instance; a module-level
+        registry does instead. A :meth:`write` or rw-mode :meth:`read` in
+        flight on *any* :class:`Workspace` for this file raises
+        :class:`WorkspaceError` here, a second concurrent :meth:`compact`
+        is rejected the same way, and for compact's duration writers and
+        rw-mode readers fail fast exactly as a second process does on the
+        lock.
 
         Raises:
             WorkspaceModeError: In ro mode; reopen with
                 ``Workspace(path, mode='rw')`` to compact.
             WorkspaceError: If a :meth:`write` or rw-mode :meth:`read` on
-                this workspace is in flight.
+                this file is in flight in this process, if another
+                :meth:`compact` is already running, or if the swap itself
+                fails — on Windows a rename over a file held open by this
+                process is refused, a known POSIX-first limitation (#85).
         """
         self._require_open()
         if self._mode == "ro":
@@ -271,35 +352,46 @@ class Workspace:
                 f"workspace {self._path} is open read-only; reopen with "
                 f"Workspace(path, mode='rw') to compact"
             )
-        if self._busy:
-            raise WorkspaceError(
-                f"workspace {self._path} has a write() or read() in flight; "
-                f"compact() would swap the file out from under it"
-            )
-        tmp = self._path.with_name(self._path.name + ".compacting")
-        tmp_wal = tmp.with_name(tmp.name + ".wal")
-        tmp.unlink(missing_ok=True)
-        tmp_wal.unlink(missing_ok=True)
+        _begin_compact(self._key)
         try:
+            tmp = self._path.with_name(self._path.name + ".compacting")
+            tmp_wal = tmp.with_name(tmp.name + ".wal")
             # Hold the source's exclusive lock through both the copy and
             # the swap: a writer in another process either commits before
             # the lock is taken (and is copied) or cannot connect until the
             # swap is done, so no commit can land between the snapshot and
-            # os.replace and be silently discarded.
+            # os.replace and be silently discarded. Connect first, before
+            # touching anything on disk, so a lock-conflicted compact
+            # leaves even another process's in-flight temp file alone.
             con = _connect(str(self._path), read_only=False)
             try:
-                row = con.execute("SELECT current_database()").fetchone()
-                assert row is not None
-                con.execute(f"ATTACH '{_quote_path(str(tmp))}' AS compact_dst")
-                con.execute(f"COPY FROM DATABASE {_quote_ident(str(row[0]))} TO compact_dst")
-                con.execute("DETACH compact_dst")
-                os.replace(tmp, self._path)
-            finally:
-                con.close()
-        except BaseException:
-            tmp.unlink(missing_ok=True)
-            tmp_wal.unlink(missing_ok=True)
-            raise
+                try:
+                    # Now that the lock is ours, any temp beside the source
+                    # is debris from an earlier crash, never a live compact.
+                    tmp.unlink(missing_ok=True)
+                    tmp_wal.unlink(missing_ok=True)
+                    row = con.execute("SELECT current_database()").fetchone()
+                    assert row is not None
+                    con.execute(f"ATTACH '{_quote_path(str(tmp))}' AS compact_dst")
+                    con.execute(f"COPY FROM DATABASE {_quote_ident(str(row[0]))} TO compact_dst")
+                    con.execute("DETACH compact_dst")
+                    try:
+                        os.replace(tmp, self._path)
+                    except PermissionError as exc:
+                        raise WorkspaceError(
+                            "compact() could not swap the rewritten file into place; "
+                            "on Windows the swap-under-lock is a known limitation (#85)"
+                        ) from exc
+                finally:
+                    con.close()
+            except BaseException:
+                # Only artifacts this compact created: the connect above
+                # succeeded, so nothing here belongs to another process.
+                tmp.unlink(missing_ok=True)
+                tmp_wal.unlink(missing_ok=True)
+                raise
+        finally:
+            _end_compact(self._key)
 
     @staticmethod
     def _is_empty(con: DuckDBPyConnection) -> bool:

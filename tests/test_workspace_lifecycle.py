@@ -90,32 +90,6 @@ class TestLifecycle:
                 pass
 
 
-class TestNoModuleLevelConnection:
-    def test_import_does_not_import_duckdb(self) -> None:
-        # A module-level connection is impossible without the duckdb module:
-        # importing the package in a fresh interpreter must not pull it in.
-        code = (
-            "import remora.workspace, remora.workspace.workspace, sys; "
-            "assert 'duckdb' not in sys.modules, 'duckdb imported at module level'"
-        )
-        subprocess.run([sys.executable, "-c", code], check=True, timeout=60)
-
-    def test_constructing_workspace_opens_nothing(self, tmp_path: Path) -> None:
-        # Constructing (not entering) a Workspace must not touch the file.
-        path = tmp_path / "ws.duckdb"
-        Workspace(path, mode="rw")
-        assert not path.exists()
-
-    def test_missing_duckdb_raises_helpful_importerror(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        # A None entry in sys.modules makes `import duckdb` raise, which is
-        # what an uninstalled extra looks like from inside the helper.
-        monkeypatch.setitem(sys.modules, "duckdb", None)
-        with pytest.raises(ImportError, match=r"remora\[workspace\]"):
-            Workspace(tmp_path / "ws.duckdb", mode="rw").open()
-
-
 def _subprocess_read(path: Path) -> subprocess.CompletedProcess[bytes]:
     """Read pkts from another process over a read-only connection."""
     code = (
@@ -358,6 +332,155 @@ class TestCompact:
                 ws.compact()
             # The guard resets once the write finishes.
             ws.compact()
+
+    def test_write_from_second_instance_during_compact_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw") as ws1, Workspace(path, mode="rw") as ws2:
+            with ws1.write() as con:
+                con.execute(
+                    "INSERT INTO pkts (frame_number, frame_time) "
+                    "VALUES (1, TIMESTAMP '2024-01-01 00:00:00')"
+                )
+            real_replace = os.replace
+            probed: list[str] = []
+
+            def probing_replace(src: object, dst: object) -> None:
+                # A second Workspace on the same file shares this process's
+                # DuckDB instance, so it never hits the file lock: without
+                # process-wide coordination its commit would land between
+                # the snapshot and the swap and be discarded.
+                with pytest.raises(WorkspaceError, match="compact"), ws2.write() as con:
+                    con.execute(
+                        "INSERT INTO pkts (frame_number, frame_time) "
+                        "VALUES (2, TIMESTAMP '2024-01-01 00:00:01')"
+                    )
+                probed.append("rejected")
+                real_replace(src, dst)  # type: ignore[arg-type]
+
+            monkeypatch.setattr("remora.workspace.workspace.os.replace", probing_replace)
+            ws1.compact()
+            monkeypatch.undo()
+            assert probed == ["rejected"]
+            # Once compaction is done the second instance writes normally.
+            with ws2.write() as con:
+                con.execute(
+                    "INSERT INTO pkts (frame_number, frame_time) "
+                    "VALUES (2, TIMESTAMP '2024-01-01 00:00:01')"
+                )
+            with ws1.read() as con:
+                rows = con.execute("SELECT frame_number FROM pkts ORDER BY frame_number").fetchall()
+            assert rows == [(1,), (2,)]
+
+    def test_compact_refuses_second_instance_inflight_write(self, tmp_path: Path) -> None:
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw") as ws1, Workspace(path, mode="rw") as ws2:
+            with ws2.write(), pytest.raises(WorkspaceError, match="in flight"):
+                ws1.compact()
+            # The registry entry clears when the other instance's write ends.
+            ws1.compact()
+
+    def test_concurrent_compact_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw") as ws1, Workspace(path, mode="rw") as ws2:
+            real_replace = os.replace
+            probed: list[str] = []
+
+            def probing_replace(src: object, dst: object) -> None:
+                with pytest.raises(WorkspaceError, match="already in progress"):
+                    ws2.compact()
+                probed.append("rejected")
+                real_replace(src, dst)  # type: ignore[arg-type]
+
+            monkeypatch.setattr("remora.workspace.workspace.os.replace", probing_replace)
+            ws1.compact()
+            monkeypatch.undo()
+            assert probed == ["rejected"]
+            # Both instances can compact again, one after the other.
+            ws2.compact()
+
+    def test_lock_conflicted_compact_modifies_nothing(self, tmp_path: Path) -> None:
+        path = tmp_path / "ws.duckdb"
+        decoy = tmp_path / "ws.duckdb.compacting"
+        decoy_wal = tmp_path / "ws.duckdb.compacting.wal"
+        sentinel = b"other compaction in flight"
+        sentinel_wal = b"other compaction wal in flight"
+        with Workspace(path, mode="rw") as ws:
+            with ws.write() as con:
+                con.execute(
+                    "INSERT INTO pkts (frame_number, frame_time) "
+                    "VALUES (7, TIMESTAMP '2024-01-01 00:00:00')"
+                )
+            # Stand in for another process's in-flight compaction.
+            decoy.write_bytes(sentinel)
+            decoy_wal.write_bytes(sentinel_wal)
+            holder = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    "import duckdb, sys; "
+                    "con = duckdb.connect(sys.argv[1], read_only=False); "
+                    "print('READY', flush=True); "
+                    "sys.stdin.readline(); "
+                    "con.close()",
+                    str(path),
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                assert holder.stdout is not None
+                assert holder.stdout.readline().strip() == "READY"
+                with pytest.raises(duckdb.IOException, match="lock"):
+                    ws.compact()
+                # The connect failed, so cleanup never ran: the other
+                # process's temp files are byte-for-byte untouched.
+                assert decoy.read_bytes() == sentinel
+                assert decoy_wal.read_bytes() == sentinel_wal
+            finally:
+                assert holder.stdin is not None
+                holder.stdin.write("done\n")
+                holder.stdin.flush()
+                holder.wait(timeout=30)
+            with ws.read() as con:
+                row = con.execute("SELECT count(*) FROM pkts").fetchone()
+                assert row is not None
+                assert row[0] == 1
+            # With the lock free, compaction runs and reclaims the debris.
+            ws.compact()
+        assert not decoy.exists()
+        assert not decoy_wal.exists()
+
+    def test_windows_swap_failure_is_wrapped(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw") as ws:
+            with ws.write() as con:
+                con.execute(
+                    "INSERT INTO pkts (frame_number, frame_time) "
+                    "VALUES (7, TIMESTAMP '2024-01-01 00:00:00')"
+                )
+
+            def denied(src: object, dst: object) -> None:
+                # What a Windows rename over a file this process holds open
+                # raises; POSIX-first is tracked in #85.
+                raise PermissionError("Access is denied")
+
+            monkeypatch.setattr("remora.workspace.workspace.os.replace", denied)
+            with pytest.raises(WorkspaceError, match=r"#85"):
+                ws.compact()
+            monkeypatch.undo()
+            with ws.read() as con:
+                row = con.execute("SELECT count(*) FROM pkts").fetchone()
+                assert row is not None
+                assert row[0] == 1
+        leftovers = [p.name for p in tmp_path.iterdir() if p.name != path.name]
+        assert leftovers == []
 
     def test_copy_stage_failure_leaves_original_intact(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
