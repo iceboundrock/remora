@@ -152,7 +152,8 @@ class Workspace:
         self._con: DuckDBPyConnection | None = None
         self._opened = False
         # Symlink-stable identity, so two Workspace objects aliasing one
-        # file coordinate through the same registry entry.
+        # file coordinate through the same registry entry. Recomputed in
+        # open() once the file is known to exist.
         self._key: str = os.path.realpath(self._path)
 
     @property
@@ -205,6 +206,10 @@ class Workspace:
                 check_compatible(con)
             finally:
                 con.close()
+        # Resolve the key only now that the file certainly exists, so every
+        # alias of one file lands on the same registry entry; compact()
+        # operates on this resolved target rather than on the alias.
+        self._key = os.path.realpath(self._path)
         self._opened = True
         return self
 
@@ -312,6 +317,16 @@ class Workspace:
         at worst a stale temp file — plus the ``.wal`` sidecar a hard kill
         mid-copy can leave beside it — that the next compact removes.
 
+        A workspace addressed through a symlink is compacted at its
+        *resolved* target: the temp lives beside the real file and the swap
+        replaces the real file, so the symlink itself survives instead of
+        being turned into an independent regular file.
+
+        The swap is POSIX-first (#85): on Windows a rename over a file this
+        process holds open is refused, and compact raises
+        :class:`WorkspaceError` naming that limitation rather than a bare
+        :class:`PermissionError`.
+
         The copy runs on a read-write connection to the source and the
         swap happens while that connection is still open, so the source's
         exclusive lock is held across both. Other processes — readers as
@@ -342,9 +357,12 @@ class Workspace:
                 ``Workspace(path, mode='rw')`` to compact.
             WorkspaceError: If a :meth:`write` or rw-mode :meth:`read` on
                 this file is in flight in this process, if another
-                :meth:`compact` is already running, or if the swap itself
-                fails — on Windows a rename over a file held open by this
-                process is refused, a known POSIX-first limitation (#85).
+                :meth:`compact` is already running, if the exclusive lock
+                cannot be taken (another process, or an ro-mode
+                :class:`Workspace` on this file in this process), or if the
+                swap itself fails — on Windows a rename over a file held
+                open by this process is refused, a known POSIX-first
+                limitation (#85).
         """
         self._require_open()
         if self._mode == "ro":
@@ -354,7 +372,11 @@ class Workspace:
             )
         _begin_compact(self._key)
         try:
-            tmp = self._path.with_name(self._path.name + ".compacting")
+            # Compact the resolved target, never the alias: placing the temp
+            # beside a symlink and replacing the symlink would turn it into
+            # an independent regular file and orphan the real one.
+            target = Path(self._key)
+            tmp = target.with_name(target.name + ".compacting")
             tmp_wal = tmp.with_name(tmp.name + ".wal")
             # Hold the source's exclusive lock through both the copy and
             # the swap: a writer in another process either commits before
@@ -363,7 +385,16 @@ class Workspace:
             # os.replace and be silently discarded. Connect first, before
             # touching anything on disk, so a lock-conflicted compact
             # leaves even another process's in-flight temp file alone.
-            con = _connect(str(self._path), read_only=False)
+            try:
+                con = _connect(str(target), read_only=False)
+            except ImportError:
+                raise
+            except Exception as exc:
+                raise WorkspaceError(
+                    f"compact() needs sole access to {target} but could not take its "
+                    f"exclusive lock (is another connection open, perhaps an ro-mode "
+                    f"Workspace in this process?): {exc}"
+                ) from exc
             try:
                 try:
                     # Now that the lock is ours, any temp beside the source
@@ -376,7 +407,7 @@ class Workspace:
                     con.execute(f"COPY FROM DATABASE {_quote_ident(str(row[0]))} TO compact_dst")
                     con.execute("DETACH compact_dst")
                     try:
-                        os.replace(tmp, self._path)
+                        os.replace(tmp, target)
                     except PermissionError as exc:
                         raise WorkspaceError(
                             f"compact() could not swap the rewritten file into place: {exc}; "

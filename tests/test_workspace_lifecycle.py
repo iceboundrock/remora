@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import subprocess
 import sys
@@ -175,6 +176,26 @@ class TestLockDiscipline:
             # process can read while this Workspace object still exists.
             result = _subprocess_read(path)
             assert result.stdout.strip() == b"1"
+
+
+# Compacts in a child process and parks forever at the swap, temp fully
+# written and the source's exclusive lock still held, so the parent can
+# SIGKILL it at exactly the point a hard interruption hurts most.
+_BLOCK_AT_SWAP = """
+import os, sys
+
+def hook(src, dst):
+    print("SWAP", flush=True)
+    sys.stdin.readline()
+
+os.replace = hook
+
+from remora.workspace import Workspace
+
+ws = Workspace(sys.argv[1], mode="rw")
+ws.open()
+ws.compact()
+"""
 
 
 class TestCompact:
@@ -435,7 +456,7 @@ class TestCompact:
             try:
                 assert holder.stdout is not None
                 assert holder.stdout.readline().strip() == "READY"
-                with pytest.raises(duckdb.IOException, match="lock"):
+                with pytest.raises(WorkspaceError, match="sole access"):
                     ws.compact()
                 # The connect failed, so cleanup never ran: the other
                 # process's temp files are byte-for-byte untouched.
@@ -528,3 +549,120 @@ class TestCompact:
                 assert row is not None
                 assert row[0] == 1
             ws.compact()
+
+    def test_compact_through_symlink_preserves_alias(self, tmp_path: Path) -> None:
+        real = tmp_path / "real.duckdb"
+        alias = tmp_path / "alias.duckdb"
+        with Workspace(real, mode="rw") as ws:  # noqa: SIM117
+            with ws.write() as con:
+                con.execute(
+                    "INSERT INTO pkts (frame_number, frame_time) "
+                    "VALUES (7, TIMESTAMP '2024-01-01 00:00:00')"
+                )
+        os.symlink(real, alias)
+        with Workspace(alias, mode="rw") as ws:
+            ws.compact()
+            # Compaction happened at the resolved target, so the alias is
+            # still a symlink to it rather than an independent regular file
+            # left over from an os.replace onto the link itself.
+            with ws.read() as con:
+                rows = con.execute("SELECT frame_number FROM pkts").fetchall()
+            assert rows == [(7,)]
+        assert alias.is_symlink()
+        assert os.readlink(alias) == str(real)
+        assert real.exists()
+        assert not real.is_symlink()
+        leftovers = sorted(
+            p.name for p in tmp_path.iterdir() if p.name not in {real.name, alias.name}
+        )
+        assert leftovers == []
+
+    def test_compact_with_ro_instance_open_raises_workspace_error(self, tmp_path: Path) -> None:
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw") as seed:  # noqa: SIM117
+            with seed.write() as con:
+                con.execute(
+                    "INSERT INTO pkts (frame_number, frame_time) "
+                    "VALUES (7, TIMESTAMP '2024-01-01 00:00:00')"
+                )
+        # The rw instance opens first: it holds no connection between
+        # operations, whereas the ro instance holds one for its lifetime and
+        # DuckDB refuses a same-process connection with a different config.
+        rw = Workspace(path, mode="rw").open()
+        try:
+            reader = Workspace(path).open()
+            try:
+                with pytest.raises(WorkspaceError, match="sole access"):
+                    rw.compact()
+            finally:
+                reader.close()
+            # With the shared instance gone, compaction takes the lock.
+            rw.compact()
+            with rw.read() as con:
+                rows = con.execute("SELECT frame_number FROM pkts").fetchall()
+            assert rows == [(7,)]
+        finally:
+            rw.close()
+
+    def test_hard_killed_compact_leaves_original_and_next_compact_recovers(
+        self, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "ws.duckdb"
+        tmp = tmp_path / "ws.duckdb.compacting"
+        with Workspace(path, mode="rw") as ws:  # noqa: SIM117
+            with ws.write() as con:
+                con.execute(
+                    "INSERT INTO pkts (frame_number, frame_time) "
+                    "VALUES (7, TIMESTAMP '2024-01-01 00:00:00')"
+                )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", _BLOCK_AT_SWAP, str(path)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert proc.stdout is not None
+            # At this line the temp is fully written and the child still
+            # holds the source's exclusive lock: the worst moment to die.
+            assert proc.stdout.readline().strip() == "SWAP"
+            proc.kill()  # SIGKILL: no cleanup handler runs
+            proc.wait(timeout=30)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=30)
+        # The original was never replaced, and the kill left the temp behind.
+        assert tmp.exists()
+        with Workspace(path) as ws, ws.read() as con:
+            rows = con.execute("SELECT frame_number FROM pkts").fetchall()
+        assert rows == [(7,)]
+        with Workspace(path, mode="rw") as ws:
+            ws.compact()
+            with ws.read() as con:
+                rows = con.execute("SELECT frame_number FROM pkts").fetchall()
+            assert rows == [(7,)]
+        leftovers = sorted(p.name for p in tmp_path.iterdir() if p.name != path.name)
+        assert leftovers == []
+
+
+class TestCoordinationRegistry:
+    def test_registry_empty_when_idle(self, tmp_path: Path) -> None:
+        path = tmp_path / "ws.duckdb"
+        assert workspace_module._FILE_STATES == {}
+        with Workspace(path, mode="rw") as ws:
+            with ws.write() as con:
+                con.execute(
+                    "INSERT INTO pkts (frame_number, frame_time) "
+                    "VALUES (7, TIMESTAMP '2024-01-01 00:00:00')"
+                )
+            with ws.read() as con:
+                con.execute("SELECT count(*) FROM pkts").fetchone()
+            ws.compact()
+        # The registry holds counters and flags only while an operation is
+        # running: nothing — least of all a connection — outlives it.
+        assert workspace_module._FILE_STATES == {}
+        with Workspace(path) as ws, ws.read() as con:
+            con.execute("SELECT count(*) FROM pkts").fetchone()
+        assert workspace_module._FILE_STATES == {}
