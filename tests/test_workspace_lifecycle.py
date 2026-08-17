@@ -443,9 +443,17 @@ class TestCompact:
                 assert decoy_wal.read_bytes() == sentinel_wal
             finally:
                 assert holder.stdin is not None
-                holder.stdin.write("done\n")
-                holder.stdin.flush()
-                holder.wait(timeout=30)
+                try:
+                    holder.stdin.write("done\n")
+                    holder.stdin.flush()
+                    holder.stdin.close()
+                except OSError:
+                    pass
+                try:
+                    holder.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    holder.kill()
+                    holder.wait(timeout=30)
             with ws.read() as con:
                 row = con.execute("SELECT count(*) FROM pkts").fetchone()
                 assert row is not None

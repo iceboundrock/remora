@@ -379,8 +379,9 @@ class Workspace:
                         os.replace(tmp, self._path)
                     except PermissionError as exc:
                         raise WorkspaceError(
-                            "compact() could not swap the rewritten file into place; "
-                            "on Windows the swap-under-lock is a known limitation (#85)"
+                            f"compact() could not swap the rewritten file into place: {exc}; "
+                            "on Windows this is a known limitation of the swap-under-lock "
+                            "design (#85)"
                         ) from exc
                 finally:
                     con.close()
