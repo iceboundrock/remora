@@ -200,6 +200,19 @@ ws.compact()
 """
 
 
+# Runs one complete compact in a child process — swapping a new inode into
+# the path — and exits. Used to land a foreign swap inside the parent
+# compact's claim-to-connect window.
+_CHILD_COMPACT = """
+import sys
+from remora.workspace import Workspace
+
+ws = Workspace(sys.argv[1], mode="rw")
+ws.open()
+ws.compact()
+"""
+
+
 class TestCompact:
     @staticmethod
     def _bulk_fill(ws: Workspace, rows: int) -> None:
@@ -512,6 +525,53 @@ class TestCompact:
         with Workspace(real) as ws, ws.read() as con:
             rows = con.execute("SELECT frame_number FROM pkts").fetchall()
         assert rows == [(1,)]
+
+    def test_second_process_compact_in_claim_to_connect_window(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw") as ws1, Workspace(path, mode="rw") as ws2:
+            with ws1.write() as con:
+                con.execute(
+                    "INSERT INTO pkts (frame_number, frame_time) "
+                    "VALUES (1, TIMESTAMP '2024-01-01 00:00:00')"
+                )
+            real_connect = workspace_module._connect
+            swapped: list[str] = []
+
+            def delayed_connect(path_: str, *, read_only: bool) -> Any:
+                # The first connect is compact's source connect: run an
+                # entire child-process compact inside the gap between the
+                # registry claim and this connect, so the path now stats to
+                # a new inode the claim does not cover. Without
+                # revalidation under the held lock the local compact would
+                # keep its flag on the dead inode, admit a same-process
+                # writer keyed on the live one, and swap its commit away.
+                if not swapped:
+                    swapped.append("swapped")
+                    subprocess.run(
+                        [sys.executable, "-c", _CHILD_COMPACT, str(path)],
+                        check=True,
+                        capture_output=True,
+                        timeout=120,
+                    )
+                return real_connect(path_, read_only=read_only)
+
+            monkeypatch.setattr(workspace_module, "_connect", delayed_connect)
+            probed: list[str] = []
+            self._reject_write_at_swap(ws2, monkeypatch, probed)
+            ws1.compact()
+            monkeypatch.undo()
+            assert swapped == ["swapped"]
+            assert probed == ["rejected"]
+            with ws2.write() as con:
+                con.execute(
+                    "INSERT INTO pkts (frame_number, frame_time) "
+                    "VALUES (2, TIMESTAMP '2024-01-01 00:00:01')"
+                )
+            with ws1.read() as con:
+                rows = con.execute("SELECT frame_number FROM pkts ORDER BY frame_number").fetchall()
+            assert rows == [(1,), (2,)]
 
     def test_write_from_thread_during_compact_raises(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

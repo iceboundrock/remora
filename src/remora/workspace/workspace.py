@@ -32,7 +32,11 @@ the temp is final and released only after the source connection is
 closed — and every writer re-stats the file after taking its slot,
 retrying if the identity moved in between. Neither side of the swap has
 a window: a writer that stats before it and one that stats after it both
-land on a key the compact is holding.
+land on a key the compact is holding. The claim itself is validated the
+same way: another *process's* compact can swap the inode between the
+stat and this compact's connect, so the identity is re-checked once the
+source's exclusive lock is held — under which no swap can happen — and
+the claim retried against the new file on a mismatch.
 """
 
 from __future__ import annotations
@@ -418,7 +422,12 @@ class Workspace:
         re-validate their key once their slot is held, so neither can slip
         through and commit into a file :func:`os.replace` has already
         discarded (DuckDB's instance cache keys on the path, so an admitted
-        writer would have joined the pre-swap instance). A
+        writer would have joined the pre-swap instance). The flag's own
+        claim is validated under the exclusive lock too: another process's
+        compact can swap the inode between this compact's stat and its
+        connect, so the identity is re-checked once the lock is held and
+        the claim retried on a mismatch — the flag always covers the live
+        file for as long as the source connection is open. A
         :meth:`write` or rw-mode :meth:`read` in
         flight on *any* :class:`Workspace` for this file raises
         :class:`WorkspaceError` here, a second concurrent :meth:`compact`
@@ -449,17 +458,47 @@ class Workspace:
         # beside a symlink and replacing the symlink would turn it into an
         # independent regular file and orphan the real one.
         #
-        # Another compact can swap the inode (and repoint a symlink) between
-        # the stat and the flag, leaving this one holding a dead key. Once
-        # the flag is held no swap can start under it, so re-checking both
-        # the resolution and the identity proves the key is the live file's;
-        # on a mismatch the flag is dropped and the whole begin retried.
+        # The compacting flag guards a file *identity*, and only the file's
+        # exclusive lock can pin that identity down: another process's
+        # compact can swap a new inode into the path at any instant this
+        # process does not hold the lock — after the stat, after the flag is
+        # taken, right up to the connect — leaving the flag on a dead key
+        # and the live inode unguarded for a same-process writer. So the
+        # source connection is opened *inside* the loop (before touching
+        # anything on disk, so a lock-conflicted compact leaves even another
+        # process's in-flight temp file alone) and the resolution and
+        # identity are re-checked while both the flag and the lock are held:
+        # no swap can happen under the lock, so a match proves the flag
+        # guards the very file the connection holds, and holds it for as
+        # long as the connection stays open. On a mismatch the connection is
+        # closed, the flag dropped, and the whole begin retried against the
+        # new file.
         while True:
             target = Path(os.path.realpath(self._path))
             key = _file_key(target)
             _begin_compact(key, target)
+            try:
+                # Hold the source's exclusive lock through both the copy and
+                # the swap: a writer in another process either commits
+                # before the lock is taken (and is copied) or cannot connect
+                # until the swap is done, so no commit can land between the
+                # snapshot and os.replace and be silently discarded.
+                try:
+                    con = _connect(str(target), read_only=False)
+                except ImportError:
+                    raise
+                except Exception as exc:
+                    raise WorkspaceError(
+                        f"compact() needs sole access to {target} but could not take its "
+                        f"exclusive lock (is another connection open, perhaps an ro-mode "
+                        f"Workspace in this process?): {exc}"
+                    ) from exc
+            except BaseException:
+                _end_compact(key)
+                raise
             if _file_key(target) == key and Path(os.path.realpath(self._path)) == target:
                 break
+            con.close()
             _end_compact(key)
         # Set once the temp is final, so the flag is also visible under the
         # identity the live file is about to have (see below).
@@ -467,23 +506,6 @@ class Workspace:
         try:
             tmp = target.with_name(target.name + ".compacting")
             tmp_wal = tmp.with_name(tmp.name + ".wal")
-            # Hold the source's exclusive lock through both the copy and
-            # the swap: a writer in another process either commits before
-            # the lock is taken (and is copied) or cannot connect until the
-            # swap is done, so no commit can land between the snapshot and
-            # os.replace and be silently discarded. Connect first, before
-            # touching anything on disk, so a lock-conflicted compact
-            # leaves even another process's in-flight temp file alone.
-            try:
-                con = _connect(str(target), read_only=False)
-            except ImportError:
-                raise
-            except Exception as exc:
-                raise WorkspaceError(
-                    f"compact() needs sole access to {target} but could not take its "
-                    f"exclusive lock (is another connection open, perhaps an ro-mode "
-                    f"Workspace in this process?): {exc}"
-                ) from exc
             try:
                 try:
                     # Now that the lock is ours, any temp beside the source
