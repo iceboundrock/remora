@@ -258,7 +258,8 @@ class Workspace:
             assert self._con is not None
             yield self._con
             return
-        _acquire_write_slot(self._key)
+        key = self._key
+        _acquire_write_slot(key)
         try:
             con = _connect(str(self._path), read_only=False)
             try:
@@ -266,7 +267,7 @@ class Workspace:
             finally:
                 con.close()
         finally:
-            _release_write_slot(self._key)
+            _release_write_slot(key)
 
     @contextmanager
     def write(self) -> Iterator[DuckDBPyConnection]:
@@ -289,7 +290,8 @@ class Workspace:
                 f"workspace {self._path} is open read-only; reopen with "
                 f"Workspace(path, mode='rw') to write"
             )
-        _acquire_write_slot(self._key)
+        key = self._key
+        _acquire_write_slot(key)
         try:
             con = _connect(str(self._path), read_only=False)
             try:
@@ -303,7 +305,7 @@ class Workspace:
             finally:
                 con.close()
         finally:
-            _release_write_slot(self._key)
+            _release_write_slot(key)
 
     def compact(self) -> None:
         """Rewrite the workspace file to reclaim space.
@@ -370,12 +372,13 @@ class Workspace:
                 f"workspace {self._path} is open read-only; reopen with "
                 f"Workspace(path, mode='rw') to compact"
             )
-        _begin_compact(self._key)
+        key = self._key
+        _begin_compact(key)
         try:
             # Compact the resolved target, never the alias: placing the temp
             # beside a symlink and replacing the symlink would turn it into
             # an independent regular file and orphan the real one.
-            target = Path(self._key)
+            target = Path(key)
             tmp = target.with_name(target.name + ".compacting")
             tmp_wal = tmp.with_name(tmp.name + ".wal")
             # Hold the source's exclusive lock through both the copy and
@@ -423,7 +426,7 @@ class Workspace:
                 tmp_wal.unlink(missing_ok=True)
                 raise
         finally:
-            _end_compact(self._key)
+            _end_compact(key)
 
     @staticmethod
     def _is_empty(con: DuckDBPyConnection) -> bool:
