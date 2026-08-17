@@ -24,6 +24,15 @@ module-level registry keyed by the file's *identity* (``st_dev`` and
 one entry) makes writes and compaction mutually exclusive across every
 :class:`Workspace` object and thread here. It holds plain counters and
 flags, never a connection.
+
+Identity keys move under compaction, which is the one thing the registry
+has to survive: ``compact`` swaps a new inode into the path, so its flag
+is held under **both** the old and the new identity — claimed the moment
+the temp is final and released only after the source connection is
+closed — and every writer re-stats the file after taking its slot,
+retrying if the identity moved in between. Neither side of the swap has
+a window: a writer that stats before it and one that stats after it both
+land on a key the compact is holding.
 """
 
 from __future__ import annotations
@@ -80,9 +89,12 @@ def _file_key(path: Path) -> _FileKey:
     Computed fresh for every operation rather than cached, because
     ``compact()`` swaps the inode: operations that begin after the swap key
     on the new file, which is correct — the old inode can no longer be
-    reached through any path. Falls back to the resolved pathname when the
-    file cannot be stat'ed, so acquisition never masks the real error the
-    connect attempt is about to raise.
+    reached through any path — and is safe because ``compact()`` flags the
+    new identity too, from the moment the temp is final. A stat is a
+    snapshot either way, so callers pair it with a re-stat once their slot
+    is held (:func:`_acquire_write_slot_validated`). Falls back to the
+    resolved pathname when the file cannot be stat'ed, so acquisition never
+    masks the real error the connect attempt is about to raise.
     """
     try:
         st = os.stat(path)
@@ -108,6 +120,24 @@ def _release_write_slot(key: _FileKey) -> None:
         state.busy -= 1
         if state.busy == 0 and not state.compacting:
             del _FILE_STATES[key]
+
+
+def _acquire_write_slot_validated(path: Path) -> _FileKey:
+    """Acquire a write slot whose key provably matches the live file.
+
+    A compact() can swap the inode between the stat and the acquire, leaving
+    the slot keyed to a dead file. Re-statting after the acquire closes that
+    window: once the slot is held, no compact can begin under this key, so a
+    matching re-stat proves the key is the live file's identity; on a
+    mismatch the slot is released and the acquire retried against the new
+    file.
+    """
+    while True:
+        key = _file_key(path)
+        _acquire_write_slot(key, path)
+        if _file_key(path) == key:
+            return key
+        _release_write_slot(key)
 
 
 def _begin_compact(key: _FileKey, path: Path) -> None:
@@ -277,8 +307,7 @@ class Workspace:
             assert self._con is not None
             yield self._con
             return
-        key = _file_key(self._path)
-        _acquire_write_slot(key, self._path)
+        key = _acquire_write_slot_validated(self._path)
         try:
             con = _connect(str(self._path), read_only=False)
             try:
@@ -309,8 +338,7 @@ class Workspace:
                 f"workspace {self._path} is open read-only; reopen with "
                 f"Workspace(path, mode='rw') to write"
             )
-        key = _file_key(self._path)
-        _acquire_write_slot(key, self._path)
+        key = _acquire_write_slot_validated(self._path)
         try:
             con = _connect(str(self._path), read_only=False)
             try:
@@ -344,9 +372,11 @@ class Workspace:
         being turned into an independent regular file. A *hard* link cannot
         survive an atomic swap by construction — the replaced name gets a
         new inode while the other name keeps the old one, so the two
-        diverge; coordination is unaffected (it follows file identity, so
-        the compact locks out writes through every alias while it runs),
-        but a hardlinked alias goes on referring to the pre-compact file.
+        diverge; coordination is unaffected (it follows file identity, and
+        this compact holds the flag under both the pre- and post-swap
+        identity, so writes are locked out through every alias for its
+        whole duration), but a hardlinked alias goes on referring to the
+        pre-compact file.
 
         Permission bits are preserved across the swap: the temp is a fresh
         file with umask defaults, so the source's mode is copied onto it
@@ -379,7 +409,16 @@ class Workspace:
         Within this process the file lock cannot arbitrate, since
         same-process connections share one DuckDB instance; a module-level
         registry keyed by file identity does instead, so every spelling,
-        symlink and hard link of one file coordinates as one. A
+        symlink and hard link of one file coordinates as one — and the swap
+        itself does not open a gap in that, because the flag is claimed
+        under the temp's identity as soon as the temp is final and both
+        identities stay flagged until *after* the source connection is
+        closed. Writers on the far side of the swap therefore stat the new
+        inode and still find the flag, and writers that stat before it
+        re-validate their key once their slot is held, so neither can slip
+        through and commit into a file :func:`os.replace` has already
+        discarded (DuckDB's instance cache keys on the path, so an admitted
+        writer would have joined the pre-swap instance). A
         :meth:`write` or rw-mode :meth:`read` in
         flight on *any* :class:`Workspace` for this file raises
         :class:`WorkspaceError` here, a second concurrent :meth:`compact`
@@ -409,9 +448,22 @@ class Workspace:
         # Compact the resolved target, never the alias: placing the temp
         # beside a symlink and replacing the symlink would turn it into an
         # independent regular file and orphan the real one.
-        target = Path(os.path.realpath(self._path))
-        key = _file_key(target)
-        _begin_compact(key, target)
+        #
+        # Another compact can swap the inode (and repoint a symlink) between
+        # the stat and the flag, leaving this one holding a dead key. Once
+        # the flag is held no swap can start under it, so re-checking both
+        # the resolution and the identity proves the key is the live file's;
+        # on a mismatch the flag is dropped and the whole begin retried.
+        while True:
+            target = Path(os.path.realpath(self._path))
+            key = _file_key(target)
+            _begin_compact(key, target)
+            if _file_key(target) == key and Path(os.path.realpath(self._path)) == target:
+                break
+            _end_compact(key)
+        # Set once the temp is final, so the flag is also visible under the
+        # identity the live file is about to have (see below).
+        claimed_new_key: _FileKey | None = None
         try:
             tmp = target.with_name(target.name + ".compacting")
             tmp_wal = tmp.with_name(tmp.name + ".wal")
@@ -443,6 +495,15 @@ class Workspace:
                     con.execute(f"ATTACH '{_quote_path(str(tmp))}' AS compact_dst")
                     con.execute(f"COPY FROM DATABASE {_quote_ident(str(row[0]))} TO compact_dst")
                     con.execute("DETACH compact_dst")
+                    new_key = _file_key(tmp)
+                    if new_key != key:
+                        # The temp is private to this compact (fresh file, held
+                        # exclusive lock on the source), so claiming its identity
+                        # cannot conflict with a live operation; it makes the
+                        # compacting flag visible to writers that stat the path
+                        # after the swap but before this compact fully ends.
+                        _begin_compact(new_key, target)
+                        claimed_new_key = new_key
                     # The temp was created fresh under this process's umask,
                     # so it would otherwise silently widen the workspace's
                     # permissions across the swap. Ownership and the rest
@@ -465,6 +526,13 @@ class Workspace:
                 tmp_wal.unlink(missing_ok=True)
                 raise
         finally:
+            # Both identities stay flagged until here, which is *after* the
+            # inner finally closed the source connection: DuckDB's instance
+            # cache keys on the path, so releasing earlier could admit a
+            # writer that joins the pre-swap instance and commits into the
+            # file os.replace has already thrown away.
+            if claimed_new_key is not None:
+                _end_compact(claimed_new_key)
             _end_compact(key)
 
     @staticmethod

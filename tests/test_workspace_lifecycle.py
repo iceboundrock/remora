@@ -396,6 +396,48 @@ class TestCompact:
                 rows = con.execute("SELECT frame_number FROM pkts ORDER BY frame_number").fetchall()
             assert rows == [(1,), (2,)]
 
+    def test_write_after_swap_before_compact_end_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw") as ws1, Workspace(path, mode="rw") as ws2:
+            with ws1.write() as con:
+                con.execute(
+                    "INSERT INTO pkts (frame_number, frame_time) "
+                    "VALUES (1, TIMESTAMP '2024-01-01 00:00:00')"
+                )
+            real_replace = os.replace
+            probed: list[str] = []
+
+            def swapping_replace(src: object, dst: object) -> None:
+                real_replace(src, dst)  # type: ignore[arg-type]
+                # Past the swap the path stats to the *new* inode, so a
+                # registry keyed only on the pre-swap identity has no entry
+                # for it and admits this writer — which then joins the
+                # pre-swap DuckDB instance (its cache keys on the path, and
+                # compact's source connection still holds it open) and
+                # commits into the file os.replace has already discarded.
+                with pytest.raises(WorkspaceError, match="compact"), ws2.write() as con:
+                    con.execute(
+                        "INSERT INTO pkts (frame_number, frame_time) "
+                        "VALUES (2, TIMESTAMP '2024-01-01 00:00:01')"
+                    )
+                probed.append("rejected")
+
+            monkeypatch.setattr("remora.workspace.workspace.os.replace", swapping_replace)
+            ws1.compact()
+            monkeypatch.undo()
+            assert probed == ["rejected"]
+            # Once compact has fully finished the same write goes through.
+            with ws2.write() as con:
+                con.execute(
+                    "INSERT INTO pkts (frame_number, frame_time) "
+                    "VALUES (2, TIMESTAMP '2024-01-01 00:00:01')"
+                )
+            with ws1.read() as con:
+                rows = con.execute("SELECT frame_number FROM pkts ORDER BY frame_number").fetchall()
+            assert rows == [(1,), (2,)]
+
     @staticmethod
     def _reject_write_at_swap(
         ws: Workspace, monkeypatch: pytest.MonkeyPatch, probed: list[str]
