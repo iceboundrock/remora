@@ -531,9 +531,11 @@ class Workspace:
             # cache keys on the path, so releasing earlier could admit a
             # writer that joins the pre-swap instance and commits into the
             # file os.replace has already thrown away.
-            if claimed_new_key is not None:
-                _end_compact(claimed_new_key)
-            _end_compact(key)
+            try:
+                if claimed_new_key is not None:
+                    _end_compact(claimed_new_key)
+            finally:
+                _end_compact(key)
 
     @staticmethod
     def _is_empty(con: DuckDBPyConnection) -> bool:
