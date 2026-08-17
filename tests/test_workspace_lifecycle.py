@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import contextlib
 import os
+import stat
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -393,6 +395,145 @@ class TestCompact:
             with ws1.read() as con:
                 rows = con.execute("SELECT frame_number FROM pkts ORDER BY frame_number").fetchall()
             assert rows == [(1,), (2,)]
+
+    @staticmethod
+    def _reject_write_at_swap(
+        ws: Workspace, monkeypatch: pytest.MonkeyPatch, probed: list[str]
+    ) -> None:
+        """Assert ``ws.write()`` is refused at the moment of the swap.
+
+        Installed as the ``os.replace`` hook: at that point the temp is
+        written but the source has not been replaced yet, so an alias still
+        resolves to compact's inode and the rejection is deterministic.
+        """
+        real_replace = os.replace
+
+        def probing_replace(src: object, dst: object) -> None:
+            with pytest.raises(WorkspaceError, match="compact"), ws.write() as con:
+                con.execute(
+                    "INSERT INTO pkts (frame_number, frame_time) "
+                    "VALUES (2, TIMESTAMP '2024-01-01 00:00:01')"
+                )
+            probed.append("rejected")
+            real_replace(src, dst)  # type: ignore[arg-type]
+
+        monkeypatch.setattr("remora.workspace.workspace.os.replace", probing_replace)
+
+    def test_write_from_hardlink_alias_during_compact_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        real = tmp_path / "real.duckdb"
+        hard = tmp_path / "hard.duckdb"
+        probed: list[str] = []
+        with Workspace(real, mode="rw") as ws1:
+            with ws1.write() as con:
+                con.execute(
+                    "INSERT INTO pkts (frame_number, frame_time) "
+                    "VALUES (1, TIMESTAMP '2024-01-01 00:00:00')"
+                )
+            os.link(real, hard)
+            # One inode, two names: a registry keyed on the pathname files
+            # these two Workspaces separately and lets the alias commit
+            # between compact's snapshot and its swap, silently discarding
+            # the commit. Keying on (st_dev, st_ino) makes them one entry.
+            with Workspace(hard, mode="rw") as ws2:
+                self._reject_write_at_swap(ws2, monkeypatch, probed)
+                ws1.compact()
+                monkeypatch.undo()
+        assert probed == ["rejected"]
+        with Workspace(real) as ws, ws.read() as con:
+            rows = con.execute("SELECT frame_number FROM pkts").fetchall()
+        assert rows == [(1,)]
+
+    def test_write_from_case_alias_during_compact_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        real = tmp_path / "real.duckdb"
+        probed: list[str] = []
+        with Workspace(real, mode="rw") as ws1:
+            with ws1.write() as con:
+                con.execute(
+                    "INSERT INTO pkts (frame_number, frame_time) "
+                    "VALUES (1, TIMESTAMP '2024-01-01 00:00:00')"
+                )
+            alias = real.with_name("REAL.DUCKDB")
+            if not alias.exists():
+                pytest.skip("case-sensitive filesystem")
+            # os.path.realpath preserves the spelling it was given, so on a
+            # case-insensitive filesystem the two spellings of one file used
+            # to key differently — the reviewer's reproduction.
+            with Workspace(alias, mode="rw") as ws2:
+                self._reject_write_at_swap(ws2, monkeypatch, probed)
+                ws1.compact()
+                monkeypatch.undo()
+        assert probed == ["rejected"]
+        with Workspace(real) as ws, ws.read() as con:
+            rows = con.execute("SELECT frame_number FROM pkts").fetchall()
+        assert rows == [(1,)]
+
+    def test_write_from_thread_during_compact_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw") as ws1, Workspace(path, mode="rw") as ws2:
+            with ws1.write() as con:
+                con.execute(
+                    "INSERT INTO pkts (frame_number, frame_time) "
+                    "VALUES (1, TIMESTAMP '2024-01-01 00:00:00')"
+                )
+            real_replace = os.replace
+            outcome: list[BaseException | None] = []
+
+            def attempt_write() -> None:
+                try:
+                    with ws2.write() as con:
+                        con.execute(
+                            "INSERT INTO pkts (frame_number, frame_time) "
+                            "VALUES (2, TIMESTAMP '2024-01-01 00:00:01')"
+                        )
+                except BaseException as exc:
+                    outcome.append(exc)
+                else:
+                    outcome.append(None)
+
+            def probing_replace(src: object, dst: object) -> None:
+                # The registry guards threads, not just Workspace objects:
+                # a writer on another thread must be refused for compact's
+                # whole duration exactly as a second process is.
+                thread = threading.Thread(target=attempt_write)
+                thread.start()
+                thread.join(timeout=60)
+                assert not thread.is_alive()
+                real_replace(src, dst)  # type: ignore[arg-type]
+
+            monkeypatch.setattr("remora.workspace.workspace.os.replace", probing_replace)
+            ws1.compact()
+            monkeypatch.undo()
+            assert len(outcome) == 1
+            failure = outcome[0]
+            assert isinstance(failure, WorkspaceError)
+            assert "compact" in str(failure)
+            with ws1.read() as con:
+                rows = con.execute("SELECT frame_number FROM pkts").fetchall()
+            assert rows == [(1,)]
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits")
+    def test_compact_preserves_permission_bits(self, tmp_path: Path) -> None:
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw") as ws:
+            with ws.write() as con:
+                con.execute(
+                    "INSERT INTO pkts (frame_number, frame_time) "
+                    "VALUES (7, TIMESTAMP '2024-01-01 00:00:00')"
+                )
+            os.chmod(path, 0o640)
+            ws.compact()
+            # The temp is a fresh file with umask defaults; without copying
+            # the source's mode the swap would widen 0o640 to 0o644.
+            assert stat.S_IMODE(os.stat(path).st_mode) == 0o640
+            with ws.read() as con:
+                rows = con.execute("SELECT frame_number FROM pkts").fetchall()
+            assert rows == [(7,)]
 
     def test_compact_refuses_second_instance_inflight_write(self, tmp_path: Path) -> None:
         path = tmp_path / "ws.duckdb"

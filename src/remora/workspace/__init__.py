@@ -9,8 +9,11 @@ type map (:mod:`remora.workspace.types`) and the cache-key computation
 
 DuckDB is an optional dependency — install it with ``pip install
 'remora[workspace]'``. The modules here are import-pure: they annotate
-connections under ``typing.TYPE_CHECKING`` and never import duckdb at runtime,
-so they can be imported (and type-checked) without it.
+connections under ``typing.TYPE_CHECKING``, so importing this package never
+imports duckdb and every module can be imported (and type-checked) without it.
+duckdb is imported at runtime in exactly one place — the connect helper in
+:mod:`remora.workspace.workspace`, and only when a connection is actually
+opened.
 """
 
 from remora.workspace.cachekey import (

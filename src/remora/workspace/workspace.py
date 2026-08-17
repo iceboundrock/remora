@@ -19,14 +19,17 @@ gap, and so an interrupted compact always leaves the original intact.
 
 The file lock cannot arbitrate *within* one process — same-process
 connections to one file share DuckDB's database instance — so a
-module-level registry keyed by the file's real path makes writes and
-compaction mutually exclusive across every :class:`Workspace` object and
-thread here. It holds plain counters and flags, never a connection.
+module-level registry keyed by the file's *identity* (``st_dev`` and
+``st_ino``, so every spelling, symlink and hard link of one file lands on
+one entry) makes writes and compaction mutually exclusive across every
+:class:`Workspace` object and thread here. It holds plain counters and
+flags, never a connection.
 """
 
 from __future__ import annotations
 
 import os
+import stat
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -46,6 +49,10 @@ Mode = Literal["ro", "rw"]
 
 _MODES: tuple[Mode, ...] = ("ro", "rw")
 
+# ``(st_dev, st_ino)`` normally; the resolved pathname only as a fallback for
+# a file that cannot be stat'ed (see :func:`_file_key`).
+_FileKey = tuple[int, int] | str
+
 
 class _FileState:
     """Per-file coordination shared by every Workspace in this process."""
@@ -60,22 +67,42 @@ class _FileState:
 # Same-process connections to one file share DuckDB's database instance, so
 # the file lock cannot arbitrate between Workspace objects in this process.
 # This registry does; it holds plain counters and flags, never a connection.
-_FILE_STATES: Final[dict[str, _FileState]] = {}
+_FILE_STATES: Final[dict[_FileKey, _FileState]] = {}
 _FILE_STATES_GUARD: Final[threading.Lock] = threading.Lock()
 
 
-def _acquire_write_slot(key: str) -> None:
+def _file_key(path: Path) -> _FileKey:
+    """Identity of the file behind ``path`` for the coordination registry.
+
+    ``os.stat`` follows symlinks, and one inode has one ``(st_dev, st_ino)``
+    no matter how the path spells it — case aliases and hard links included,
+    which pathname-based keys get wrong on case-insensitive filesystems.
+    Computed fresh for every operation rather than cached, because
+    ``compact()`` swaps the inode: operations that begin after the swap key
+    on the new file, which is correct — the old inode can no longer be
+    reached through any path. Falls back to the resolved pathname when the
+    file cannot be stat'ed, so acquisition never masks the real error the
+    connect attempt is about to raise.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return os.path.realpath(path)
+    return (st.st_dev, st.st_ino)
+
+
+def _acquire_write_slot(key: _FileKey, path: Path) -> None:
     with _FILE_STATES_GUARD:
         state = _FILE_STATES.setdefault(key, _FileState())
         if state.compacting:
             raise WorkspaceError(
-                f"a compact() is in progress on {key}; writes and rw-mode "
+                f"a compact() is in progress on {path}; writes and rw-mode "
                 f"reads fail fast until it finishes"
             )
         state.busy += 1
 
 
-def _release_write_slot(key: str) -> None:
+def _release_write_slot(key: _FileKey) -> None:
     with _FILE_STATES_GUARD:
         state = _FILE_STATES[key]
         state.busy -= 1
@@ -83,20 +110,20 @@ def _release_write_slot(key: str) -> None:
             del _FILE_STATES[key]
 
 
-def _begin_compact(key: str) -> None:
+def _begin_compact(key: _FileKey, path: Path) -> None:
     with _FILE_STATES_GUARD:
         state = _FILE_STATES.setdefault(key, _FileState())
         if state.busy:
             raise WorkspaceError(
-                f"workspace {key} has a write() or read() in flight; "
+                f"workspace {path} has a write() or read() in flight; "
                 f"compact() would swap the file out from under it"
             )
         if state.compacting:
-            raise WorkspaceError(f"another compact() is already in progress on {key}")
+            raise WorkspaceError(f"another compact() is already in progress on {path}")
         state.compacting = True
 
 
-def _end_compact(key: str) -> None:
+def _end_compact(key: _FileKey) -> None:
     with _FILE_STATES_GUARD:
         state = _FILE_STATES[key]
         state.compacting = False
@@ -151,10 +178,6 @@ class Workspace:
         # Held only in ro mode; rw mode never keeps a connection open.
         self._con: DuckDBPyConnection | None = None
         self._opened = False
-        # Symlink-stable identity, so two Workspace objects aliasing one
-        # file coordinate through the same registry entry. Recomputed in
-        # open() once the file is known to exist.
-        self._key: str = os.path.realpath(self._path)
 
     @property
     def path(self) -> Path:
@@ -206,10 +229,6 @@ class Workspace:
                 check_compatible(con)
             finally:
                 con.close()
-        # Resolve the key only now that the file certainly exists, so every
-        # alias of one file lands on the same registry entry; compact()
-        # operates on this resolved target rather than on the alias.
-        self._key = os.path.realpath(self._path)
         self._opened = True
         return self
 
@@ -258,8 +277,8 @@ class Workspace:
             assert self._con is not None
             yield self._con
             return
-        key = self._key
-        _acquire_write_slot(key)
+        key = _file_key(self._path)
+        _acquire_write_slot(key, self._path)
         try:
             con = _connect(str(self._path), read_only=False)
             try:
@@ -290,8 +309,8 @@ class Workspace:
                 f"workspace {self._path} is open read-only; reopen with "
                 f"Workspace(path, mode='rw') to write"
             )
-        key = self._key
-        _acquire_write_slot(key)
+        key = _file_key(self._path)
+        _acquire_write_slot(key, self._path)
         try:
             con = _connect(str(self._path), read_only=False)
             try:
@@ -322,12 +341,24 @@ class Workspace:
         A workspace addressed through a symlink is compacted at its
         *resolved* target: the temp lives beside the real file and the swap
         replaces the real file, so the symlink itself survives instead of
-        being turned into an independent regular file.
+        being turned into an independent regular file. A *hard* link cannot
+        survive an atomic swap by construction — the replaced name gets a
+        new inode while the other name keeps the old one, so the two
+        diverge; coordination is unaffected (it follows file identity, so
+        the compact locks out writes through every alias while it runs),
+        but a hardlinked alias goes on referring to the pre-compact file.
+
+        Permission bits are preserved across the swap: the temp is a fresh
+        file with umask defaults, so the source's mode is copied onto it
+        before the rename. Ownership and other metadata follow the fresh
+        file — changing them would need privileges compact does not assume.
 
         The swap is POSIX-first (#85): on Windows a rename over a file this
         process holds open is refused, and compact raises
         :class:`WorkspaceError` naming that limitation rather than a bare
-        :class:`PermissionError`.
+        :class:`PermissionError`. That wrapping is narrow — only
+        :class:`PermissionError` is translated; any other :class:`OSError`
+        from the rename propagates unchanged.
 
         The copy runs on a read-write connection to the source and the
         swap happens while that connection is still open, so the source's
@@ -347,7 +378,9 @@ class Workspace:
 
         Within this process the file lock cannot arbitrate, since
         same-process connections share one DuckDB instance; a module-level
-        registry does instead. A :meth:`write` or rw-mode :meth:`read` in
+        registry keyed by file identity does instead, so every spelling,
+        symlink and hard link of one file coordinates as one. A
+        :meth:`write` or rw-mode :meth:`read` in
         flight on *any* :class:`Workspace` for this file raises
         :class:`WorkspaceError` here, a second concurrent :meth:`compact`
         is rejected the same way, and for compact's duration writers and
@@ -362,9 +395,10 @@ class Workspace:
                 :meth:`compact` is already running, if the exclusive lock
                 cannot be taken (another process, or an ro-mode
                 :class:`Workspace` on this file in this process), or if the
-                swap itself fails — on Windows a rename over a file held
-                open by this process is refused, a known POSIX-first
-                limitation (#85).
+                swap raises :class:`PermissionError` — on Windows a rename
+                over a file held open by this process is refused, a known
+                POSIX-first limitation (#85). Every other :class:`OSError`
+                from the swap propagates as itself.
         """
         self._require_open()
         if self._mode == "ro":
@@ -372,13 +406,13 @@ class Workspace:
                 f"workspace {self._path} is open read-only; reopen with "
                 f"Workspace(path, mode='rw') to compact"
             )
-        key = self._key
-        _begin_compact(key)
+        # Compact the resolved target, never the alias: placing the temp
+        # beside a symlink and replacing the symlink would turn it into an
+        # independent regular file and orphan the real one.
+        target = Path(os.path.realpath(self._path))
+        key = _file_key(target)
+        _begin_compact(key, target)
         try:
-            # Compact the resolved target, never the alias: placing the temp
-            # beside a symlink and replacing the symlink would turn it into
-            # an independent regular file and orphan the real one.
-            target = Path(key)
             tmp = target.with_name(target.name + ".compacting")
             tmp_wal = tmp.with_name(tmp.name + ".wal")
             # Hold the source's exclusive lock through both the copy and
@@ -409,6 +443,11 @@ class Workspace:
                     con.execute(f"ATTACH '{_quote_path(str(tmp))}' AS compact_dst")
                     con.execute(f"COPY FROM DATABASE {_quote_ident(str(row[0]))} TO compact_dst")
                     con.execute("DETACH compact_dst")
+                    # The temp was created fresh under this process's umask,
+                    # so it would otherwise silently widen the workspace's
+                    # permissions across the swap. Ownership and the rest
+                    # follow the new file: chown needs privileges.
+                    os.chmod(tmp, stat.S_IMODE(os.stat(target).st_mode))
                     try:
                         os.replace(tmp, target)
                     except PermissionError as exc:
