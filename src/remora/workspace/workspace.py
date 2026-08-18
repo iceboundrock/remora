@@ -46,10 +46,13 @@ import stat
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from types import TracebackType
 from typing import TYPE_CHECKING, Final, Literal
 
+from remora.workspace import annotations as _annotations
+from remora.workspace.annotations import AnnotationRecord, AnnotationScope
 from remora.workspace.errors import WorkspaceError, WorkspaceModeError
 from remora.workspace.schema import check_compatible, create_schema
 
@@ -357,6 +360,111 @@ class Workspace:
                 con.close()
         finally:
             _release_write_slot(key)
+
+    def add_annotation(
+        self,
+        scope: AnnotationScope,
+        target_id: int,
+        key: str,
+        value: str | None = None,
+        *,
+        created_at: datetime | None = None,
+    ) -> int:
+        """Attach an annotation to a packet or stream in one transaction.
+
+        Args:
+            scope: ``"packet"`` (``target_id`` is a frame number) or
+                ``"stream"`` (``target_id`` is a stream id).
+            target_id: The frame number or stream id being annotated.
+            key: Short label, e.g. ``"verdict"``. Must not be empty.
+            value: Free-form body, or ``None`` for a bare tag.
+            created_at: When the annotation was made; defaults to now.
+
+        Returns:
+            The new ``annotation_id``.
+
+        Raises:
+            WorkspaceModeError: In ro mode.
+            ValueError: If ``scope`` or ``key`` is invalid.
+        """
+        with self.write() as con:
+            return _annotations.add_annotation(
+                con, scope, target_id, key, value, created_at=created_at
+            )
+
+    def remove_annotation(self, annotation_id: int) -> bool:
+        """Remove one annotation by id, in one transaction.
+
+        Args:
+            annotation_id: The id :meth:`add_annotation` returned.
+
+        Returns:
+            Whether a row was removed.
+
+        Raises:
+            WorkspaceModeError: In ro mode.
+        """
+        with self.write() as con:
+            return _annotations.remove_annotation(con, annotation_id)
+
+    def remove_annotations(
+        self,
+        *,
+        scope: AnnotationScope | None = None,
+        target_id: int | None = None,
+        key: str | None = None,
+    ) -> int:
+        """Remove every annotation matching the filters, in one transaction.
+
+        Args:
+            scope: Restrict to one scope.
+            target_id: Restrict to one frame number / stream id.
+            key: Restrict to one label.
+
+        Returns:
+            How many annotations were removed.
+
+        Raises:
+            WorkspaceModeError: In ro mode.
+            ValueError: If no filter is given.
+        """
+        with self.write() as con:
+            return _annotations.remove_annotations(con, scope=scope, target_id=target_id, key=key)
+
+    def delete_orphan_annotations(self) -> int:
+        """Remove annotations whose target is gone, in one transaction.
+
+        Orphans are kept and flagged until this is called explicitly; see
+        :mod:`remora.workspace.annotations` for the policy.
+
+        Returns:
+            How many orphaned annotations were removed.
+
+        Raises:
+            WorkspaceModeError: In ro mode.
+        """
+        with self.write() as con:
+            return _annotations.delete_orphan_annotations(con)
+
+    def list_annotations(
+        self,
+        *,
+        scope: AnnotationScope | None = None,
+        target_id: int | None = None,
+        key: str | None = None,
+    ) -> tuple[AnnotationRecord, ...]:
+        """List annotations, each flagged for orphanhood. Works in ro mode.
+
+        Args:
+            scope: Restrict to one scope.
+            target_id: Restrict to one frame number / stream id.
+            key: Restrict to one label.
+
+        Returns:
+            Matching annotations, ascending by ``annotation_id``.
+        """
+        with self.read() as con:
+            return _annotations.list_annotations(con, scope=scope, target_id=target_id, key=key)
 
     def compact(self) -> None:
         """Rewrite the workspace file to reclaim space.

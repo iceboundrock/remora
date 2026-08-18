@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
 from collections.abc import Iterator
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
 
+from remora.workspace import Workspace
 from remora.workspace.annotations import (
     ANNOTATION_SCOPES,
     AnnotationRecord,
@@ -17,6 +21,7 @@ from remora.workspace.annotations import (
     remove_annotation,
     remove_annotations,
 )
+from remora.workspace.errors import WorkspaceModeError
 from remora.workspace.schema import create_schema
 
 if TYPE_CHECKING:
@@ -176,3 +181,99 @@ class TestRemoval:
     def test_delete_orphans_with_none_present_returns_zero(self, con: DuckDBPyConnection) -> None:
         add_annotation(con, "packet", 1, "live", created_at=UTC_NOW)
         assert delete_orphan_annotations(con) == 0
+
+
+def _subprocess_read(path: Path) -> subprocess.CompletedProcess[bytes]:
+    """Count annotations from another process over a read-only connection."""
+    code = (
+        "import duckdb, sys; "
+        "con = duckdb.connect(sys.argv[1], read_only=True); "
+        "print(con.execute('SELECT count(*) FROM main.annotations').fetchone()[0]); "
+        "con.close()"
+    )
+    return subprocess.run(
+        [sys.executable, "-c", code, str(path)],
+        check=True,
+        capture_output=True,
+        timeout=60,
+    )
+
+
+class TestWorkspaceMethods:
+    def test_add_list_remove_in_rw_mode(self, tmp_path: Path) -> None:
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw") as ws:
+            with ws.write() as con:
+                con.execute(
+                    "INSERT INTO main.pkts (frame_number, frame_time) "
+                    "VALUES (1, TIMESTAMP '2026-08-18 00:00:00')"
+                )
+            annotation_id = ws.add_annotation("packet", 1, "verdict", "bad", created_at=UTC_NOW)
+            assert annotation_id == 1
+            listed = ws.list_annotations()
+            assert listed == (
+                AnnotationRecord(
+                    annotation_id=1,
+                    scope="packet",
+                    target_id=1,
+                    key="verdict",
+                    value="bad",
+                    created_at=UTC_NOW,
+                    orphaned=False,
+                ),
+            )
+            assert ws.remove_annotation(annotation_id) is True
+            assert ws.list_annotations() == ()
+
+    def test_stream_annotation_through_the_workspace(self, tmp_path: Path) -> None:
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw") as ws:
+            with ws.write() as con:
+                con.execute("INSERT INTO main.streams (stream_id) VALUES (7)")
+            ws.add_annotation("stream", 7, "owner", "ruoshi", created_at=UTC_NOW)
+            assert ws.list_annotations(scope="stream")[0].target_id == 7
+
+    def test_remove_annotations_and_orphan_cleanup_through_the_workspace(
+        self, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw") as ws:
+            ws.add_annotation("packet", 1, "ghost", created_at=UTC_NOW)
+            ws.add_annotation("packet", 2, "ghost", created_at=UTC_NOW)
+            assert ws.remove_annotations(target_id=2) == 1
+            assert ws.delete_orphan_annotations() == 1
+            assert ws.list_annotations() == ()
+
+    def test_ro_mode_lists_but_refuses_writes(self, tmp_path: Path) -> None:
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw") as ws:
+            ws.add_annotation("packet", 1, "verdict", "bad", created_at=UTC_NOW)
+        with Workspace(path) as ws:
+            assert [r.key for r in ws.list_annotations()] == ["verdict"]
+            with pytest.raises(WorkspaceModeError, match="mode='rw'"):
+                ws.add_annotation("packet", 2, "verdict", "worse", created_at=UTC_NOW)
+            with pytest.raises(WorkspaceModeError, match="mode='rw'"):
+                ws.remove_annotation(1)
+            with pytest.raises(WorkspaceModeError, match="mode='rw'"):
+                ws.remove_annotations(key="verdict")
+            with pytest.raises(WorkspaceModeError, match="mode='rw'"):
+                ws.delete_orphan_annotations()
+            # Refused means untouched.
+            assert len(ws.list_annotations()) == 1
+
+    def test_no_connection_is_held_between_calls(self, tmp_path: Path) -> None:
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw") as ws:
+            ws.add_annotation("packet", 1, "verdict", "bad", created_at=UTC_NOW)
+            # The write lock was released at the end of the call: another
+            # process can read while this Workspace object still exists.
+            assert _subprocess_read(path).stdout.strip() == b"1"
+            ws.add_annotation("packet", 2, "verdict", "worse", created_at=UTC_NOW)
+            assert _subprocess_read(path).stdout.strip() == b"2"
+
+    def test_a_failing_call_rolls_back(self, tmp_path: Path) -> None:
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw") as ws:
+            with pytest.raises(ValueError, match="key"):
+                ws.add_annotation("packet", 1, "", created_at=UTC_NOW)
+            assert ws.list_annotations() == ()
