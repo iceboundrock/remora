@@ -118,8 +118,12 @@ from remora.expr import (
     Expr,
     FieldLike,
     LiteralValue,
+    Membership,
+    MembershipItem,
     Not,
     Or,
+    Presence,
+    ValueRange,
 )
 from remora.workspace.naming import column_name
 from remora.workspace.types import column_sql_type, get_column_type
@@ -191,6 +195,11 @@ def _render(expr: Expr, params: list[Any]) -> str:
     """Render one node, appending its parameters to ``params`` in order."""
     if isinstance(expr, Comparison):
         return _render_comparison(expr, params)
+    if isinstance(expr, Presence):
+        column = _column(expr.field)
+        return f"len({column}) > 0" if expr.field.multi else f"{column} IS NOT NULL"
+    if isinstance(expr, Membership):
+        return _render_membership(expr, params)
     if isinstance(expr, Not):
         return f"NOT ({_render(expr.operand, params)})"
     if isinstance(expr, And):
@@ -213,6 +222,41 @@ def _render_comparison(expr: Comparison, params: list[Any]) -> str:
     if expr.op is CompareOp.EQ:
         return f"list_contains({column}, {placeholder})"
     return _any_occurrence(column, f"{_LAMBDA_VAR} {_SQL_OPS[expr.op]} {placeholder}")
+
+
+def _render_membership(expr: Membership, params: list[Any]) -> str:
+    """Render ``field in {...}`` as the OR of one term per set element."""
+    column = _column(expr.field)
+    terms = [_render_member(expr.field, column, item, params) for item in expr.values]
+    if len(terms) == 1:
+        return terms[0]
+    return "(" + " OR ".join(terms) + ")"
+
+
+def _render_member(field: FieldLike, column: str, item: MembershipItem, params: list[Any]) -> str:
+    """Render one membership element: an equality, or an inclusive range.
+
+    A range over an address column is exactly the subnet predicate: ``BETWEEN``
+    over the integer form, which DuckDB's zone maps can skip row groups on.
+    """
+    ftype = field.ftype
+    placeholder = _placeholder(ftype)
+    if isinstance(item, ValueRange):
+        lo: Any = values.coerce_literal(ftype, item.lo)
+        hi: Any = values.coerce_literal(ftype, item.hi)
+        if hi < lo:
+            raise ValueError(f"inverted membership range: {item.lo!r}..{item.hi!r}")
+        encode = get_column_type(ftype).encode
+        params.append(encode(lo))
+        params.append(encode(hi))
+        between = f"BETWEEN {placeholder} AND {placeholder}"
+        if field.multi:
+            return _any_occurrence(column, f"{_LAMBDA_VAR} {between}")
+        return f"{column} {between}"
+    params.append(_encode(ftype, item))
+    if field.multi:
+        return f"list_contains({column}, {placeholder})"
+    return f"{column} = {placeholder}"
 
 
 def _quote(name: str) -> str:

@@ -8,7 +8,7 @@ absent. Execution against a real DuckDB lives in tests/test_sql_duckdb.py.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from ipaddress import IPv4Address, IPv6Address
+from ipaddress import IPv4Address, IPv6Address, ip_network
 
 import pytest
 
@@ -124,3 +124,76 @@ class TestNegationAndConnectives:
 
         with pytest.raises(UnsupportedSqlExprError, match="Weird"):
             compile_sql(Weird())
+
+
+class TestPresence:
+    def test_scalar_presence_is_is_not_null(self) -> None:
+        assert compile_sql(SRC.present()) == SqlPredicate('"ip_src" IS NOT NULL', ())
+
+    def test_multi_presence_is_a_length_test(self) -> None:
+        assert compile_sql(PORT.present()) == SqlPredicate('len("tcp_port") > 0', ())
+
+    def test_column_name_comes_from_the_naming_policy(self) -> None:
+        # Full abbrev, lowercased, non-alnum -> "_": the frozen #25/#26 policy,
+        # imported rather than restated (tcp.port and udp.port must not merge).
+        assert compile_sql(QNAME.present()).sql == 'len("dns_qry_name") > 0'
+
+    def test_negated_presence_is_null_safe(self) -> None:
+        # IS NOT NULL never yields NULL, so NOT of it selects the absent rows —
+        # the one place the SQL backend matches the predicate backend on absence.
+        assert compile_sql(~SRC.present()).sql == 'NOT ("ip_src" IS NOT NULL)'
+
+
+class TestMembership:
+    def test_scalar_set_is_an_or_of_equalities(self) -> None:
+        result = compile_sql(TTL.in_([1, 64]))
+        assert result.sql == '("ip_ttl" = ? OR "ip_ttl" = ?)'
+        assert result.params == (1, 64)
+
+    def test_multi_set_uses_list_contains_per_element(self) -> None:
+        result = compile_sql(PORT.in_([80, 443]))
+        assert result.sql == '(list_contains("tcp_port", ?) OR list_contains("tcp_port", ?))'
+        assert result.params == (80, 443)
+
+    def test_single_element_set_needs_no_parentheses(self) -> None:
+        assert compile_sql(PORT.in_([443])) == SqlPredicate('list_contains("tcp_port", ?)', (443,))
+
+    def test_range_on_a_multi_field_is_an_any_occurrence_between(self) -> None:
+        result = compile_sql(PORT.in_([range(8000, 8081)]))
+        assert result.sql == 'len(list_filter("tcp_port", x -> x BETWEEN ? AND ?)) > 0'
+        assert result.params == (8000, 8080)
+
+    def test_inverted_range_raises(self) -> None:
+        with pytest.raises(ValueError, match="inverted membership range"):
+            compile_sql(TTL.in_([(64, 1)]))
+
+    def test_not_in_is_not_of_the_whole_set(self) -> None:
+        result = compile_sql(~PORT.in_([80, 443]))
+        assert result.sql == (
+            'NOT ((list_contains("tcp_port", ?) OR list_contains("tcp_port", ?)))'
+        )
+        assert result.params == (80, 443)
+
+
+class TestSubnetMembership:
+    def test_ipv4_subnet_is_a_between_over_the_integer_column(self) -> None:
+        # Acceptance criterion 3. There is no subnet node in the IR: a subnet
+        # test is a Membership carrying a ValueRange of the network's first and
+        # last address, which lowers to the zone-map-friendly range predicate
+        # that #26 stores integer addresses for.
+        network = ip_network("10.0.0.0/24")
+        result = compile_sql(SRC.in_([(network[0], network[-1])]))
+        assert result.sql == '"ip_src" BETWEEN ? AND ?'
+        assert result.params == (int(network[0]), int(network[-1]))
+        assert "10.0.0" not in result.sql
+
+    def test_ipv6_subnet_casts_both_endpoints(self) -> None:
+        network = ip_network("2001:db8::/32")
+        result = compile_sql(V6SRC.in_([(network[0], network[-1])]))
+        assert result.sql == ('"ipv6_src" BETWEEN CAST(? AS UHUGEINT) AND CAST(? AS UHUGEINT)')
+        assert result.params == (str(int(network[0])), str(int(network[-1])))
+
+    def test_subnet_endpoints_may_be_written_as_text(self) -> None:
+        result = compile_sql(SRC.in_([("10.0.0.0", "10.0.0.255")]))
+        assert result.sql == '"ip_src" BETWEEN ? AND ?'
+        assert result.params == (int(IPv4Address("10.0.0.0")), int(IPv4Address("10.0.0.255")))
