@@ -307,11 +307,13 @@ class TestSurvival:
             spec = column_spec("tcp.port", "FT_UINT16", multi=True)
             with ws.write() as con:
                 add_field_column(con, spec.column_name, spec.sql_type)
-                cols = con.execute(
-                    "SELECT count(*) FROM duckdb_columns() WHERE database_name = current_database() "
-                    "AND schema_name = 'main' AND table_name = 'pkts' AND column_name = ?",
-                    [spec.column_name],
-                ).fetchone()
+                sql = (
+                    "SELECT count(*) FROM duckdb_columns() "
+                    "WHERE database_name = current_database() "
+                    "AND schema_name = 'main' AND table_name = 'pkts' "
+                    "AND column_name = ?"
+                )
+                cols = con.execute(sql, [spec.column_name]).fetchone()
                 assert cols is not None and cols[0] == 1
             self._materialize(ws, (1, 2, 3))
             assert ws.list_annotations() == (
