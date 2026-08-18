@@ -307,6 +307,12 @@ class TestSurvival:
             spec = column_spec("tcp.port", "FT_UINT16", multi=True)
             with ws.write() as con:
                 add_field_column(con, spec.column_name, spec.sql_type)
+                cols = con.execute(
+                    "SELECT count(*) FROM duckdb_columns() WHERE database_name = current_database() "
+                    "AND schema_name = 'main' AND table_name = 'pkts' AND column_name = ?",
+                    [spec.column_name],
+                ).fetchone()
+                assert cols is not None and cols[0] == 1
             self._materialize(ws, (1, 2, 3))
             assert ws.list_annotations() == (
                 AnnotationRecord(
@@ -367,3 +373,11 @@ class TestSurvival:
             remaining = ws.list_annotations()
             assert [r.target_id for r in remaining] == [1]
             assert remaining[0].orphaned is False
+
+    def test_annotations_survive_compact(self, tmp_path: Path) -> None:
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw") as ws:
+            self._materialize(ws, (1, 2))
+            ws.add_annotation("packet", 1, "verdict", "kept", created_at=UTC_NOW)
+            ws.compact()
+            assert [r.value for r in ws.list_annotations()] == ["kept"]
