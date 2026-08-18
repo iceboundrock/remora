@@ -15,6 +15,7 @@ import pytest
 from remora.compile.sql import SqlPredicate, UnsupportedSqlExprError, compile_sql
 from remora.expr import Expr
 from remora.fields import FieldRef
+from remora.workspace.naming import column_name
 
 SRC = FieldRef[IPv4Address]("ip.src", "FT_IPv4", False)
 DST = FieldRef[IPv4Address]("ip.dst", "FT_IPv4", False)
@@ -226,8 +227,59 @@ class TestContains:
         with pytest.raises(TypeError, match="contains needs a str needle"):
             compile_sql(HOST.contains(b"\xbb"))
 
+    def test_str_needle_on_bytes_field_is_a_user_error(self) -> None:
+        # The needle-type check must run before the BLOB refusal: a wrong
+        # needle is the user's mistake, not a backend limitation.
+        with pytest.raises(TypeError, match="contains needs a str needle"):
+            compile_sql(PAYLOAD.contains("text"))
+
+    def test_contains_composes_with_interleaved_params(self) -> None:
+        result = compile_sql((TTL < 64) & ~HOST.contains("evil"))
+        assert result.sql == '("ip_ttl" < ? AND NOT (contains("http_host", ?)))'
+        assert result.params == (64, "evil")
+
 
 class TestMatches:
     def test_matches_is_refused(self) -> None:
         with pytest.raises(UnsupportedSqlExprError, match="RE2"):
             compile_sql(HOST.matches("^ex.*com$"))
+
+
+HOSTILE_LITERALS = (
+    "'; DROP TABLE pkts; --",
+    '" OR "1"="1',
+    "\\'; DELETE FROM main.pkts; --",
+    "x' UNION SELECT * FROM meta.info --",
+    "a\x00b",
+)
+
+
+class TestNoInjectionPath:
+    @pytest.mark.parametrize("hostile", HOSTILE_LITERALS)
+    def test_hostile_string_literal_is_bound_never_rendered(self, hostile: str) -> None:
+        # Acceptance criterion 4: the literal reaches DuckDB only as a parameter.
+        result = compile_sql(hostile == HOST)
+        assert result == SqlPredicate('"http_host" = ?', (hostile,))
+        assert hostile not in result.sql
+
+    @pytest.mark.parametrize("hostile", HOSTILE_LITERALS)
+    def test_hostile_needle_is_bound(self, hostile: str) -> None:
+        result = compile_sql(HOST.contains(hostile))
+        assert result == SqlPredicate('contains("http_host", ?)', (hostile,))
+
+    def test_hostile_field_abbrev_cannot_escape_the_identifier(self) -> None:
+        # column_name() maps every non-alphanumeric to "_", so a hostile abbrev
+        # is inert before quoting even gets a say; assert both halves.
+        hostile = FieldRef[str]('http.host"; DROP TABLE pkts; --', "FT_STRING", False)
+        result = compile_sql(hostile == "x")
+        assert result.sql == f'"{column_name(hostile.name)}" = ?'
+        assert ";" not in result.sql
+        assert "DROP" not in result.sql
+
+    def test_every_placeholder_has_exactly_one_parameter(self) -> None:
+        expr = (
+            ((SRC == "10.0.0.1") & PORT.in_([80, 443, range(8000, 8081)]))
+            | (~HOST.contains("evil"))
+        ) & (V6SRC == "ff02::1")
+        result = compile_sql(expr)
+        assert result.sql.count("?") == len(result.params)
