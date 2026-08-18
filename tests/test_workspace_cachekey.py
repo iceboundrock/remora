@@ -494,7 +494,11 @@ class TestPackageSurface:
             assert hasattr(workspace, name)
 
     def test_module_is_import_pure(self) -> None:
-        """The workspace layer never imports duckdb at runtime."""
+        """Importing the cachekey module never imports duckdb.
+
+        Import-time purity only: the one lazy runtime import lives in
+        workspace.py's connect helper, reached when a connection is opened.
+        """
         result = subprocess.run(
             [
                 sys.executable,

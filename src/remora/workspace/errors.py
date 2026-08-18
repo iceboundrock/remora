@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-__all__ = ["ColumnNameCollisionError", "SchemaVersionError", "WorkspaceError"]
+__all__ = [
+    "ColumnNameCollisionError",
+    "SchemaVersionError",
+    "WorkspaceError",
+    "WorkspaceModeError",
+]
 
 
 class WorkspaceError(Exception):
@@ -15,3 +20,7 @@ class SchemaVersionError(WorkspaceError):
 
 class ColumnNameCollisionError(WorkspaceError):
     """Two distinct field abbrevs mangle to one column name."""
+
+
+class WorkspaceModeError(WorkspaceError):
+    """A write API was called on a workspace opened read-only."""

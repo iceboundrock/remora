@@ -60,7 +60,7 @@ Domain-specific protocol sets ship as separate distributions, selected with an e
 | `telecom` | `GTP`, `DIAMETER` | `remora-telecom` |
 | `all` | everything above, plus `workspace` | all three, plus `duckdb` |
 
-One extra is not a protocol set: `workspace` pulls in DuckDB for the materialized workspace (M4 — the storage layer is landing ahead of the `Workspace`/`Query` API, so there is nothing to import yet). `all` means everything, so it includes that one too.
+One extra is not a protocol set: `workspace` pulls in DuckDB for the materialized workspace (M4 — the storage layer and the `Workspace` lifecycle class have landed, so `from remora.workspace import Workspace` gives you open/read/write/compact today; the `Query` API on top is still to come). `all` means everything, so it includes that one too.
 
 The protocol extras' *distributions* are unpublished, so `pip install "remora[wireless]"` cannot resolve — the extra points at a `remora-wireless` distribution that no index carries. Until they ship, install them from a checkout, alongside core. Each extra lives at `packages/<distribution>`, so name the ones you want:
 
