@@ -381,11 +381,19 @@ class Workspace:
             created_at: When the annotation was made; defaults to now.
 
         Returns:
-            The new ``annotation_id``.
+            The new ``annotation_id``, taken from the ``meta.info``
+            high-water mark :mod:`remora.workspace.annotations` documents:
+            monotonic, and never reused.
 
         Raises:
             WorkspaceModeError: In ro mode.
             ValueError: If ``scope`` or ``key`` is invalid.
+            duckdb.Error: If another thread's :meth:`write` transaction is
+                allocating an id at the same moment — ``TransactionException``
+                when both advance an existing mark, ``ConstraintException``
+                when both seed a missing one. The transaction rolls back
+                whole, so no annotation is written and no id is shared;
+                whether to retry is the caller's decision.
         """
         with self.write() as con:
             return _annotations.add_annotation(

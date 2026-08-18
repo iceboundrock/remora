@@ -255,7 +255,14 @@ def add_annotation(
     keeps and flags rather than refusing.
 
     Args:
-        con: A read-write connection to the workspace.
+        con: A read-write connection to the workspace, **inside a
+            transaction the caller drives** — ``Workspace.write()`` provides
+            exactly that. The id allocator reads the high-water mark and
+            advances it in two statements, so it is safe against a
+            concurrent allocation only when both land in one transaction
+            that can conflict as a unit. On an autocommit connection the
+            read and the advance are separate implicit transactions, and two
+            callers can still read the same mark and silently share an id.
         scope: ``"packet"`` (``target_id`` is a frame number) or
             ``"stream"`` (``target_id`` is a stream id).
         target_id: The frame number or stream id being annotated.
@@ -270,10 +277,12 @@ def add_annotation(
 
     Raises:
         ValueError: If ``scope`` is not a legal scope, or ``key`` is empty.
-        duckdb.Error: If another transaction in this process is allocating an
-            id at the same time — ``TransactionException`` or
-            ``ConstraintException`` on the mark row. The whole add rolls back;
-            no annotation is written and no id is shared.
+        duckdb.Error: If ``con`` is inside a transaction and another
+            transaction in this process is allocating an id at the same time
+            — ``TransactionException`` or ``ConstraintException`` on the mark
+            row. The whole add rolls back; no annotation is written and no id
+            is shared. This is the guarantee an autocommit ``con`` gives up:
+            there the race is not detected and no error is raised.
     """
     _check_scope(scope)
     if not key:
