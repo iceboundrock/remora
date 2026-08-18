@@ -198,6 +198,9 @@ def _render(expr: Expr, params: list[Any]) -> str:
     if isinstance(expr, Comparison):
         return _render_comparison(expr, params)
     if isinstance(expr, Presence):
+        # Presence is exempt from the NULL divergence: coalesce guards against back-filled NULL
+        # on multi columns. Harmonizing comparisons would require wrapping every scanned column
+        # in coalesce, which would defeat zone-map skipping (see module docstring, issue #29).
         column = _column(expr.field)
         return f"len(coalesce({column}, [])) > 0" if expr.field.multi else f"{column} IS NOT NULL"
     if isinstance(expr, Membership):
