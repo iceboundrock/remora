@@ -396,6 +396,54 @@ class TestCompact:
                 assert row is not None
                 assert row[0] == 1
 
+    def test_second_process_may_connect_after_swap(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw") as ws:
+            with ws.write() as con:
+                con.execute(
+                    "INSERT INTO pkts (frame_number, frame_time) "
+                    "VALUES (1, TIMESTAMP '2024-01-01 00:00:00')"
+                )
+            real_replace = os.replace
+            probed: list[str] = []
+
+            def probing_replace(src: object, dst: object) -> None:
+                real_replace(src, dst)  # type: ignore[arg-type]
+                # The rename, not the return, is the cross-process
+                # linearization point: it installs a new inode the old
+                # file's lock does not cover, so a second process may
+                # connect the instant it lands — safely, its write going
+                # into the compacted file, where it must survive. This is
+                # the documented contract's outer edge, the mirror of
+                # test_compact_swap_holds_exclusive_lock's pre-rename
+                # exclusion probe.
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        "import duckdb, sys; "
+                        "con = duckdb.connect(sys.argv[1], read_only=False); "
+                        'con.execute("INSERT INTO pkts (frame_number, frame_time) '
+                        "VALUES (2, TIMESTAMP '2024-01-01 00:00:01')\"); "
+                        "con.close()",
+                        str(path),
+                    ],
+                    capture_output=True,
+                    timeout=60,
+                )
+                assert result.returncode == 0, result.stderr
+                probed.append("committed")
+
+            monkeypatch.setattr("remora.workspace.workspace.os.replace", probing_replace)
+            ws.compact()
+            monkeypatch.undo()
+            assert probed == ["committed"]
+            with ws.read() as con:
+                rows = con.execute("SELECT frame_number FROM pkts ORDER BY frame_number").fetchall()
+            assert rows == [(1,), (2,)]
+
     def test_compact_refuses_inflight_write(self, tmp_path: Path) -> None:
         path = tmp_path / "ws.duckdb"
         with Workspace(path, mode="rw") as ws:

@@ -397,11 +397,16 @@ class Workspace:
         The copy runs on a read-write connection to the source and the
         swap happens while that connection is still open, so the source's
         exclusive lock is held across both. Other processes — readers as
-        well as writers — are locked out for compact's whole duration and
-        fail fast on the lock rather than losing data: a concurrent
-        writer either commits before compaction begins (and is copied) or
-        cannot connect until the swap is done, so no commit can land
-        between the snapshot and the rename and be silently discarded.
+        well as writers — fail fast on that lock from the moment it is
+        taken *through the atomic rename*, rather than losing data: a
+        concurrent writer either commits before the lock is taken (and is
+        copied) or cannot connect until the rename is done, so no commit
+        can land between the snapshot and the rename and be silently
+        discarded. The rename, not the return, is the cross-process
+        linearization point: it installs a new inode the old file's lock
+        does not cover, so another process may connect the instant it
+        lands — safely, because such a write goes into the compacted file
+        and survives; there is nothing left for compact to discard.
         Conversely, compaction needs sole access: if any other process —
         even a read-only reader — is already connected when it starts, the
         connect fails with DuckDB's lock error and nothing is modified.
@@ -431,9 +436,12 @@ class Workspace:
         :meth:`write` or rw-mode :meth:`read` in
         flight on *any* :class:`Workspace` for this file raises
         :class:`WorkspaceError` here, a second concurrent :meth:`compact`
-        is rejected the same way, and for compact's duration writers and
-        rw-mode readers fail fast exactly as a second process does on the
-        lock.
+        is rejected the same way, and writers and rw-mode readers fail
+        fast for compact's whole duration — through the rename and until
+        the source connection is closed, deliberately a hair longer than
+        other processes are held out, precisely because an admitted
+        same-process writer would join the pre-swap instance where a
+        fresh process opens the new file.
 
         Raises:
             WorkspaceModeError: In ro mode; reopen with
