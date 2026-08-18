@@ -153,18 +153,20 @@ class TestImportPurity:
             "import remora.compile.sql\n"
             "assert 'duckdb' not in sys.modules, 'duckdb imported by the sql backend'\n"
         )
-        subprocess.run(
-            [sys.executable, "-c", code], check=True, timeout=60, capture_output=True, text=True
+        proc = subprocess.run(
+            [sys.executable, "-c", code], check=False, timeout=60, capture_output=True, text=True
         )
+        assert proc.returncode == 0, proc.stderr
 
 
 #: Cases the SQL backend refuses outright, with the reason it refuses them.
+#: Values are regex-safe fragments for pytest.raises(match=...) assertions.
 SQL_UNSUPPORTED_CASES: dict[str, str] = {
-    "matches-case-insensitive": "DuckDB's regexp engine is RE2, not PCRE2",
-    "matches-byte-oriented": "DuckDB's regexp engine is RE2, not PCRE2",
-    "matches-multi-value-any-occurrence": "DuckDB's regexp engine is RE2, not PCRE2",
-    "not-matches-absent-is-true": "DuckDB's regexp engine is RE2, not PCRE2",
-    "contains-bytes": "DuckDB's contains() takes VARCHAR or LIST, not the BLOB column",
+    "matches-case-insensitive": "RE2",
+    "matches-byte-oriented": "RE2",
+    "matches-multi-value-any-occurrence": "RE2",
+    "not-matches-absent-is-true": "RE2",
+    "contains-bytes": "BLOB",
 }
 
 #: Cases that compile but select a different row set, because SQL is
@@ -218,7 +220,7 @@ def test_sql_backend_matches_the_predicate_backend(con: DuckDBPyConnection, case
     """
     reason = SQL_UNSUPPORTED_CASES.get(case.id)
     if reason is not None:
-        with pytest.raises(UnsupportedSqlExprError):
+        with pytest.raises(UnsupportedSqlExprError, match=reason):
             compile_sql(case.expr)
         return
     seed_case(con, case)
@@ -232,6 +234,7 @@ def test_coverage_maps_name_real_cases() -> None:
     ids = {case.id for case in CASES}
     assert set(SQL_UNSUPPORTED_CASES) <= ids
     assert set(SQL_NULL_DIVERGENT_CASES) <= ids
+    assert not (set(SQL_UNSUPPORTED_CASES) & set(SQL_NULL_DIVERGENT_CASES))
 
 
 def test_divergent_cases_really_do_diverge() -> None:
