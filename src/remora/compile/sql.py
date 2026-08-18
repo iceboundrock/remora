@@ -33,7 +33,7 @@ Rendering rules
   multi-value ``==`` and the predicate backend's ``any()``.
 - Ordered comparisons on a multi column -> ``len(list_filter("col", x -> x <op>
   ?)) > 0``, the same any-occurrence rule spelled out for a list.
-- ``Presence(field)`` -> ``"col" IS NOT NULL`` (scalar) / ``len("col") > 0``
+- ``Presence(field)`` -> ``"col" IS NOT NULL`` (scalar) / ``len(coalesce("col", [])) > 0``
   (multi).
 - ``Membership(field, values)`` -> the ``OR`` of one term per element; a
   :class:`~remora.expr.ValueRange` element becomes ``"col" BETWEEN ? AND ?``
@@ -84,11 +84,11 @@ multi-value field as ``[]``, and SQL is three-valued, so:
   predicate backend's ``not False`` includes it. ``x != v`` on a scalar field
   therefore does not select packets missing the field, where the Wireshark and
   Python backends do.
-- **Presence is exempt**: ``IS NOT NULL`` and ``len(...) > 0`` never yield
+- **Presence is exempt**: ``IS NOT NULL`` and ``len(coalesce(..., [])) > 0`` never yield
   ``NULL``, so ``~field.present()`` matches the other backends exactly.
 - **A multi column back-filled with ``NULL``** (a column added after older rows
-  were written) behaves like the absent-scalar case, not like ``[]``:
-  ``list_contains(NULL, v)`` is ``NULL``.
+  were written) behaves like the absent-scalar case for comparisons (``list_contains(NULL, v)``
+  is ``NULL``), but presence treats it as absent via ``coalesce(..., [])``.
 
 Reconciling that divergence across backends is explicitly out of scope for issue
 #29; it is stated here so callers can rely on it rather than discover it.
@@ -197,7 +197,7 @@ def _render(expr: Expr, params: list[Any]) -> str:
         return _render_comparison(expr, params)
     if isinstance(expr, Presence):
         column = _column(expr.field)
-        return f"len({column}) > 0" if expr.field.multi else f"{column} IS NOT NULL"
+        return f"len(coalesce({column}, [])) > 0" if expr.field.multi else f"{column} IS NOT NULL"
     if isinstance(expr, Membership):
         return _render_membership(expr, params)
     if isinstance(expr, Not):

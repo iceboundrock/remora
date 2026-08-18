@@ -131,17 +131,22 @@ class TestPresence:
         assert compile_sql(SRC.present()) == SqlPredicate('"ip_src" IS NOT NULL', ())
 
     def test_multi_presence_is_a_length_test(self) -> None:
-        assert compile_sql(PORT.present()) == SqlPredicate('len("tcp_port") > 0', ())
+        assert compile_sql(PORT.present()) == SqlPredicate('len(coalesce("tcp_port", [])) > 0', ())
 
     def test_column_name_comes_from_the_naming_policy(self) -> None:
         # Full abbrev, lowercased, non-alnum -> "_": the frozen #25/#26 policy,
         # imported rather than restated (tcp.port and udp.port must not merge).
-        assert compile_sql(QNAME.present()).sql == 'len("dns_qry_name") > 0'
+        assert compile_sql(QNAME.present()).sql == 'len(coalesce("dns_qry_name", [])) > 0'
 
     def test_negated_presence_is_null_safe(self) -> None:
         # IS NOT NULL never yields NULL, so NOT of it selects the absent rows —
         # the one place the SQL backend matches the predicate backend on absence.
         assert compile_sql(~SRC.present()).sql == 'NOT ("ip_src" IS NOT NULL)'
+
+    def test_negated_multi_presence_is_null_safe(self) -> None:
+        # coalesce(..., []) treats a back-filled NULL column as absent, so
+        # NOT of that is false (not NULL) — the other exception to the three-valued logic.
+        assert compile_sql(~PORT.present()).sql == 'NOT (len(coalesce("tcp_port", [])) > 0)'
 
 
 class TestMembership:
