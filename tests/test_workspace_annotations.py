@@ -22,7 +22,8 @@ from remora.workspace.annotations import (
     remove_annotations,
 )
 from remora.workspace.errors import WorkspaceModeError
-from remora.workspace.schema import create_schema
+from remora.workspace.schema import add_field_column, create_schema
+from remora.workspace.types import column_spec
 
 if TYPE_CHECKING:
     from duckdb import DuckDBPyConnection
@@ -277,3 +278,92 @@ class TestWorkspaceMethods:
             with pytest.raises(ValueError, match="key"):
                 ws.add_annotation("packet", 1, "", created_at=UTC_NOW)
             assert ws.list_annotations() == ()
+
+
+class TestSurvival:
+    """What a re-materialization does to annotations (issue #30's core question)."""
+
+    @staticmethod
+    def _materialize(ws: Workspace, frames: tuple[int, ...]) -> None:
+        """Rewrite pkts the way #31's materialize pipeline will: replace rows."""
+        with ws.write() as con:
+            con.execute("DELETE FROM main.pkts")
+            for frame in frames:
+                con.execute(
+                    "INSERT INTO main.pkts (frame_number, frame_time) VALUES (?, ?)",
+                    # Naive: DuckDB TIMESTAMP is timezone-naive UTC by the
+                    # convention in remora.workspace.types.
+                    [frame, datetime(2026, 8, 18, 0, 0, frame)],
+                )
+
+    def test_annotations_survive_a_column_being_added(self, tmp_path: Path) -> None:
+        # Re-materializing with a wider field set adds columns to pkts and
+        # rewrites its rows; annotations live in their own table and must be
+        # untouched, still pointing at the same frames.
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw") as ws:
+            self._materialize(ws, (1, 2, 3))
+            ws.add_annotation("packet", 2, "verdict", "retransmit", created_at=UTC_NOW)
+            spec = column_spec("tcp.port", "FT_UINT16", multi=True)
+            with ws.write() as con:
+                add_field_column(con, spec.column_name, spec.sql_type)
+            self._materialize(ws, (1, 2, 3))
+            assert ws.list_annotations() == (
+                AnnotationRecord(
+                    annotation_id=1,
+                    scope="packet",
+                    target_id=2,
+                    key="verdict",
+                    value="retransmit",
+                    created_at=UTC_NOW,
+                    orphaned=False,
+                ),
+            )
+
+    def test_annotations_survive_close_and_reopen(self, tmp_path: Path) -> None:
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw") as ws:
+            self._materialize(ws, (1,))
+            ws.add_annotation("packet", 1, "verdict", "bad", created_at=UTC_NOW)
+        with Workspace(path) as ws:
+            assert [r.value for r in ws.list_annotations()] == ["bad"]
+
+    def test_a_narrower_rematerialization_orphans_but_keeps(self, tmp_path: Path) -> None:
+        # The decided policy: kept-but-flagged. A narrower display filter
+        # drops frame 3 from pkts; the finding about it is analyst data and
+        # is never destroyed on its own.
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw") as ws:
+            self._materialize(ws, (1, 2, 3))
+            ws.add_annotation("packet", 1, "verdict", "kept", created_at=UTC_NOW)
+            ws.add_annotation("packet", 3, "verdict", "dropped", created_at=UTC_NOW)
+            self._materialize(ws, (1, 2))
+            by_id = {r.annotation_id: r for r in ws.list_annotations()}
+            assert len(by_id) == 2
+            assert by_id[1].orphaned is False
+            assert by_id[2].orphaned is True
+            assert by_id[2].value == "dropped"
+
+    def test_a_wider_rematerialization_un_orphans(self, tmp_path: Path) -> None:
+        # Orphanhood is derived at read time, which is why nothing deletes an
+        # orphan implicitly: widening the filter brings the target back.
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw") as ws:
+            self._materialize(ws, (1,))
+            ws.add_annotation("packet", 3, "verdict", "dropped", created_at=UTC_NOW)
+            assert ws.list_annotations()[0].orphaned is True
+            self._materialize(ws, (1, 2, 3))
+            assert ws.list_annotations()[0].orphaned is False
+
+    def test_explicit_cleanup_is_the_only_thing_that_deletes_orphans(self, tmp_path: Path) -> None:
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw") as ws:
+            self._materialize(ws, (1, 2, 3))
+            ws.add_annotation("packet", 1, "verdict", "kept", created_at=UTC_NOW)
+            ws.add_annotation("packet", 3, "verdict", "dropped", created_at=UTC_NOW)
+            self._materialize(ws, (1,))
+            assert len(ws.list_annotations()) == 2
+            assert ws.delete_orphan_annotations() == 1
+            remaining = ws.list_annotations()
+            assert [r.target_id for r in remaining] == [1]
+            assert remaining[0].orphaned is False
