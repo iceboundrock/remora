@@ -258,7 +258,7 @@ class TestNoInjectionPath:
     @pytest.mark.parametrize("hostile", HOSTILE_LITERALS)
     def test_hostile_string_literal_is_bound_never_rendered(self, hostile: str) -> None:
         # Acceptance criterion 4: the literal reaches DuckDB only as a parameter.
-        result = compile_sql(hostile == HOST)
+        result = compile_sql(HOST == hostile)  # noqa: SIM300
         assert result == SqlPredicate('"http_host" = ?', (hostile,))
         assert hostile not in result.sql
 
