@@ -30,7 +30,11 @@ workspace written before the sequence existed would never gain it. Like
 exclusive file lock serializes writers across processes, but two threads in
 one process can hold two ``Workspace.write()`` transactions at once, and
 those can compute the same next id. Callers annotating from several threads
-must serialize their writes.
+must serialize their writes. Deleting the highest-numbered annotation frees
+its id; the next :func:`add_annotation` reuses it. An id held across a
+deletion can therefore come to name a different annotation, and
+:func:`remove_annotation` with a stale id silently deletes the wrong finding.
+Callers that hold ids across deletions must re-list first.
 
 Capture identity
 ----------------
@@ -62,7 +66,9 @@ packets they point at. :func:`list_annotations` computes
 :attr:`AnnotationRecord.orphaned` at read time — true when no row in
 ``pkts`` (or ``streams``) carries the annotation's ``target_id`` — and
 :func:`delete_orphan_annotations` is the explicit cleanup a caller can run
-when it really does want them gone.
+when it really does want them gone. ``main.streams`` is unpopulated until
+#33 lands stream semantics, so every stream annotation currently reads as
+``orphaned=True`` and :func:`delete_orphan_annotations` removes all of them.
 
 Connections are supplied by the caller — this module never opens one, because
 connection and lock ownership belongs to ``Workspace`` (#28), whose
@@ -247,7 +253,10 @@ def list_annotations(
     Args:
         con: An open connection to the workspace. Works in ro mode.
         scope: Restrict to one scope, or ``None`` for both.
-        target_id: Restrict to one frame number / stream id.
+        target_id: Restrict to one frame number or stream id. Frame numbers
+            and stream ids are separate namespaces that overlap, so ``None``
+            scope with a given ``target_id`` matches annotations in both
+            scopes; pass ``scope`` to mean one.
         key: Restrict to one label.
 
     Returns:
@@ -281,9 +290,11 @@ def list_annotations(
 def remove_annotation(con: DuckDBPyConnection, annotation_id: int) -> bool:
     """Remove one annotation by id.
 
-    Removal by id is the precise form: an id names exactly one annotation,
-    so nothing else can be caught by accident. Removing a whole label or a
-    whole target is :func:`remove_annotations`.
+    Removal by id is the precise form: an id names one annotation by
+    convention — ``annotation_id`` is unique the way ``pkts.frame_number``
+    is (see the module docstring) — and ``DELETE`` removes every row that
+    matches. Removing a whole label or a whole target is
+    :func:`remove_annotations`.
 
     Args:
         con: A read-write connection to the workspace.
@@ -315,8 +326,12 @@ def remove_annotations(
 
     Args:
         con: A read-write connection to the workspace.
-        scope: Restrict to one scope.
-        target_id: Restrict to one frame number / stream id.
+        scope: Restrict to one scope, or ``None`` for both.
+        target_id: Restrict to one frame number or stream id. Frame numbers
+            and stream ids are separate namespaces that overlap, so ``None``
+            scope with a given ``target_id`` matches annotations in both
+            scopes; pass ``scope`` to mean one. It matters most on this
+            destructive call.
         key: Restrict to one label.
 
     Returns:
@@ -341,7 +356,9 @@ def delete_orphan_annotations(con: DuckDBPyConnection) -> int:
     The explicit half of the kept-but-flagged policy: nothing deletes an
     orphan on its own, because a re-materialization under a wider filter can
     bring its target back. Call this when the current ``pkts``/``streams``
-    contents are the ones to keep.
+    contents are the ones to keep. ``main.streams`` is unpopulated until #33
+    lands stream semantics, so every stream annotation currently reads as
+    orphaned and this call removes all of them.
 
     Args:
         con: A read-write connection to the workspace.
