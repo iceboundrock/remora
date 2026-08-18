@@ -115,9 +115,11 @@ from remora.expr import (
     And,
     CompareOp,
     Comparison,
+    Contains,
     Expr,
     FieldLike,
     LiteralValue,
+    Matches,
     Membership,
     MembershipItem,
     Not,
@@ -200,6 +202,14 @@ def _render(expr: Expr, params: list[Any]) -> str:
         return f"len(coalesce({column}, [])) > 0" if expr.field.multi else f"{column} IS NOT NULL"
     if isinstance(expr, Membership):
         return _render_membership(expr, params)
+    if isinstance(expr, Contains):
+        return _render_contains(expr, params)
+    if isinstance(expr, Matches):
+        raise UnsupportedSqlExprError(
+            "matches is not compiled to SQL: DuckDB's regexp engine is RE2, whose "
+            "dialect and case folding differ from Wireshark's PCRE2 and the "
+            "predicate backend's Python re"
+        )
     if isinstance(expr, Not):
         return f"NOT ({_render(expr.operand, params)})"
     if isinstance(expr, And):
@@ -257,6 +267,32 @@ def _render_member(field: FieldLike, column: str, item: MembershipItem, params: 
     if field.multi:
         return f"list_contains({column}, {placeholder})"
     return f"{column} = {placeholder}"
+
+
+def _render_contains(expr: Contains, params: list[Any]) -> str:
+    """Render ``field contains needle`` over a VARCHAR (or VARCHAR LIST) column."""
+    field = expr.field
+    needle = expr.needle
+    py_type = values.get_info(field.ftype).py_type
+    if not (
+        (py_type is str and isinstance(needle, str))
+        or (py_type is bytes and isinstance(needle, bytes))
+    ):
+        raise TypeError(
+            "contains needs a str needle on string fields and a bytes needle on "
+            f"bytes fields; got {type(needle).__name__} for {field.ftype}"
+        )
+    if py_type is not str:
+        raise UnsupportedSqlExprError(
+            f"contains on {field.ftype} is not compiled to SQL: the column is "
+            f"{column_sql_type(field.ftype)} and DuckDB's contains() takes VARCHAR "
+            "or LIST, not BLOB"
+        )
+    column = _column(field)
+    params.append(needle)
+    if field.multi:
+        return _any_occurrence(column, f"contains({_LAMBDA_VAR}, ?)")
+    return f"contains({column}, ?)"
 
 
 def _quote(name: str) -> str:

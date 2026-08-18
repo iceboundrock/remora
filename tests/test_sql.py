@@ -202,3 +202,32 @@ class TestSubnetMembership:
         result = compile_sql(SRC.in_([("10.0.0.0", "10.0.0.255")]))
         assert result.sql == '"ip_src" BETWEEN ? AND ?'
         assert result.params == (int(IPv4Address("10.0.0.0")), int(IPv4Address("10.0.0.255")))
+
+
+class TestContains:
+    def test_scalar_string_contains(self) -> None:
+        assert compile_sql(HOST.contains("ample")) == SqlPredicate(
+            'contains("http_host", ?)', ("ample",)
+        )
+
+    def test_multi_string_contains_is_any_occurrence(self) -> None:
+        result = compile_sql(QNAME.contains("example"))
+        assert result.sql == 'len(list_filter("dns_qry_name", x -> contains(x, ?))) > 0'
+        assert result.params == ("example",)
+
+    def test_bytes_field_is_unsupported(self) -> None:
+        # DuckDB's contains() takes VARCHAR or LIST, not BLOB, and #26 stores
+        # FT_BYTES as BLOB: refuse rather than emit something that half-works.
+        with pytest.raises(UnsupportedSqlExprError, match="BLOB"):
+            compile_sql(PAYLOAD.contains(b"\xbb\xcc"))
+
+    def test_needle_type_mismatch_is_a_user_error(self) -> None:
+        # Same timing and same exception type as the dfilter/predicate backends.
+        with pytest.raises(TypeError, match="contains needs a str needle"):
+            compile_sql(HOST.contains(b"\xbb"))
+
+
+class TestMatches:
+    def test_matches_is_refused(self) -> None:
+        with pytest.raises(UnsupportedSqlExprError, match="RE2"):
+            compile_sql(HOST.matches("^ex.*com$"))
