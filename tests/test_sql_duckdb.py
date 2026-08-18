@@ -36,6 +36,10 @@ HOST = FieldRef[str]("http.host", "FT_STRING", False)
 SRC = FieldRef[IPv4Address]("ip.src", "FT_IPv4", False)
 V6SRC = FieldRef[IPv6Address]("ipv6.src", "FT_IPv6", False)
 V6ADDR = FieldRef[IPv6Address]("ipv6.addr", "FT_IPv6", True)
+DVAL = FieldRef[float]("x.value", "FT_DOUBLE", False)
+DVALS = FieldRef[float]("x.values", "FT_DOUBLE", True)
+
+NAN = float("nan")
 
 
 @pytest.fixture
@@ -142,6 +146,63 @@ class TestIPv4SubnetAgainstRealDuckDB:
         )
         expr = SRC.in_([(IPv4Address("10.0.0.0"), IPv4Address("10.0.0.255"))])
         assert select(con, expr) == {0, 1}
+
+
+class TestNaNAgainstRealDuckDB:
+    """The NaN rules, executed — DuckDB's total order is the whole reason.
+
+    In DuckDB a stored NaN equals itself and sorts greater than everything, so
+    an unguarded ``"col" > ?`` would select the NaN row for any literal. Rows:
+    0 is NaN, 1 is 1.5, 2 has no x.value at all (NULL).
+    """
+
+    @pytest.fixture
+    def seeded(self, con: DuckDBPyConnection) -> DuckDBPyConnection:
+        materialize(con, (DVAL,), ({"x.value": ("nan",)}, {"x.value": ("1.5",)}, {}))
+        return con
+
+    def test_the_nan_row_really_holds_a_nan(self, seeded: DuckDBPyConnection) -> None:
+        # The codec path is what puts it there: values.py parses "nan" with
+        # float(), and DOUBLE's encoder is the identity.
+        rows = seeded.execute(
+            'SELECT frame_number, isnan("x_value") FROM main.pkts ORDER BY frame_number'
+        ).fetchall()
+        assert [(int(number), flag) for number, flag in rows] == [(0, True), (1, False), (2, None)]
+
+    def test_gt_excludes_the_stored_nan(self, seeded: DuckDBPyConnection) -> None:
+        # Without the guard this would be {0, 1}: NaN sorts greatest.
+        assert select(seeded, DVAL > 0.0) == {1}
+
+    def test_ge_excludes_the_stored_nan(self, seeded: DuckDBPyConnection) -> None:
+        assert select(seeded, DVAL >= 0.0) == {1}
+
+    def test_lt_needs_no_guard(self, seeded: DuckDBPyConnection) -> None:
+        # NaN sorting greatest already makes NaN < 100.0 false.
+        assert select(seeded, DVAL < 100.0) == {1}
+
+    def test_between_needs_no_guard(self, seeded: DuckDBPyConnection) -> None:
+        assert select(seeded, DVAL.in_([(0.0, 100.0)])) == {1}
+
+    def test_nan_literal_matches_nothing(self, seeded: DuckDBPyConnection) -> None:
+        # Even though DuckDB's own `NaN = NaN` is true, the compiled predicate is
+        # FALSE, so the stored-NaN row is not selected.
+        assert select(seeded, DVAL == NAN) == set()
+
+    def test_negated_nan_literal_selects_every_row(self, seeded: DuckDBPyConnection) -> None:
+        # NOT (FALSE) — the NaN row and the absent row included. Pinned
+        # deliberately: this is the predicate backend's `not False`, and it is
+        # the one negation that does *not* hit the absent-scalar NULL divergence,
+        # because no column is referenced at all.
+        assert select(seeded, ~(DVAL == NAN)) == {0, 1, 2}
+
+    def test_multi_ordered_comparison_guards_each_element(self, con: DuckDBPyConnection) -> None:
+        materialize(
+            con,
+            (DVALS,),
+            ({"x.values": ("nan",)}, {"x.values": ("nan", "1.5")}, {"x.values": ("0.5",)}, {}),
+        )
+        # Row 1 qualifies on its 1.5 alone; row 0's lone NaN must not qualify.
+        assert select(con, DVALS > 1.0) == {1}
 
 
 class TestImportPurity:

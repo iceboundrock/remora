@@ -12,7 +12,9 @@ Output shape
 placeholders and the tuple of values to bind, in placeholder order. Literals are
 **never** interpolated into the string, so a hostile literal is inert. Callers
 splice the string into a ``WHERE`` clause and pass ``list(predicate.params)`` to
-``con.execute``.
+``con.execute``. The one literal that binds **no** parameter is a float ``NaN``,
+which compiles to the constant ``FALSE`` (see the NaN section below) — a constant
+the compiler chose, never user text, so it is not an injection surface.
 
 Where the compiler gets its facts
 ---------------------------------
@@ -33,6 +35,9 @@ Rendering rules
   multi-value ``==`` and the predicate backend's ``any()``.
 - Ordered comparisons on a multi column -> ``len(list_filter("col", x -> x <op>
   ?)) > 0``, the same any-occurrence rule spelled out for a list.
+- ``>`` / ``>=`` on a **float** column additionally carry a ``NOT isnan(...)``
+  guard, and a ``NaN`` literal anywhere compiles to ``FALSE`` (see the
+  IEEE-754 section).
 - ``Presence(field)`` -> ``"col" IS NOT NULL`` (scalar) / ``len(coalesce("col", [])) > 0``
   (multi).
 - ``Membership(field, values)`` -> the ``OR`` of one term per element; a
@@ -93,6 +98,41 @@ multi-value field as ``[]``, and SQL is three-valued, so:
 Reconciling that divergence across backends is explicitly out of scope for issue
 #29; it is stated here so callers can rely on it rather than discover it.
 
+IEEE-754 specials (harmonized, unlike NULL)
+-------------------------------------------
+DuckDB gives ``DOUBLE`` a **total** order: ``NaN`` equals itself and sorts
+*greater than everything*, ``inf`` included. Python's comparisons are the IEEE
+ones, where every comparison involving ``NaN`` is false. Left alone, the same
+``Expr`` would select different packets per backend, so this backend compiles the
+Python semantics — the predicate backend is the reference:
+
+- **A NaN literal compiles to the constant ``FALSE``**, binding no parameter.
+  ``x == nan``, ``x > nan`` and friends are all false in Python, so the compiled
+  predicate is simply the constant it already equals. This covers every place a
+  float literal can appear: :class:`~remora.expr.Comparison` values,
+  :class:`~remora.expr.Membership` scalar elements (a NaN element contributes a
+  ``FALSE`` term to the ``OR``) and :class:`~remora.expr.ValueRange` endpoints —
+  checked *before* the inverted-range test, since ``hi < lo`` is false for a NaN
+  endpoint and would otherwise wave it through. Because ``!=`` is
+  ``Not(Comparison(EQ, ...))``, ``x != nan`` renders ``NOT (FALSE)`` and selects
+  every row, absent ones included — exactly the predicate backend's ``not False``.
+- **A stored NaN is excluded from ``>`` and ``>=``** by a ``NOT isnan(...)``
+  guard on float columns: scalar ``("col" > ? AND NOT isnan("col"))``, multi
+  ``x -> x > ? AND NOT isnan(x)``. Without it, NaN sorting greatest makes
+  ``"col" > ?`` true for a stored NaN against *any* literal, where Python's
+  ``nan > 0.5`` is false.
+- **``<``, ``<=``, ``BETWEEN`` and ``=`` need no guard, deliberately.** NaN
+  sorting greatest already makes ``NaN < v`` and ``NaN <= v`` false, ``BETWEEN``
+  false through its ``<= hi`` conjunct, and ``NaN = v`` false for every non-NaN
+  literal (a NaN literal never reaches SQL — it became ``FALSE`` above). Adding
+  the guard there would be dead weight, so do not "complete" the set.
+- ``inf`` needs nothing: both engines order it identically, above every finite
+  value and below ``NaN`` only in DuckDB, which no rule above depends on.
+
+The guard is ``NOT isnan(col)``, which is ``NULL`` on a ``NULL`` column value —
+so an absent scalar stays excluded under a guarded comparison, the same as under
+an unguarded one. The NULL behavior above is unchanged by this section.
+
 Error policy
 ------------
 :class:`UnsupportedSqlExprError` means "this backend legitimately cannot render
@@ -107,6 +147,7 @@ the sibling backends raise and are deliberately not converted.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Final
 
@@ -171,6 +212,22 @@ _CAST_FTYPES: Final[frozenset[str]] = frozenset({"FT_IPv6"})
 #: Lambda variable used by the any-occurrence ``list_filter`` forms.
 _LAMBDA_VAR: Final[str] = "x"
 
+#: SQL constant a NaN literal compiles to (a comparison with NaN is false in
+#: Python, so the predicate *is* this constant). Self-delimiting like every leaf.
+_FALSE: Final[str] = "FALSE"
+
+#: FTypes whose column holds a float and can therefore hold a NaN. Derived from
+#: the ftype table rather than listed, so a float ftype added to
+#: :mod:`remora.values` cannot silently escape the NaN rules.
+_FLOAT_FTYPES: Final[frozenset[str]] = frozenset(
+    ftype for ftype, info in values.FTYPE_TABLE.items() if info.py_type is float
+)
+
+#: Operators whose DuckDB result on a *stored* NaN disagrees with Python, because
+#: NaN sorts greatest. ``<``/``<=``/``BETWEEN``/``=`` already agree — see the
+#: module docstring's IEEE-754 section before adding to this set.
+_NAN_GUARDED_OPS: Final[frozenset[CompareOp]] = frozenset({CompareOp.GT, CompareOp.GE})
+
 
 def compile_sql(expr: Expr) -> SqlPredicate:
     """Render ``expr`` as a DuckDB SQL predicate with bound parameters.
@@ -227,14 +284,22 @@ def _render(expr: Expr, params: list[Any]) -> str:
 def _render_comparison(expr: Comparison, params: list[Any]) -> str:
     """Render ``field <op> literal`` against a scalar or a LIST column."""
     field = expr.field
+    if _is_nan(values.coerce_literal(field.ftype, expr.value)):
+        return _FALSE
     column = _column(field)
     placeholder = _placeholder(field.ftype)
     params.append(_encode(field.ftype, expr.value))
+    guard = _needs_nan_guard(field.ftype, expr.op)
     if not field.multi:
-        return f"{column} {_SQL_OPS[expr.op]} {placeholder}"
+        condition = f"{column} {_SQL_OPS[expr.op]} {placeholder}"
+        # Now a compound, so it parenthesizes itself like And/Or do.
+        return f"({condition} AND NOT isnan({column}))" if guard else condition
     if expr.op is CompareOp.EQ:
         return f"list_contains({column}, {placeholder})"
-    return _any_occurrence(column, f"{_LAMBDA_VAR} {_SQL_OPS[expr.op]} {placeholder}")
+    condition = f"{_LAMBDA_VAR} {_SQL_OPS[expr.op]} {placeholder}"
+    if guard:
+        condition = f"{condition} AND NOT isnan({_LAMBDA_VAR})"
+    return _any_occurrence(column, condition)
 
 
 def _render_membership(expr: Membership, params: list[Any]) -> str:
@@ -257,6 +322,10 @@ def _render_member(field: FieldLike, column: str, item: MembershipItem, params: 
     if isinstance(item, ValueRange):
         lo: Any = values.coerce_literal(ftype, item.lo)
         hi: Any = values.coerce_literal(ftype, item.hi)
+        # Before the inversion check, not after: every comparison with NaN is
+        # false, so `hi < lo` would wave a NaN endpoint straight through.
+        if _is_nan(lo) or _is_nan(hi):
+            return _FALSE
         if hi < lo:
             raise ValueError(f"inverted membership range: {item.lo!r}..{item.hi!r}")
         encode = get_column_type(ftype).encode
@@ -266,6 +335,8 @@ def _render_member(field: FieldLike, column: str, item: MembershipItem, params: 
         if field.multi:
             return _any_occurrence(column, f"{_LAMBDA_VAR} {between}")
         return f"{column} {between}"
+    if _is_nan(values.coerce_literal(ftype, item)):
+        return _FALSE
     params.append(_encode(ftype, item))
     if field.multi:
         return f"list_contains({column}, {placeholder})"
@@ -319,6 +390,21 @@ def _placeholder(ftype: str) -> str:
 def _encode(ftype: str, value: LiteralValue) -> Any:
     """Normalize a user literal and encode it the way the column stores it."""
     return get_column_type(ftype).encode(values.coerce_literal(ftype, value))
+
+
+def _is_nan(value: Any) -> bool:
+    """Is this coerced literal a float NaN, which no Python comparison matches?"""
+    return isinstance(value, float) and math.isnan(value)
+
+
+def _needs_nan_guard(ftype: str, op: CompareOp) -> bool:
+    """Does ``op`` on this column need ``NOT isnan(...)`` to match Python?
+
+    Only ``>``/``>=`` on a float column: DuckDB sorts NaN greatest, so those two
+    are true for a stored NaN where Python's are false. See the module
+    docstring's IEEE-754 section for why the other operators need nothing.
+    """
+    return ftype in _FLOAT_FTYPES and op in _NAN_GUARDED_OPS
 
 
 def _any_occurrence(column: str, condition: str) -> str:

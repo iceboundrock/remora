@@ -27,6 +27,11 @@ PAYLOAD = FieldRef[bytes]("tcp.payload", "FT_BYTES", False)
 TIME = FieldRef[datetime]("frame.time", "FT_ABSOLUTE_TIME", False)
 V6SRC = FieldRef[IPv6Address]("ipv6.src", "FT_IPv6", False)
 V6ADDR = FieldRef[IPv6Address]("ipv6.addr", "FT_IPv6", True)
+DVAL = FieldRef[float]("x.value", "FT_DOUBLE", False)
+DVALS = FieldRef[float]("x.values", "FT_DOUBLE", True)
+
+NAN = float("nan")
+INF = float("inf")
 
 
 class TestScalarComparisons:
@@ -237,6 +242,99 @@ class TestContains:
         result = compile_sql((TTL < 64) & ~HOST.contains("evil"))
         assert result.sql == '("ip_ttl" < ? AND NOT (contains("http_host", ?)))'
         assert result.params == (64, "evil")
+
+
+class TestNaN:
+    """IEEE-754 NaN, compiled to Python's semantics rather than DuckDB's.
+
+    DuckDB gives DOUBLE a total order where NaN equals itself and sorts greatest;
+    Python's comparisons with NaN are all false. The backend closes that gap two
+    ways: a NaN *literal* becomes the constant FALSE, and a *stored* NaN is kept
+    out of ``>``/``>=`` by a ``NOT isnan(...)`` guard.
+    """
+
+    def test_nan_literal_equality_is_the_false_constant(self) -> None:
+        # nan == nan is False in Python, so the predicate *is* that constant —
+        # and it binds no parameter.
+        assert compile_sql(DVAL == NAN) == SqlPredicate("FALSE", ())
+
+    def test_nan_literal_is_false_under_every_operator(self) -> None:
+        for expr in (DVAL > NAN, DVAL >= NAN, DVAL < NAN, DVAL <= NAN):
+            assert compile_sql(expr) == SqlPredicate("FALSE", ())
+
+    def test_not_equal_nan_selects_everything(self) -> None:
+        # != is Not(Comparison(EQ, ...)), so this is NOT (FALSE): every row,
+        # absent ones included — exactly the predicate backend's `not False`.
+        assert compile_sql(DVAL != NAN) == SqlPredicate("NOT (FALSE)", ())
+
+    def test_multi_nan_literal_is_false(self) -> None:
+        assert compile_sql(DVALS == NAN) == SqlPredicate("FALSE", ())
+
+    def test_gt_on_a_float_column_is_isnan_guarded(self) -> None:
+        result = compile_sql(DVAL > 0.5)
+        assert result.sql == '("x_value" > ? AND NOT isnan("x_value"))'
+        assert result.params == (0.5,)
+
+    def test_ge_on_a_float_column_is_isnan_guarded(self) -> None:
+        result = compile_sql(DVAL >= 0.5)
+        assert result.sql == '("x_value" >= ? AND NOT isnan("x_value"))'
+        assert result.params == (0.5,)
+
+    @pytest.mark.parametrize(
+        ("expr", "sql"),
+        [(DVAL < 0.5, '"x_value" < ?'), (DVAL <= 0.5, '"x_value" <= ?')],
+        ids=["lt", "le"],
+    )
+    def test_lt_and_le_are_not_guarded(self, expr: Expr, sql: str) -> None:
+        # NaN sorting greatest already makes these false for a stored NaN, which
+        # is what Python does too: the guard would be dead weight.
+        result = compile_sql(expr)
+        assert result.sql == sql
+        assert result.params == (0.5,)
+
+    def test_eq_on_a_float_column_is_not_guarded(self) -> None:
+        # A stored NaN never equals a non-NaN literal, and a NaN literal never
+        # reaches SQL (it became FALSE above).
+        assert compile_sql(DVAL == 0.5) == SqlPredicate('"x_value" = ?', (0.5,))
+
+    def test_float_range_is_not_guarded(self) -> None:
+        # BETWEEN is false for a stored NaN through its `<= hi` conjunct.
+        result = compile_sql(DVAL.in_([(0.0, 1.0)]))
+        assert result.sql == '"x_value" BETWEEN ? AND ?'
+        assert result.params == (0.0, 1.0)
+
+    def test_multi_ordered_comparison_guards_inside_the_lambda(self) -> None:
+        result = compile_sql(DVALS > 0.5)
+        assert result.sql == 'len(list_filter("x_values", x -> x > ? AND NOT isnan(x))) > 0'
+        assert result.params == (0.5,)
+
+    def test_membership_nan_element_contributes_a_false_term(self) -> None:
+        result = compile_sql(DVAL.in_([1.5, NAN]))
+        assert result.sql == '("x_value" = ? OR FALSE)'
+        assert result.params == (1.5,)
+
+    @pytest.mark.parametrize(
+        "bounds",
+        [(0.0, NAN), (NAN, 1.0), (NAN, NAN)],
+        ids=["nan-hi", "nan-lo", "both"],
+    )
+    def test_range_with_a_nan_endpoint_is_false(self, bounds: tuple[float, float]) -> None:
+        # Checked before the inverted-range test: `hi < lo` is false for a NaN
+        # endpoint, so an inversion check alone would wave it through.
+        assert compile_sql(DVAL.in_([bounds])) == SqlPredicate("FALSE", ())
+
+    def test_integer_column_is_never_guarded(self) -> None:
+        # The rules are scoped to float ftypes; isnan() on an integer column
+        # would be nonsense.
+        result = compile_sql(TTL > 64)
+        assert result.sql == '"ip_ttl" > ?'
+        assert "isnan" not in result.sql
+
+    def test_infinity_needs_no_special_handling(self) -> None:
+        # Both engines order inf identically, so it binds as an ordinary literal.
+        result = compile_sql(DVAL > INF)
+        assert result.sql == '("x_value" > ? AND NOT isnan("x_value"))'
+        assert result.params == (INF,)
 
 
 class TestMatches:
