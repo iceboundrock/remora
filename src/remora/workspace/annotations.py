@@ -21,20 +21,30 @@ Column              Holds
 ``created_at``      When the annotation was written (naive UTC).
 ==================  ====================================================
 
-``annotation_id`` is assigned as ``max(annotation_id) + 1`` *inside the
-caller's transaction* rather than from a sequence, because a sequence would
-be a layout change no existing workspace could acquire — ``create_schema`` is
-``IF NOT EXISTS``-only and an opener runs it only on an empty database, so a
-workspace written before the sequence existed would never gain it. Like
-``pkts.frame_number``, the id is therefore unique by *convention*: DuckDB's
-exclusive file lock serializes writers across processes, but two threads in
-one process can hold two ``Workspace.write()`` transactions at once, and
-those can compute the same next id. Callers annotating from several threads
-must serialize their writes. Deleting the highest-numbered annotation frees
-its id; the next :func:`add_annotation` reuses it. An id held across a
-deletion can therefore come to name a different annotation, and
-:func:`remove_annotation` with a stale id silently deletes the wrong finding.
-Callers that hold ids across deletions must re-list first.
+``annotation_id`` comes from a monotonic high-water mark stored in
+``meta.info`` under ``next_annotation_id`` — a row in the key/value catalog
+table every v1 workspace already has, so nothing about the layout changes and
+``SCHEMA_VERSION`` stays 1. A sequence would be the obvious allocator and is
+not available: ``create_schema`` is ``IF NOT EXISTS``-only and an opener runs
+it only on an empty database, so a workspace written before a sequence existed
+could never acquire one.
+
+The mark only ever moves forward, so **ids are never reused**. Deleting the
+highest-numbered annotation does not free its id, an id held across a deletion
+can never come to name a different finding, and :func:`remove_annotation` with
+a stale id matches nothing and returns ``False``.
+
+Reading and advancing the mark happen *inside the caller's transaction*, so
+two same-process ``Workspace.write()`` transactions racing the allocator both
+write that one row: DuckDB refuses the loser loudly rather than letting the
+two share an id — ``duckdb.TransactionException`` when both update an existing
+mark, ``duckdb.ConstraintException`` on ``meta.info``'s primary key when both
+seed a missing one, and both derive from ``duckdb.Error``. The losing add
+rolls back whole, writing no annotation; whether to retry it is the caller's
+decision. Writers in other processes were already serialized by DuckDB's
+exclusive file lock. A workspace written before this key existed simply has no
+mark: the first :func:`add_annotation` seeds it from
+``max(annotation_id) + 1`` and carries on from there.
 
 Capture identity
 ----------------
@@ -104,6 +114,9 @@ AnnotationScope = Literal["packet", "stream"]
 
 ANNOTATION_SCOPES: Final[tuple[AnnotationScope, ...]] = ("packet", "stream")
 """Every legal scope, for runtime validation of values mypy cannot see."""
+
+_NEXT_ID_KEY: Final[str] = "next_annotation_id"
+"""``meta.info`` key holding the annotation id high-water mark."""
 
 # True when the annotation's target is not in the workspace any more. An
 # EXISTS subquery rather than a LEFT JOIN on purpose: pkts has no PRIMARY KEY
@@ -191,6 +204,41 @@ def _filters(
     return (" WHERE " + " AND ".join(clauses) if clauses else "", params)
 
 
+def _allocate_annotation_id(con: DuckDBPyConnection) -> int:
+    """Take the next id from the ``meta.info`` high-water mark and advance it.
+
+    Runs inside the caller's transaction, which is what makes the mark an
+    allocator rather than a hint: the read, the advance and the annotation
+    row all commit together, so a committed id is never handed out twice and
+    two racing transactions conflict on the mark row instead of sharing an id
+    (see the module docstring). A workspace with no mark yet — one written
+    before this key existed — is seeded from ``max(annotation_id) + 1``.
+
+    Args:
+        con: A read-write connection to the workspace, inside a transaction.
+
+    Returns:
+        The id to write the next annotation under.
+    """
+    row = con.execute("SELECT value FROM meta.info WHERE key = ?", [_NEXT_ID_KEY]).fetchone()
+    if row is None:
+        seed = con.execute(
+            "SELECT coalesce(max(annotation_id), 0) + 1 FROM main.annotations"
+        ).fetchone()
+        next_id = 1 if seed is None else int(seed[0])
+        con.execute(
+            "INSERT INTO meta.info (key, value) VALUES (?, ?)",
+            [_NEXT_ID_KEY, str(next_id + 1)],
+        )
+    else:
+        next_id = int(row[0])
+        con.execute(
+            "UPDATE meta.info SET value = ? WHERE key = ?",
+            [str(next_id + 1), _NEXT_ID_KEY],
+        )
+    return next_id
+
+
 def add_annotation(
     con: DuckDBPyConnection,
     scope: AnnotationScope,
@@ -217,17 +265,21 @@ def add_annotation(
             datetime is taken to be UTC already.
 
     Returns:
-        The new ``annotation_id``.
+        The new ``annotation_id``, taken from the high-water mark described
+        in the module docstring: monotonic, and never reused.
 
     Raises:
         ValueError: If ``scope`` is not a legal scope, or ``key`` is empty.
+        duckdb.Error: If another transaction in this process is allocating an
+            id at the same time — ``TransactionException`` or
+            ``ConstraintException`` on the mark row. The whole add rolls back;
+            no annotation is written and no id is shared.
     """
     _check_scope(scope)
     if not key:
         raise ValueError("an annotation key must not be empty")
     stamp = datetime.now(timezone.utc) if created_at is None else created_at
-    row = con.execute("SELECT coalesce(max(annotation_id), 0) + 1 FROM main.annotations").fetchone()
-    annotation_id = 1 if row is None else int(row[0])
+    annotation_id = _allocate_annotation_id(con)
     con.execute(
         "INSERT INTO main.annotations "
         '(annotation_id, scope, target_id, "key", value, created_at) '
@@ -290,10 +342,11 @@ def list_annotations(
 def remove_annotation(con: DuckDBPyConnection, annotation_id: int) -> bool:
     """Remove one annotation by id.
 
-    Removal by id is the precise form: an id names one annotation by
-    convention — ``annotation_id`` is unique the way ``pkts.frame_number``
-    is (see the module docstring) — and ``DELETE`` removes every row that
-    matches. Removing a whole label or a whole target is
+    Removal by id is the precise form: ids come from a monotonic high-water
+    mark and are never reused (see the module docstring), so an id names at
+    most one annotation for the workspace's whole life and a stale one — an
+    id whose annotation is already gone — matches nothing rather than some
+    later finding. Removing a whole label or a whole target is
     :func:`remove_annotations`.
 
     Args:
@@ -302,7 +355,8 @@ def remove_annotation(con: DuckDBPyConnection, annotation_id: int) -> bool:
 
     Returns:
         Whether a row was removed. ``False`` means the id was not there —
-        not an error, so a repeated remove is idempotent.
+        not an error, so a repeated remove is idempotent, and so is a remove
+        with an id held across an earlier deletion.
     """
     row = con.execute(
         "DELETE FROM main.annotations WHERE annotation_id = ?", [annotation_id]

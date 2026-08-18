@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import threading
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
@@ -182,6 +183,84 @@ class TestRemoval:
     def test_delete_orphans_with_none_present_returns_zero(self, con: DuckDBPyConnection) -> None:
         add_annotation(con, "packet", 1, "live", created_at=UTC_NOW)
         assert delete_orphan_annotations(con) == 0
+
+
+READ_MARK = "SELECT value FROM meta.info WHERE key = 'next_annotation_id'"
+DROP_MARK = "DELETE FROM meta.info WHERE key = 'next_annotation_id'"
+
+
+class TestIdAllocation:
+    """Ids come from the meta.info high-water mark: monotonic, never reused."""
+
+    def test_ids_are_never_recycled(self, con: DuckDBPyConnection) -> None:
+        first = add_annotation(con, "packet", 1, "a", created_at=UTC_NOW)
+        assert first == 1
+        assert remove_annotation(con, first) is True
+        second = add_annotation(con, "packet", 2, "b", created_at=UTC_NOW)
+        # The mark does not go back down, so the freed id is not reissued.
+        assert second == 2
+        # A stale id therefore names nothing rather than the newer finding.
+        assert remove_annotation(con, first) is False
+        assert [r.annotation_id for r in list_annotations(con)] == [2]
+
+    def test_the_mark_is_stored_in_meta_info(self, con: DuckDBPyConnection) -> None:
+        add_annotation(con, "packet", 1, "a", created_at=UTC_NOW)
+        row = con.execute(READ_MARK).fetchone()
+        assert row is not None and int(row[0]) == 2
+
+    def test_a_legacy_workspace_without_the_key_is_seeded(self, tmp_path: Path) -> None:
+        # A workspace written before the mark existed has no row; the next
+        # add seeds it from max(annotation_id) + 1 and carries on.
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw") as ws:
+            ws.add_annotation("packet", 1, "a", created_at=UTC_NOW)
+            ws.add_annotation("packet", 2, "b", created_at=UTC_NOW)
+            with ws.write() as con:
+                con.execute(DROP_MARK)
+            assert ws.add_annotation("packet", 3, "c", created_at=UTC_NOW) == 3
+            with ws.read() as con:
+                row = con.execute(READ_MARK).fetchone()
+            assert row is not None and int(row[0]) == 4
+            assert [r.annotation_id for r in ws.list_annotations()] == [1, 2, 3]
+
+    def test_concurrent_adds_never_share_an_id(self, tmp_path: Path) -> None:
+        # Workspace.write() permits concurrent same-process transactions, so
+        # the allocator is what has to keep ids distinct: the losers of the
+        # race conflict on the meta.info mark row and roll back loudly
+        # instead of committing a shared id.
+        path = tmp_path / "ws.duckdb"
+        workers = 8
+        ready = threading.Barrier(workers)
+        guard = threading.Lock()
+        succeeded: list[int] = []
+        conflicts: list[BaseException] = []
+        with Workspace(path, mode="rw") as ws:
+
+            def add(target: int) -> None:
+                ready.wait()
+                try:
+                    annotation_id = ws.add_annotation(
+                        "packet", target, "verdict", created_at=UTC_NOW
+                    )
+                except duckdb.Error as exc:
+                    with guard:
+                        conflicts.append(exc)
+                    return
+                with guard:
+                    succeeded.append(annotation_id)
+
+            threads = [threading.Thread(target=add, args=(i,)) for i in range(workers)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            committed = [r.annotation_id for r in ws.list_annotations()]
+
+        assert succeeded, "every add lost the race, which cannot happen"
+        assert len(set(committed)) == len(committed), f"an id was shared: {committed}"
+        assert sorted(succeeded) == committed
+        # No exact failure count: how many transactions overlap is timing.
+        assert len(succeeded) + len(conflicts) == workers
 
 
 def _subprocess_read(path: Path) -> subprocess.CompletedProcess[bytes]:
