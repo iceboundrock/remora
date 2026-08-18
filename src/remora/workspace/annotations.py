@@ -87,7 +87,10 @@ __all__ = [
     "AnnotationRecord",
     "AnnotationScope",
     "add_annotation",
+    "delete_orphan_annotations",
     "list_annotations",
+    "remove_annotation",
+    "remove_annotations",
 ]
 
 AnnotationScope = Literal["packet", "stream"]
@@ -256,7 +259,7 @@ def list_annotations(
     """
     where, params = _filters(scope, target_id, key)
     rows = con.execute(
-        "SELECT a.annotation_id, a.scope, a.target_id, a.key, a.value, a.created_at, "
+        'SELECT a.annotation_id, a.scope, a.target_id, a."key", a.value, a.created_at, '
         f"{_ORPHANED} AS orphaned "
         f"FROM main.annotations AS a{where} ORDER BY a.annotation_id",
         params,
@@ -273,3 +276,78 @@ def list_annotations(
         )
         for row in rows
     )
+
+
+def remove_annotation(con: DuckDBPyConnection, annotation_id: int) -> bool:
+    """Remove one annotation by id.
+
+    Removal by id is the precise form: an id names exactly one annotation,
+    so nothing else can be caught by accident. Removing a whole label or a
+    whole target is :func:`remove_annotations`.
+
+    Args:
+        con: A read-write connection to the workspace.
+        annotation_id: The id :func:`add_annotation` returned.
+
+    Returns:
+        Whether a row was removed. ``False`` means the id was not there —
+        not an error, so a repeated remove is idempotent.
+    """
+    row = con.execute(
+        "DELETE FROM main.annotations WHERE annotation_id = ?", [annotation_id]
+    ).fetchone()
+    return row is not None and int(row[0]) > 0
+
+
+def remove_annotations(
+    con: DuckDBPyConnection,
+    *,
+    scope: AnnotationScope | None = None,
+    target_id: int | None = None,
+    key: str | None = None,
+) -> int:
+    """Remove every annotation matching the given filters.
+
+    At least one filter is required. An unfiltered call would silently wipe
+    every finding in the workspace, which is too destructive to be the
+    meaning of a call with no arguments; a caller who really wants that can
+    say so in SQL.
+
+    Args:
+        con: A read-write connection to the workspace.
+        scope: Restrict to one scope.
+        target_id: Restrict to one frame number / stream id.
+        key: Restrict to one label.
+
+    Returns:
+        How many annotations were removed.
+
+    Raises:
+        ValueError: If no filter is given, or ``scope`` is not a legal scope.
+    """
+    if scope is None and target_id is None and key is None:
+        raise ValueError(
+            "remove_annotations needs at least one of scope, target_id or key; "
+            "removing every annotation must be spelled out in SQL"
+        )
+    where, params = _filters(scope, target_id, key)
+    row = con.execute(f"DELETE FROM main.annotations AS a{where}", params).fetchone()
+    return 0 if row is None else int(row[0])
+
+
+def delete_orphan_annotations(con: DuckDBPyConnection) -> int:
+    """Remove annotations whose packet or stream is no longer in the workspace.
+
+    The explicit half of the kept-but-flagged policy: nothing deletes an
+    orphan on its own, because a re-materialization under a wider filter can
+    bring its target back. Call this when the current ``pkts``/``streams``
+    contents are the ones to keep.
+
+    Args:
+        con: A read-write connection to the workspace.
+
+    Returns:
+        How many orphaned annotations were removed.
+    """
+    row = con.execute(f"DELETE FROM main.annotations AS a WHERE {_ORPHANED}").fetchone()
+    return 0 if row is None else int(row[0])

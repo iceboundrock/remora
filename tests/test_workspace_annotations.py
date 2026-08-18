@@ -12,7 +12,10 @@ from remora.workspace.annotations import (
     ANNOTATION_SCOPES,
     AnnotationRecord,
     add_annotation,
+    delete_orphan_annotations,
     list_annotations,
+    remove_annotation,
+    remove_annotations,
 )
 from remora.workspace.schema import create_schema
 
@@ -127,3 +130,49 @@ class TestAddAndList:
         con.execute("INSERT INTO main.pkts VALUES (1, TIMESTAMP '2026-08-18 00:00:02')")
         add_annotation(con, "packet", 1, "a", created_at=UTC_NOW)
         assert len(list_annotations(con)) == 1
+
+
+class TestRemoval:
+    def test_remove_by_id(self, con: DuckDBPyConnection) -> None:
+        first = add_annotation(con, "packet", 1, "a", created_at=UTC_NOW)
+        add_annotation(con, "packet", 2, "b", created_at=UTC_NOW)
+        assert remove_annotation(con, first) is True
+        assert [r.annotation_id for r in list_annotations(con)] == [2]
+
+    def test_remove_unknown_id_is_false(self, con: DuckDBPyConnection) -> None:
+        assert remove_annotation(con, 404) is False
+
+    def test_remove_by_key(self, con: DuckDBPyConnection) -> None:
+        add_annotation(con, "packet", 1, "verdict", created_at=UTC_NOW)
+        add_annotation(con, "packet", 2, "verdict", created_at=UTC_NOW)
+        add_annotation(con, "stream", 7, "owner", created_at=UTC_NOW)
+        assert remove_annotations(con, key="verdict") == 2
+        assert [r.key for r in list_annotations(con)] == ["owner"]
+
+    def test_remove_by_scope_and_target(self, con: DuckDBPyConnection) -> None:
+        add_annotation(con, "packet", 1, "a", created_at=UTC_NOW)
+        add_annotation(con, "stream", 1, "a", created_at=UTC_NOW)
+        assert remove_annotations(con, scope="stream", target_id=1) == 1
+        assert [r.scope for r in list_annotations(con)] == ["packet"]
+
+    def test_remove_without_filters_is_refused(self, con: DuckDBPyConnection) -> None:
+        add_annotation(con, "packet", 1, "a", created_at=UTC_NOW)
+        with pytest.raises(ValueError, match="at least one"):
+            remove_annotations(con)
+        assert len(list_annotations(con)) == 1
+
+    def test_removing_nothing_returns_zero(self, con: DuckDBPyConnection) -> None:
+        assert remove_annotations(con, key="absent") == 0
+
+    def test_delete_orphans_leaves_live_annotations(self, con: DuckDBPyConnection) -> None:
+        add_annotation(con, "packet", 1, "live", created_at=UTC_NOW)
+        add_annotation(con, "packet", 999, "ghost", created_at=UTC_NOW)
+        add_annotation(con, "stream", 7, "live", created_at=UTC_NOW)
+        add_annotation(con, "stream", 42, "ghost", created_at=UTC_NOW)
+        assert delete_orphan_annotations(con) == 2
+        assert [r.key for r in list_annotations(con)] == ["live", "live"]
+        assert all(r.orphaned is False for r in list_annotations(con))
+
+    def test_delete_orphans_with_none_present_returns_zero(self, con: DuckDBPyConnection) -> None:
+        add_annotation(con, "packet", 1, "live", created_at=UTC_NOW)
+        assert delete_orphan_annotations(con) == 0
