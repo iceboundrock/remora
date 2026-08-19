@@ -52,10 +52,14 @@ exact.
 
 One materialization per workspace
 ---------------------------------
-A workspace that already holds packet rows or registered fields is refused.
-Appending a second run's rows would misalign them against columns the first run
-added, and deciding that a stored table already covers a request — or
-backfilling the columns it lacks — is issue #32's job, not this one's.
+A workspace that already holds packet rows, registered fields *or* a recorded
+cache key is refused. Appending a second run's rows would misalign them against
+columns the first run added, and deciding that a stored table already covers a
+request — or backfilling the columns it lacks — is issue #32's job, not this
+one's. The cache key counts because a run can legitimately write nothing else:
+``fields=()`` with a filter that matches no packet leaves no rows and no
+registry entries, and admitting a second run over that workspace would leave the
+first run's key describing rows it never produced.
 """
 
 from __future__ import annotations
@@ -67,7 +71,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Final, Protocol, TypeAlias
 
-from remora.codegen.fingerprint import parse_tshark_version
 from remora.compile.dfilter import compile_dfilter
 from remora.expr import Expr
 from remora.fields import FieldRef
@@ -174,10 +177,15 @@ def detect_tshark_version(tshark: str) -> str:
         subprocess.CalledProcessError: If tshark runs but exits non-zero.
         subprocess.TimeoutExpired: If it does not answer within
             ``_VERSION_PROBE_TIMEOUT`` seconds. Propagated as itself: a
-            binary that cannot report its version in 30 seconds is broken,
-            not merely absent.
+            binary that cannot report its version within
+            ``_VERSION_PROBE_TIMEOUT`` seconds is broken, not merely absent.
         ValueError: If its output carries no recognizable version.
     """
+    # Imported here, not at module scope: remora.codegen is the code generator,
+    # and importing remora.workspace must not drag it in for a version parse
+    # that only a probe ever performs.
+    from remora.codegen.fingerprint import parse_tshark_version
+
     try:
         output = subprocess.run(
             [tshark, "--version"],
@@ -222,16 +230,26 @@ def _quote_identifier(name: str) -> str:
 
 
 def _refuse_second_materialization(con: DuckDBPyConnection) -> None:
-    """Refuse a workspace that already holds packet rows or registered fields."""
+    """Refuse a workspace that already holds a materialization.
+
+    All three of the tables a run writes are probed, not just ``pkts`` and
+    ``meta.fields``: a first run with ``fields=()`` and a filter matching
+    nothing writes no rows and registers no fields, yet still records its
+    cache key — so keying the refusal on rows and fields alone would admit a
+    second run and leave the stored key permanently describing rows it did
+    not produce.
+    """
     rows = con.execute("SELECT count(*) FROM main.pkts").fetchone()
     fields = con.execute("SELECT count(*) FROM meta.fields").fetchone()
+    keys = con.execute("SELECT count(*) FROM meta.cache_keys").fetchone()
     n_rows = 0 if rows is None else int(rows[0])
     n_fields = 0 if fields is None else int(fields[0])
-    if n_rows or n_fields:
+    n_keys = 0 if keys is None else int(keys[0])
+    if n_rows or n_fields or n_keys:
         raise WorkspaceError(
             f"workspace already holds a materialization ({n_rows} pkts rows, "
-            f"{n_fields} registered fields); cache-hit and backfill land with "
-            f"issue #32 — materialize into a fresh workspace file"
+            f"{n_fields} registered fields, {n_keys} cache keys); cache-hit and "
+            f"backfill land with issue #32 — materialize into a fresh workspace file"
         )
 
 
@@ -287,6 +305,10 @@ def materialize_into(
         WorkspaceError: If the workspace already holds a materialization, or
             if a requested field claims a ``pkts`` skeleton column name.
         UnsupportedExprError: If ``filter`` cannot be pushed to tshark.
+        TsharkError: If the run exits non-zero — ``TsharkProcess`` raises
+            :class:`remora.reader.process.TsharkError` at end of stream, so it
+            surfaces from inside this call and the caller's transaction rolls
+            back every row already appended.
         OSError: If ``pcap`` cannot be read for its fingerprint.
     """
     if batch_size < 1:

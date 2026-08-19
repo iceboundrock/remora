@@ -20,7 +20,7 @@ from datetime import datetime, timezone  # noqa: E402
 from remora.compile.dfilter import UnsupportedExprError, compile_dfilter  # noqa: E402
 from remora.fields import FieldRef  # noqa: E402
 from remora.reader.fields_reader import OCC_SEP, UNIT_SEP  # noqa: E402
-from remora.reader.process import TsharkNotFoundError  # noqa: E402
+from remora.reader.process import TsharkError, TsharkNotFoundError  # noqa: E402
 from remora.workspace import (  # noqa: E402
     ColumnNameCollisionError,
     MaterializeResult,
@@ -45,11 +45,22 @@ def line(*cols: tuple[str, ...] | str) -> str:
 
 
 class FakeRunner:
-    """Runner double: records argv, streams canned lines, optionally fails mid-stream."""
+    """Runner double: records argv, streams canned lines, optionally fails mid-stream.
 
-    def __init__(self, lines: Sequence[str], fail_after: int | None = None) -> None:
+    ``fail_after`` equal to the line count fails at end of stream instead —
+    which is where the real ``TsharkProcess`` raises ``TsharkError`` on a
+    nonzero exit — and ``fail_with`` picks the exception raised either way.
+    """
+
+    def __init__(
+        self,
+        lines: Sequence[str],
+        fail_after: int | None = None,
+        fail_with: BaseException | None = None,
+    ) -> None:
         self._lines = list(lines)
         self._fail_after = fail_after
+        self._fail_with = fail_with
         self.argv: list[str] | None = None
         self.pulled = 0
 
@@ -62,12 +73,19 @@ class FakeRunner:
 
         return ctx()
 
+    def _failure(self) -> BaseException:
+        if self._fail_with is not None:
+            return self._fail_with
+        return RuntimeError("mid-stream failure injected by test")
+
     def _iter(self) -> Iterator[str]:
         for i, text in enumerate(self._lines):
             if self._fail_after is not None and i >= self._fail_after:
-                raise RuntimeError("mid-stream failure injected by test")
+                raise self._failure()
             self.pulled += 1
             yield text
+        if self._fail_after is not None and self._fail_after >= len(self._lines):
+            raise self._failure()
 
 
 class SpyCon:
@@ -102,7 +120,11 @@ def make_pcap(tmp_path: Path) -> Path:
 
 def materialized(tmp_path: Path, **kwargs: Any) -> tuple[Path, FakeRunner, MaterializeResult]:
     """Open a fresh rw workspace, materialize ROWS (or kwargs overrides), return handles."""
-    runner = FakeRunner(kwargs.pop("lines", ROWS), fail_after=kwargs.pop("fail_after", None))
+    runner = FakeRunner(
+        kwargs.pop("lines", ROWS),
+        fail_after=kwargs.pop("fail_after", None),
+        fail_with=kwargs.pop("fail_with", None),
+    )
     kwargs.setdefault("fields", [IP_SRC, TCP_PORT])
     pcap = make_pcap(tmp_path)
     ws_path = tmp_path / "ws.duckdb"
@@ -196,7 +218,10 @@ class TestMaterializeInto:
             assert [record.column_type for record in records] == ["UINTEGER", "USMALLINT[]"]
             assert [record.multi for record in records] == [False, True]
             assert all(record.materialized_at == result.cache_key.created_at for record in records)
-            assert records == result.fields
+            # read_fields orders by abbrev, result.fields keeps request order,
+            # so compare by a key rather than relying on this request happening
+            # to be abbrev-sorted already.
+            assert records == tuple(sorted(result.fields, key=lambda record: record.abbrev))
             stored = read_cache_key(con, result.cache_key.key)
             assert stored == result.cache_key
 
@@ -337,6 +362,71 @@ class TestMaterializeInto:
         with reading(ws_path) as con:
             assert count(con, "main.pkts") == 3
             assert read_cache_key(con, first.cache_key.key) == first.cache_key
+
+    def test_zero_row_first_run_still_refuses_a_second(self, tmp_path: Path) -> None:
+        # The hole the three-table probe closes: fields=() plus a filter that
+        # matches nothing writes no rows and registers no fields, so a refusal
+        # keyed on pkts and meta.fields alone would admit a second run and
+        # leave this key describing rows it never produced.
+        ws_path, _runner, first = materialized(
+            tmp_path, lines=[], fields=[], filter=TCP_PORT == 443
+        )
+        assert first.row_count == 0
+        assert first.fields == ()
+        again = FakeRunner(ROWS)
+        with (
+            Workspace(ws_path, mode="rw") as ws,
+            pytest.raises(WorkspaceError, match="0 pkts rows, 0 registered fields, 1 cache keys"),
+            ws.write() as con,
+        ):
+            materialize_into(
+                con,
+                pcap=tmp_path / "cap.pcap",
+                fields=[IP_SRC],
+                tshark="tshark",
+                tshark_version="4.6.7",
+                runner=again,
+            )
+        assert again.argv is None
+        with reading(ws_path) as con:
+            assert count(con, "meta.cache_keys") == 1
+            assert read_cache_key(con, first.cache_key.key) == first.cache_key
+
+    def test_tshark_error_propagates_and_rolls_back(self, tmp_path: Path) -> None:
+        # A nonzero tshark exit reaches this pipeline as TsharkError from the
+        # line iterator at end of stream, inside the caller's transaction.
+        with pytest.raises(TsharkError, match="exited with code 2"):
+            materialized(
+                tmp_path,
+                fail_after=len(ROWS),
+                fail_with=TsharkError("tshark exited with code 2"),
+                batch_size=1,
+            )
+        assert_untouched(tmp_path / "ws.duckdb")
+
+    def test_field_claiming_skeleton_column_refused(self, tmp_path: Path) -> None:
+        # A hostile abbrev whose column name is the row key's. find_collisions
+        # cannot see it (it collides with no other abbrev), so add_field_column
+        # is what refuses — and that runs before tshark would be built.
+        hostile: FieldRef[int] = FieldRef("frame_number", "FT_UINT16", False)
+        runner = FakeRunner(ROWS)
+        pcap = make_pcap(tmp_path)
+        ws_path = tmp_path / "ws.duckdb"
+        with (
+            Workspace(ws_path, mode="rw") as ws,
+            pytest.raises(WorkspaceError, match="already the pkts row key"),
+            ws.write() as con,
+        ):
+            materialize_into(
+                con,
+                pcap=pcap,
+                fields=[hostile],
+                tshark="tshark",
+                tshark_version="4.6.7",
+                runner=runner,
+            )
+        assert runner.argv is None
+        assert_untouched(ws_path)
 
     def test_empty_capture(self, tmp_path: Path) -> None:
         ws_path, _runner, result = materialized(tmp_path, lines=[])

@@ -556,7 +556,15 @@ class Workspace:
             ColumnNameCollisionError: If two distinct abbrevs map onto one
                 column name.
             UnsupportedExprError: If ``filter`` cannot be pushed to tshark.
-            TsharkNotFoundError: If the tshark binary cannot be run.
+            TsharkNotFoundError: If the tshark binary is missing. Raised by
+                the version probe when ``tshark_version`` is omitted, and by
+                the spawn otherwise; other spawn failures (a path that names
+                a directory, say) surface as their own
+                :class:`OSError` subclass rather than being converted.
+            TsharkError: If the run exits non-zero
+                (:class:`remora.reader.process.TsharkError`, raised at end of
+                stream). The transaction rolls back, so a partial run leaves
+                the workspace as it was.
             ValueError: If ``batch_size`` is below 1, if a capture path or
                 argv element cannot be stored, or if a field declared
                 scalar occurs more than once in one packet.
