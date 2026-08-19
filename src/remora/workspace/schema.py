@@ -15,7 +15,9 @@ Table                Holds
                      (#31) through :func:`add_field_column`.
 ``main.streams``     Stream sessionization output — a documented placeholder
                      here; #33 owns the semantics.
-``main.annotations`` User annotations — a placeholder here; #30 owns the API.
+``main.annotations`` Analyst annotations on packets and streams; the API and
+                     the kept-but-flagged orphan policy live in
+                     :mod:`remora.workspace.annotations` (#30).
 ``meta.info``        Key/value catalog, including ``schema_version``.
 ``meta.fields``      What has been materialized: abbrev, column, ftype,
                      multiplicity, column type, timestamp.
