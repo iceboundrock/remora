@@ -23,6 +23,7 @@ pytest.importorskip("duckdb")
 from ipaddress import IPv4Address
 
 from remora.fields import FieldRef
+from remora.reader.fields_reader import OCC_SEP, UNIT_SEP
 from remora.workspace import (
     CacheKeyRecord,
     ColumnNameCollisionError,
@@ -34,9 +35,11 @@ from remora.workspace import (
     fingerprint_pcap,
     materialize_into,
 )
+from remora.workspace.materialize import _argv_residue
 from remora.workspace.schema import (
     read_cache_keys,
     read_fields,
+    read_pkts_columns,
     record_cache_key,
     register_fields,
 )
@@ -128,6 +131,89 @@ def checksum(con: DuckDBPyConnection, columns: list[str]) -> str:
     projection = ", ".join(f'"{column}"' for column in columns)
     rows = con.execute(f"SELECT {projection} FROM main.pkts ORDER BY frame_number").fetchall()
     return hashlib.sha256(repr(rows).encode()).hexdigest()
+
+
+class TestArgvResidue:
+    """The argv comparison's parser, pinned directly.
+
+    ``_argv_residue`` strips the argv parts other cache-key components own,
+    and in doing so assumes each of ``-e`` / ``-r`` / ``-Y`` takes exactly one
+    following value. That holds because ``_build_argv`` — the only producer of
+    these argvs — is the other half of the same module. These tests pin the
+    assumption on both sides so it cannot drift silently.
+    """
+
+    def test_matches_the_argv_the_pipeline_builds(self, tmp_path: Path) -> None:
+        pcap = make_pcap(tmp_path)
+        ws_path = tmp_path / "ws.duckdb"
+        runner, result = run(ws_path, pcap, [IP_SRC, TCP_PORT], lines=ROWS, filter=TCP_PORT == 443)
+        assert runner.argv is not None
+        # Every owned option present, each with exactly one value, and what is
+        # left is argv[0] plus the -T/-E options that shape the dissection.
+        assert result.cache_key.argv == tuple(runner.argv)
+        assert _argv_residue(runner.argv) == (
+            "tshark",
+            "-T",
+            "fields",
+            "-E",
+            f"separator={UNIT_SEP}",
+            "-E",
+            f"aggregator={OCC_SEP}",
+            "-E",
+            "occurrence=a",
+        )
+
+    def test_strips_each_owned_option_with_its_value(self) -> None:
+        argv = ["tshark", "-r", "cap.pcap", "-Y", "tcp.port == 443", "-e", "ip.src"]
+        assert _argv_residue(argv) == ("tshark",)
+
+    def test_absent_filter_leaves_the_same_residue(self) -> None:
+        # -Y present or absent must not change the residue, since the dfilter
+        # is compared as its own component.
+        with_filter = ["tshark", "-r", "cap.pcap", "-Y", "ip", "-T", "fields"]
+        without = ["tshark", "-r", "cap.pcap", "-T", "fields"]
+        assert _argv_residue(with_filter) == _argv_residue(without) == ("tshark", "-T", "fields")
+
+    def test_unknown_options_survive_verbatim(self) -> None:
+        # Anything that changes how bytes are dissected is exactly what the
+        # residue exists to compare, so it must pass through untouched — order
+        # and values included.
+        argv = [
+            "tshark",
+            "-X",
+            "lua_script:evil.lua",
+            "-r",
+            "cap.pcap",
+            "-d",
+            "tcp.port==8888,http",
+            "-o",
+            "tcp.desegment_tcp_streams:FALSE",
+            "-e",
+            "ip.src",
+        ]
+        assert _argv_residue(argv) == (
+            "tshark",
+            "-X",
+            "lua_script:evil.lua",
+            "-d",
+            "tcp.port==8888,http",
+            "-o",
+            "tcp.desegment_tcp_streams:FALSE",
+        )
+
+    def test_a_value_that_looks_like_an_option_is_not_reparsed(self) -> None:
+        # The value after an owned option is consumed as a value, never
+        # re-examined: a display filter spelled "-e" cannot swallow the token
+        # after it.
+        assert _argv_residue(["tshark", "-Y", "-e", "-T", "fields"]) == (
+            "tshark",
+            "-T",
+            "fields",
+        )
+
+    def test_repeated_projection_options_all_strip(self) -> None:
+        argv = ["tshark", "-e", "a", "-e", "b", "-e", "c", "-T", "fields"]
+        assert _argv_residue(argv) == ("tshark", "-T", "fields")
 
 
 class TestCacheHit:
@@ -394,6 +480,60 @@ class TestBackfill:
             ws_path, pcap, shifted, r"pkts does not hold: \[9\].*never produced: \[3\]"
         )
 
+    def test_duplicate_stored_frame_number_refused(self, tmp_path: Path) -> None:
+        # pkts has no PRIMARY KEY, so frame_number's uniqueness is a
+        # convention. A workspace where it does not hold would have its
+        # UPDATE fan out across every row sharing a number — writing one
+        # scanned row's values into two stored rows — so the convention is
+        # verified before any column is added or any row touched.
+        pcap = make_pcap(tmp_path)
+        ws_path = tmp_path / "ws.duckdb"
+        run(ws_path, pcap, [IP_SRC])
+        with Workspace(ws_path, mode="rw") as ws, ws.write() as con:
+            con.execute("UPDATE main.pkts SET frame_number = 1 WHERE frame_number = 3")
+        runner = FakeRunner([line("1", "51234"), line("2", "443")])
+        with (
+            Workspace(ws_path, mode="rw") as ws,
+            pytest.raises(WorkspaceError, match=r"more than one row: \[1\]"),
+            ws.write() as con,
+        ):
+            materialize_into(
+                con,
+                pcap=pcap,
+                fields=[IP_SRC, TCP_PORT],
+                tshark="tshark",
+                tshark_version="4.6.7",
+                runner=runner,
+            )
+        # Refused before the scan: no argv was ever built, and no column added.
+        assert runner.argv is None
+        with reading(ws_path) as con:
+            assert pkts_columns(con) == ["frame_number", "frame_time", "ip_src"]
+
+    def test_null_stored_frame_number_refused(self, tmp_path: Path) -> None:
+        # A NULL row key matches nothing, so its row would silently keep the
+        # NULL its ADD COLUMN back-filled.
+        pcap = make_pcap(tmp_path)
+        ws_path = tmp_path / "ws.duckdb"
+        run(ws_path, pcap, [IP_SRC])
+        with Workspace(ws_path, mode="rw") as ws, ws.write() as con:
+            con.execute("UPDATE main.pkts SET frame_number = NULL WHERE frame_number = 3")
+        runner = FakeRunner([line("1", "51234"), line("2", "443")])
+        with (
+            Workspace(ws_path, mode="rw") as ws,
+            pytest.raises(WorkspaceError, match=r"no frame number at all: 1"),
+            ws.write() as con,
+        ):
+            materialize_into(
+                con,
+                pcap=pcap,
+                fields=[IP_SRC, TCP_PORT],
+                tshark="tshark",
+                tshark_version="4.6.7",
+                runner=runner,
+            )
+        assert runner.argv is None
+
     def test_drift_examples_are_bounded(self, tmp_path: Path) -> None:
         # A wholly mismatched scan must not build a message naming every row.
         pcap = make_pcap(tmp_path)
@@ -616,6 +756,70 @@ class TestRefusedComponents:
                 ],
             )
         refuse(ws_path, pcap, [IP_SRC], WorkspaceError, r"not claimed by the cache key.*ip.dst")
+
+    def test_dropped_column_refused_on_the_hit_path(self, tmp_path: Path) -> None:
+        # meta.fields describes main.pkts rather than proving anything about
+        # it. A column dropped outside this pipeline leaves the registry
+        # saying otherwise, and reuse would report a hit for a column that is
+        # gone — the caller's next query then failing with a raw DuckDB binder
+        # error, far from the cause.
+        pcap = make_pcap(tmp_path)
+        ws_path = tmp_path / "ws.duckdb"
+        run(ws_path, pcap, [IP_SRC, TCP_PORT], lines=ROWS)
+        with Workspace(ws_path, mode="rw") as ws, ws.write() as con:
+            con.execute("ALTER TABLE main.pkts DROP COLUMN tcp_port")
+        refuse(ws_path, pcap, [TCP_PORT], WorkspaceError, r"missing from pkts.*tcp.port")
+
+    def test_dropped_column_refused_on_the_backfill_path(self, tmp_path: Path) -> None:
+        # Same corruption reached through a widening request, where the delta
+        # is non-empty and a scan would otherwise run against a table missing
+        # a column the registry still lists.
+        pcap = make_pcap(tmp_path)
+        ws_path = tmp_path / "ws.duckdb"
+        run(ws_path, pcap, [IP_SRC])
+        with Workspace(ws_path, mode="rw") as ws, ws.write() as con:
+            con.execute("ALTER TABLE main.pkts DROP COLUMN ip_src")
+        refuse(ws_path, pcap, [IP_SRC, TCP_PORT], WorkspaceError, r"missing from pkts.*ip.src")
+
+    def test_retyped_column_refused_on_the_hit_path(self, tmp_path: Path) -> None:
+        # A column recreated with another type would be read back through the
+        # codec its registered type implies, silently.
+        pcap = make_pcap(tmp_path)
+        ws_path = tmp_path / "ws.duckdb"
+        run(ws_path, pcap, [IP_SRC])
+        with Workspace(ws_path, mode="rw") as ws, ws.write() as con:
+            con.execute("ALTER TABLE main.pkts DROP COLUMN ip_src")
+            con.execute("ALTER TABLE main.pkts ADD COLUMN ip_src VARCHAR")
+        refuse(
+            ws_path,
+            pcap,
+            [IP_SRC],
+            WorkspaceError,
+            r"type changed.*ip_src is VARCHAR, registered as UINTEGER",
+        )
+
+    def test_retyped_column_refused_on_the_backfill_path(self, tmp_path: Path) -> None:
+        pcap = make_pcap(tmp_path)
+        ws_path = tmp_path / "ws.duckdb"
+        run(ws_path, pcap, [IP_SRC])
+        with Workspace(ws_path, mode="rw") as ws, ws.write() as con:
+            con.execute("ALTER TABLE main.pkts DROP COLUMN ip_src")
+            con.execute("ALTER TABLE main.pkts ADD COLUMN ip_src VARCHAR")
+        refuse(ws_path, pcap, [IP_SRC, TCP_PORT], WorkspaceError, r"type changed.*ip_src")
+
+    def test_list_column_type_survives_the_round_trip(self, tmp_path: Path) -> None:
+        # The comparison is a string equality against what duckdb_columns()
+        # reports, so a list column reporting anything but the "T[]" spelling
+        # meta.fields stores would refuse every healthy multi-value workspace.
+        pcap = make_pcap(tmp_path)
+        ws_path = tmp_path / "ws.duckdb"
+        run(ws_path, pcap, [TCP_PORT], lines=PORT_ROWS)
+        with reading(ws_path) as con:
+            assert read_pkts_columns(con)["tcp_port"] == "USMALLINT[]"
+            assert [record.column_type for record in read_fields(con)] == ["USMALLINT[]"]
+        again, second = run(ws_path, pcap, [TCP_PORT])
+        assert again.argv is None
+        assert second.outcome == "hit"
 
     def test_several_cache_keys_refused(self, tmp_path: Path) -> None:
         # One workspace records exactly one materialization; more than one key

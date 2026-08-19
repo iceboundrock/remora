@@ -76,11 +76,13 @@ __all__ = [
     "create_schema",
     "delete_cache_key",
     "find_covering_cache_key",
+    "find_duplicate_row_keys",
     "iter_ddl",
     "iter_scratch_ddl",
     "read_cache_key",
     "read_cache_keys",
     "read_fields",
+    "read_pkts_columns",
     "read_schema_version",
     "record_cache_key",
     "register_fields",
@@ -209,6 +211,69 @@ def create_schema(con: DuckDBPyConnection) -> None:
         "INSERT INTO meta.info (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING",
         [_SCHEMA_VERSION_KEY, str(SCHEMA_VERSION)],
     )
+
+
+def read_pkts_columns(con: DuckDBPyConnection) -> dict[str, str]:
+    """Return ``main.pkts``'s live columns as name -> SQL type.
+
+    The physical truth about the table, as opposed to what ``meta.fields``
+    says about it: #32 compares the two before reusing a workspace, because a
+    registry row is not evidence that its column is still there or still has
+    the type it was created with.
+
+    Pinned to ``current_database()`` and the ``main`` schema like every other
+    catalog probe here, so an attached workspace's ``pkts`` cannot answer for
+    this one's.
+
+    Args:
+        con: An open connection to the workspace.
+
+    Returns:
+        Column name to the SQL type DuckDB reports for it, in ordinal order.
+        The reported spelling round-trips what :func:`add_field_column` was
+        given for every type :mod:`remora.workspace.types` can produce,
+        ``T[]`` list types included — a test pins that over the whole ftype
+        table, which is what lets callers compare the strings directly.
+    """
+    rows = con.execute(
+        "SELECT column_name, data_type FROM duckdb_columns() "
+        "WHERE database_name = current_database() AND schema_name = 'main' "
+        "AND table_name = 'pkts' ORDER BY column_index"
+    ).fetchall()
+    return {str(name): str(data_type) for name, data_type in rows}
+
+
+def find_duplicate_row_keys(con: DuckDBPyConnection, limit: int = 5) -> tuple[int, list[int]]:
+    """Probe ``main.pkts`` for row keys that are not usable as row keys.
+
+    ``pkts`` has no ``PRIMARY KEY`` — DuckDB would back one with an ART index
+    that taxes the bulk append path (#25) — so ``frame_number``'s uniqueness
+    is a convention, and a backfill that matches rows on it has to verify the
+    convention holds before it writes. One statement, two aggregate passes
+    over a single ``BIGINT`` column, with the examples bounded by ``limit``.
+
+    Args:
+        con: An open connection to the workspace.
+        limit: How many duplicate frame numbers to name.
+
+    Returns:
+        The number of rows whose ``frame_number`` is ``NULL``, and up to
+        ``limit`` frame numbers that occur more than once.
+    """
+    row = con.execute(
+        f"""
+        SELECT
+            (SELECT count(*) FROM main.pkts WHERE frame_number IS NULL),
+            (SELECT list(frame_number) FROM (
+                SELECT frame_number FROM main.pkts WHERE frame_number IS NOT NULL
+                GROUP BY frame_number HAVING count(*) > 1
+                ORDER BY frame_number LIMIT {int(limit)}
+            ))
+        """
+    ).fetchone()
+    if row is None:
+        return 0, []
+    return int(row[0]), [int(value) for value in (row[1] or [])]
 
 
 def create_backfill_scan(con: DuckDBPyConnection) -> str:

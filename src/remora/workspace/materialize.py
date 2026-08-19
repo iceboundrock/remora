@@ -118,15 +118,31 @@ than a Python set is what keeps the check exact *and* the memory bounded on a
 capture of any size. Any discrepancy refuses and the caller's transaction
 rolls the whole backfill back.
 
-Consistency of the catalog itself
----------------------------------
-The subset rule reads ``meta.cache_keys`` alone, so it is only as trustworthy
-as the key's agreement with ``meta.fields``. The two are written together in
-one transaction and must describe the same workspace: every field a key claims
-has a registry row (bar the row-key-backed abbrevs, which get no column), and
-every registry row is claimed. A workspace where they diverge is refused
-before any reuse decision — never repaired, because which of the two states
-the truth is exactly what cannot be determined from here.
+Integrity of the workspace being reused
+--------------------------------------
+Reuse is only as trustworthy as the file it reuses, so three things are
+checked before any hit is served or any backfill delta is sized — all
+refusals, never repairs, because which of two disagreeing states holds the
+truth is exactly what cannot be determined from here.
+
+1. **The two catalogs agree.** The subset rule reads ``meta.cache_keys``
+   alone. It and ``meta.fields`` are written together in one transaction and
+   must describe one workspace: every field a key claims has a registry row
+   (bar the row-key-backed abbrevs, which get no column), and every registry
+   row is claimed.
+2. **The registry agrees with the table.** A ``meta.fields`` row is a
+   *description* of ``main.pkts``, not evidence about it. Every registered
+   column is checked to exist in the live catalog with the type it was
+   registered under; otherwise a hit names a column that has been dropped —
+   and the caller's next query fails with a raw binder error far from the
+   cause — or one recreated with another type is read back through the wrong
+   codec.
+3. **A backfill's row keys are matchable.** ``pkts`` has no ``PRIMARY KEY``
+   (#25), so ``frame_number``'s uniqueness is convention: a duplicate would
+   make ``UPDATE ... WHERE frame_number = ?`` fan one scanned row's values
+   out across several stored rows, and a ``NULL`` one would match nothing.
+   Verified before a column is added or a row touched, and only on the
+   backfill path — a hit writes nothing, so it cannot fan out.
 """
 
 from __future__ import annotations
@@ -157,8 +173,10 @@ from remora.workspace.schema import (
     create_backfill_scan,
     delete_cache_key,
     find_covering_cache_key,
+    find_duplicate_row_keys,
     read_cache_keys,
     read_fields,
+    read_pkts_columns,
     record_cache_key,
     register_fields,
 )
@@ -528,12 +546,15 @@ def materialize_into(
             different capture, display filter, tshark version or tshark
             argument vector, or if a requested field is already materialized
             under a different ftype or multiplicity.
-        WorkspaceError: If the workspace holds packet rows or registered
-            fields but no cache key describing them, if it holds more than one
-            cache key, if its stored key and ``meta.fields`` disagree about
-            which fields are materialized, if a requested field claims a
-            ``pkts`` skeleton column name, or if a backfill scan's row keys are
-            not exactly the ones ``pkts`` already holds.
+        WorkspaceError: If the workspace is not one this pipeline can reuse —
+            packet rows or registered fields with no cache key describing them,
+            more than one cache key, a stored key and ``meta.fields`` that
+            disagree about which fields are materialized, a registered column
+            missing from ``main.pkts`` or holding a different type than it was
+            registered with, or (on the backfill path) ``pkts`` rows whose
+            ``frame_number`` is duplicated or ``NULL``. Also if a requested
+            field claims a ``pkts`` skeleton column name, or if a backfill
+            scan's row keys are not exactly the ones ``pkts`` already holds.
         UnsupportedExprError: If ``filter`` cannot be pushed to tshark.
         TsharkError: If the run exits non-zero — ``TsharkProcess`` raises
             :class:`remora.reader.process.TsharkError` at end of stream, so it
@@ -712,6 +733,90 @@ def _refuse_inconsistent_catalog(
     )
 
 
+def _normalize_sql_type(sql_type: str) -> str:
+    """Fold a SQL type string for comparison: case and internal spacing only.
+
+    DuckDB reports back exactly the type string ``add_field_column`` was given
+    for every type :mod:`remora.workspace.types` can produce — ``T[]`` list
+    types included, which a test pins across the whole ftype table. This fold
+    is therefore defensive rather than load-bearing: it keeps a
+    hand-registered ``uinteger`` or ``DOUBLE  PRECISION`` from reading as a
+    corrupt column.
+    """
+    return " ".join(sql_type.split()).upper()
+
+
+def _refuse_absent_columns(con: DuckDBPyConnection, stored_fields: Sequence[FieldRecord]) -> None:
+    """Refuse when ``pkts`` does not physically hold what the registry claims.
+
+    ``meta.fields`` is a description of ``main.pkts``, not evidence about it: a
+    column dropped or recreated with another type outside this pipeline leaves
+    the registry saying otherwise. Reuse would then answer a request with a
+    cache *hit* naming a column that is gone — and the caller's next query
+    fails with a raw binder error from DuckDB, far from the cause — or
+    silently read values through the wrong codec. Both are refused here, as
+    workspace corruption, and deliberately not repaired: re-deriving the
+    column would mean rematerializing data this call promised only to read.
+    """
+    columns = read_pkts_columns(con)
+    absent: list[str] = []
+    retyped: list[str] = []
+    for record in stored_fields:
+        found = columns.get(record.column_name)
+        if found is None:
+            absent.append(f"{record.abbrev} -> {record.column_name}")
+        elif _normalize_sql_type(found) != _normalize_sql_type(record.column_type):
+            retyped.append(
+                f"{record.abbrev} -> {record.column_name} is {found}, "
+                f"registered as {record.column_type}"
+            )
+    if not absent and not retyped:
+        return
+    parts: list[str] = []
+    if absent:
+        parts.append(f"registered columns missing from pkts: {absent}")
+    if retyped:
+        parts.append(f"registered columns whose type changed: {retyped}")
+    raise WorkspaceError(
+        f"workspace is corrupt — {'; '.join(parts)}. meta.fields describes main.pkts, "
+        f"so reusing this workspace would serve a request from columns that are not "
+        f"there or no longer hold what they are registered to hold. Materialize into a "
+        f"fresh workspace file"
+    )
+
+
+def _refuse_unusable_row_keys(con: DuckDBPyConnection) -> None:
+    """Refuse a backfill over ``pkts`` rows that cannot be matched one to one.
+
+    A backfill fills its new columns with ``UPDATE ... WHERE frame_number =
+    ?``, which silently fans out across every row sharing a frame number and
+    silently matches none for a ``NULL`` one. ``pkts`` has no ``PRIMARY KEY``
+    to prevent either — DuckDB would back one with an ART index that taxes the
+    bulk append path (#25) — so ``frame_number``'s uniqueness is a convention,
+    and the convention is verified here rather than assumed. Checked *before*
+    any column is added or any row updated, so a corrupt workspace is refused
+    having been read and not written.
+
+    The cost is one statement of two aggregate passes over a single ``BIGINT``
+    column, paid once per backfill (never on a hit, which writes nothing and
+    so cannot fan out). The examples it names are bounded.
+    """
+    null_keys, duplicates = find_duplicate_row_keys(con, limit=_DRIFT_EXAMPLES)
+    if not null_keys and not duplicates:
+        return
+    parts: list[str] = []
+    if duplicates:
+        parts.append(f"frame numbers held by more than one row: {duplicates}")
+    if null_keys:
+        parts.append(f"rows with no frame number at all: {null_keys}")
+    raise WorkspaceError(
+        f"workspace is corrupt — {'; '.join(parts)}. pkts rows are matched by "
+        f"frame_number, which is unique by convention rather than by constraint, so a "
+        f"backfill cannot fill these rows one for one; nothing was written — "
+        f"materialize into a fresh workspace file"
+    )
+
+
 def _refuse_redeclared_fields(
     stored_by_abbrev: Mapping[str, FieldRecord], material_refs: Mapping[str, FieldRef[Any]]
 ) -> None:
@@ -756,7 +861,11 @@ def _reuse_or_backfill(
 ) -> MaterializeResult:
     """Decide hit / backfill / refuse against the workspace's stored key."""
     stored_by_abbrev = {record.abbrev: record for record in stored_fields}
+    # Integrity first, and in this order: the two catalogs must agree with each
+    # other, and the registry must agree with the physical table, before either
+    # is trusted to answer a hit or to size a backfill delta.
     _refuse_inconsistent_catalog(stored, stored_by_abbrev)
+    _refuse_absent_columns(con, stored_fields)
     _refuse_redeclared_fields(stored_by_abbrev, material_refs)
     fingerprint = fingerprint_pcap(pcap)
     rendered = fingerprint.render()
@@ -872,6 +981,9 @@ def _backfill(
             fields=tuple(stored_fields),
             added_fields=(),
         )
+    # Before a single column is added or a single row touched: the rows this
+    # backfill is about to match one for one must actually be matchable.
+    _refuse_unusable_row_keys(con)
     projection_refs = (
         _FRAME_NUMBER_REF,
         *(FieldRef(spec.abbrev, spec.ftype, spec.multi) for spec in new_specs),

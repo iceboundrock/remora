@@ -526,10 +526,17 @@ class Workspace:
         capture, the filter, the tshark version or its arguments is refused
         with :class:`~remora.workspace.errors.MaterializationMismatchError`.
         :func:`~remora.workspace.materialize.materialize_into` documents the
-        comparison rule and why refusing beats rematerializing in place. Note
-        that a hit still runs the ``tshark --version`` probe unless
-        ``tshark_version`` is given — the version is one of the components the
-        decision compares, so it has to be known before the decision is made.
+        comparison rule and why refusing beats rematerializing in place.
+
+        A hit spawns no *dissecting* tshark, which is the cost reuse exists to
+        avoid — but it still runs the ``tshark --version`` probe when
+        ``tshark_version`` is omitted, and that is deliberate: the version is
+        one of the components the decision compares, so it must be read from
+        the live binary rather than assumed from the stored key. Reusing the
+        recorded version instead would make every workspace hit forever across
+        a tshark upgrade that changes how the capture dissects. Pass
+        ``tshark_version`` explicitly to guarantee the call spawns no
+        subprocess at all.
 
         Args:
             pcap: Capture file to read.
@@ -558,12 +565,15 @@ class Workspace:
             WorkspaceModeError: In ro mode. Raised before anything is
                 spawned or probed, so a read-only workspace has no
                 subprocess side effects.
-            WorkspaceError: If the workspace holds packet data no cache key
-                describes, if its cache key and field registry disagree, if a
-                requested field claims a ``pkts`` skeleton column name, if a
-                backfill scan's row keys are not exactly the stored ones, or
-                if a :meth:`compact` on this file is in progress in this
-                process.
+            WorkspaceError: If the workspace is not one this pipeline can
+                reuse — packet data no cache key describes, a cache key and
+                field registry that disagree, a registered column missing from
+                ``pkts`` or retyped under it, or ``pkts`` rows whose
+                ``frame_number`` is duplicated or ``NULL`` when a backfill
+                needs to match on it. Also if a requested field claims a
+                ``pkts`` skeleton column name, if a backfill scan's row keys
+                are not exactly the stored ones, or if a :meth:`compact` on
+                this file is in progress in this process.
             MaterializationMismatchError: If the workspace already
                 materializes a different capture, filter, tshark version or
                 tshark argument vector.

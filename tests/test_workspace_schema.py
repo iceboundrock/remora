@@ -20,14 +20,17 @@ from remora.workspace.schema import (
     check_compatible,
     create_backfill_scan,
     create_schema,
+    find_duplicate_row_keys,
     iter_ddl,
     iter_scratch_ddl,
     read_cache_key,
     read_fields,
+    read_pkts_columns,
     read_schema_version,
     record_cache_key,
     register_fields,
 )
+from remora.workspace.types import COLUMN_TYPES, column_sql_type
 
 if TYPE_CHECKING:
     from duckdb import DuckDBPyConnection
@@ -212,6 +215,64 @@ class TestCreateSchema:
         for statement in iter_scratch_ddl():
             assert re.search(r"CREATE\s+(?:OR\s+REPLACE\s+)?TEMP\b", statement, re.IGNORECASE)
             assert workspace_names_created_in(statement) == set()
+
+    def test_reported_column_types_round_trip_every_ftype(self, con: DuckDBPyConnection) -> None:
+        # #32 refuses reuse when a pkts column's live type differs from the one
+        # meta.fields registered, comparing the two as strings. That is only
+        # correct if DuckDB reports back exactly what add_field_column was
+        # given — including the "T[]" spelling of a multi-value column, which
+        # is the one most likely to normalize differently. Checked across the
+        # whole ftype table so a future column type cannot break reuse
+        # silently.
+        for index, ftype in enumerate(sorted(COLUMN_TYPES)):
+            for multi in (False, True):
+                declared = column_sql_type(ftype, multi)
+                column = f"c{index}_{int(multi)}"
+                add_field_column(con, column, declared)
+                assert read_pkts_columns(con)[column] == declared
+
+    def test_read_pkts_columns_ignores_an_attached_workspace(
+        self, con: DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        # duckdb_columns() spans every attached database, so the probe is
+        # pinned to current_database() like every other catalog probe here.
+        # The second workspace is built through create_schema on its own
+        # connection rather than from DDL written here: nothing outside
+        # schema.py may create a layout name, test files included.
+        other = tmp_path / "other.duckdb"
+        side: DuckDBPyConnection = duckdb.connect(str(other))
+        try:
+            create_schema(side)
+            add_field_column(side, "intruder", "VARCHAR")
+        finally:
+            side.close()
+        con.execute(f"ATTACH '{other}' AS other (READ_ONLY)")
+        assert "intruder" not in read_pkts_columns(con)
+        assert set(read_pkts_columns(con)) == {"frame_number", "frame_time"}
+
+    def test_find_duplicate_row_keys(self, con: DuckDBPyConnection) -> None:
+        stamp = datetime(2026, 8, 18, tzinfo=timezone.utc)
+        con.executemany(
+            "INSERT INTO main.pkts (frame_number, frame_time) VALUES (?, ?)",
+            [[1, stamp], [2, stamp], [2, stamp], [3, stamp], [3, stamp], [None, stamp]],
+        )
+        assert find_duplicate_row_keys(con) == (1, [2, 3])
+
+    def test_find_duplicate_row_keys_bounds_its_examples(self, con: DuckDBPyConnection) -> None:
+        stamp = datetime(2026, 8, 18, tzinfo=timezone.utc)
+        con.executemany(
+            "INSERT INTO main.pkts (frame_number, frame_time) VALUES (?, ?)",
+            [[n, stamp] for n in range(1, 11) for _ in range(2)],
+        )
+        assert find_duplicate_row_keys(con, limit=3) == (0, [1, 2, 3])
+
+    def test_find_duplicate_row_keys_clean_table(self, con: DuckDBPyConnection) -> None:
+        stamp = datetime(2026, 8, 18, tzinfo=timezone.utc)
+        con.executemany(
+            "INSERT INTO main.pkts (frame_number, frame_time) VALUES (?, ?)",
+            [[1, stamp], [2, stamp], [3, stamp]],
+        )
+        assert find_duplicate_row_keys(con) == (0, [])
 
     def test_backfill_scan_staging_stays_out_of_the_workspace(
         self, con: DuckDBPyConnection
