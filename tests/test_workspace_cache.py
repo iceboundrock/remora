@@ -809,6 +809,77 @@ class TestRefusedComponents:
             con.execute("ALTER TABLE main.pkts DROP COLUMN ip_src")
         refuse(ws_path, pcap, [IP_SRC, TCP_PORT], WorkspaceError, r"missing from pkts.*ip.src")
 
+    def test_missing_skeleton_column_refused_on_the_hit_path(self, tmp_path: Path) -> None:
+        # Nothing registers the row key in meta.fields, so the skeleton was the
+        # one part of pkts no check covered: a dropped frame_time still
+        # answered a repeat request with a hit.
+        pcap = make_pcap(tmp_path)
+        ws_path = tmp_path / "ws.duckdb"
+        run(ws_path, pcap, [], lines=[line("1", "1614597071.5"), line("2", "1614597072.25")])
+        with Workspace(ws_path, mode="rw") as ws, ws.write() as con:
+            con.execute("ALTER TABLE main.pkts DROP COLUMN frame_time")
+        refuse(ws_path, pcap, [], WorkspaceError, r"missing from pkts.*frame_time \(pkts row key\)")
+
+    def test_missing_row_key_refused_on_the_backfill_path(self, tmp_path: Path) -> None:
+        # A dropped frame_number used to surface as a raw DuckDB catalog error
+        # from the middle of the backfill's row-key probe.
+        pcap = make_pcap(tmp_path)
+        ws_path = tmp_path / "ws.duckdb"
+        run(ws_path, pcap, [IP_SRC])
+        with Workspace(ws_path, mode="rw") as ws, ws.write() as con:
+            con.execute("ALTER TABLE main.pkts DROP COLUMN frame_number")
+        refuse(
+            ws_path,
+            pcap,
+            [IP_SRC, TCP_PORT],
+            WorkspaceError,
+            r"missing from pkts.*frame_number \(pkts row key\)",
+        )
+
+    def test_retyped_skeleton_column_refused(self, tmp_path: Path) -> None:
+        # Both types named: what the column is now, and what the layout says.
+        pcap = make_pcap(tmp_path)
+        ws_path = tmp_path / "ws.duckdb"
+        run(ws_path, pcap, [IP_SRC])
+        with Workspace(ws_path, mode="rw") as ws, ws.write() as con:
+            con.execute("ALTER TABLE main.pkts DROP COLUMN frame_time")
+            con.execute("ALTER TABLE main.pkts ADD COLUMN frame_time VARCHAR")
+        refuse(
+            ws_path,
+            pcap,
+            [IP_SRC],
+            WorkspaceError,
+            r"frame_time \(pkts row key\) is VARCHAR, the layout declares TIMESTAMP",
+        )
+
+    def test_retyped_row_key_refused_before_the_row_key_probe(self, tmp_path: Path) -> None:
+        # A recreated frame_number column is empty, so the duplicate/NULL probe
+        # would have blamed "rows with no frame number at all" — the symptom of
+        # the retyping rather than its cause. The schema check runs first.
+        pcap = make_pcap(tmp_path)
+        ws_path = tmp_path / "ws.duckdb"
+        run(ws_path, pcap, [IP_SRC])
+        with Workspace(ws_path, mode="rw") as ws, ws.write() as con:
+            con.execute("ALTER TABLE main.pkts DROP COLUMN frame_number")
+            con.execute("ALTER TABLE main.pkts ADD COLUMN frame_number VARCHAR")
+        refuse(
+            ws_path,
+            pcap,
+            [IP_SRC, TCP_PORT],
+            WorkspaceError,
+            r"frame_number \(pkts row key\) is VARCHAR, the layout declares BIGINT",
+        )
+
+    def test_skeleton_check_covers_a_first_materialization_too(self, tmp_path: Path) -> None:
+        # An altered but *empty* workspace takes the fresh path, which binds
+        # straight into the skeleton columns; without the check the INSERT
+        # fails with a raw binder error instead.
+        ws_path = tmp_path / "ws.duckdb"
+        pcap = make_pcap(tmp_path)
+        with Workspace(ws_path, mode="rw") as ws, ws.write() as con:
+            con.execute("ALTER TABLE main.pkts DROP COLUMN frame_time")
+        refuse(ws_path, pcap, [IP_SRC], WorkspaceError, r"missing from pkts.*frame_time")
+
     def test_retyped_column_refused_on_the_hit_path(self, tmp_path: Path) -> None:
         # A column recreated with another type would be read back through the
         # codec its registered type implies, silently.

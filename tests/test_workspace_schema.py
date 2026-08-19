@@ -11,9 +11,10 @@ from typing import TYPE_CHECKING
 import pytest
 
 from remora.workspace.errors import SchemaVersionError, WorkspaceError
-from remora.workspace.naming import column_name
+from remora.workspace.naming import SKELETON_COLUMNS, column_name
 from remora.workspace.schema import (
     SCHEMA_VERSION,
+    SKELETON_COLUMN_TYPES,
     CacheKeyRecord,
     FieldRecord,
     add_field_column,
@@ -215,6 +216,21 @@ class TestCreateSchema:
         for statement in iter_scratch_ddl():
             assert re.search(r"CREATE\s+(?:OR\s+REPLACE\s+)?TEMP\b", statement, re.IGNORECASE)
             assert workspace_names_created_in(statement) == set()
+
+    def test_skeleton_column_types_match_the_ddl(self, con: DuckDBPyConnection) -> None:
+        # SKELETON_COLUMN_TYPES is the authoritative statement of what the pkts
+        # row key columns are, imported by the materialize pipeline instead of
+        # restated there. It is declared beside _DDL rather than parsed out of
+        # it, so this is the guard that keeps the two in step: run the real
+        # DDL, read the real catalog, compare. Changing one without the other
+        # fails here rather than disagreeing silently.
+        assert read_pkts_columns(con) == dict(SKELETON_COLUMN_TYPES)
+
+    def test_skeleton_column_types_cover_the_reserved_names(self) -> None:
+        # naming.SKELETON_COLUMNS owns the names, SKELETON_COLUMN_TYPES the
+        # types; naming.py cannot import schema.py (schema imports naming), so
+        # the two definitions are pinned equal here instead.
+        assert set(SKELETON_COLUMN_TYPES) == SKELETON_COLUMNS
 
     def test_reported_column_types_round_trip_every_ftype(self, con: DuckDBPyConnection) -> None:
         # #32 refuses reuse when a pkts column's live type differs from the one

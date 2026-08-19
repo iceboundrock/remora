@@ -193,6 +193,7 @@ from remora.workspace.errors import (
 )
 from remora.workspace.naming import find_collisions
 from remora.workspace.schema import (
+    SKELETON_COLUMN_TYPES,
     CacheKeyRecord,
     FieldRecord,
     add_field_column,
@@ -261,9 +262,10 @@ _FRAME_NUMBER_SPEC: Final[ColumnSpec] = ColumnSpec(
     ftype="FT_FRAMENUM",
     multi=False,
     # Deliberately not column_sql_type("FT_FRAMENUM") (UINTEGER): frame_number
-    # is part of the pkts skeleton, so this must match what schema.py's layout
-    # declares, not what the ftype map would pick for a projected column.
-    sql_type="BIGINT",
+    # is part of the pkts skeleton, so its type is whatever schema.py's layout
+    # declares, not what the ftype map would pick for a projected column. Read
+    # from that layout rather than restated, so the two cannot drift.
+    sql_type=SKELETON_COLUMN_TYPES["frame_number"],
 )
 # frame.time renders human-readable; frame.time_epoch is the epoch-seconds
 # form remora.values.convert parses for FT_ABSOLUTE_TIME, landing in the
@@ -273,7 +275,7 @@ _FRAME_TIME_SPEC: Final[ColumnSpec] = ColumnSpec(
     column_name="frame_time",
     ftype="FT_ABSOLUTE_TIME",
     multi=False,
-    sql_type="TIMESTAMP",
+    sql_type=SKELETON_COLUMN_TYPES["frame_time"],
 )
 
 _FRAME_NUMBER_REF: Final[FieldRef[int]] = FieldRef("frame.number", "FT_FRAMENUM", False)
@@ -663,6 +665,11 @@ def _materialize_fresh(
     created_at: datetime | None,
 ) -> MaterializeResult:
     """Stream the whole capture into an empty workspace (the #31 pipeline)."""
+    # This path binds straight into the skeleton columns, so it needs the same
+    # assurance the reuse paths do that pkts is still pkts — an empty workspace
+    # someone has altered would otherwise fail on the INSERT with a raw binder
+    # error. No fields are registered yet, so only the skeleton is checked.
+    _refuse_broken_pkts_schema(con, ())
     specs = _sorted_specs(material_refs)
     projection_refs = _full_projection(specs)
     argv = _build_argv(tshark, pcap, dfilter, projection_refs)
@@ -775,21 +782,41 @@ def _normalize_sql_type(sql_type: str) -> str:
     return " ".join(sql_type.split()).upper()
 
 
-def _refuse_absent_columns(con: DuckDBPyConnection, stored_fields: Sequence[FieldRecord]) -> None:
-    """Refuse when ``pkts`` does not physically hold what the registry claims.
+def _refuse_broken_pkts_schema(
+    con: DuckDBPyConnection, stored_fields: Sequence[FieldRecord]
+) -> None:
+    """Refuse when ``main.pkts`` is not physically the table it is described as.
 
-    ``meta.fields`` is a description of ``main.pkts``, not evidence about it: a
-    column dropped or recreated with another type outside this pipeline leaves
-    the registry saying otherwise. Reuse would then answer a request with a
-    cache *hit* naming a column that is gone — and the caller's next query
-    fails with a raw binder error from DuckDB, far from the cause — or
-    silently read values through the wrong codec. Both are refused here, as
-    workspace corruption, and deliberately not repaired: re-deriving the
-    column would mean rematerializing data this call promised only to read.
+    Two descriptions are checked against the one live catalog read:
+
+    * the **skeleton** — ``frame_number`` and ``frame_time``, which every
+      workspace is created with and which
+      :data:`~remora.workspace.schema.SKELETON_COLUMN_TYPES` declares the types
+      of. Nothing registers them in ``meta.fields``, so without this they were
+      the one part of ``pkts`` no check covered: a dropped ``frame_time`` still
+      answered a repeat request with a cache *hit*, and a dropped
+      ``frame_number`` surfaced as a raw DuckDB catalog error from the middle
+      of a backfill's row-key probe.
+    * the **registry** — ``meta.fields`` is a description of ``main.pkts``, not
+      evidence about it: a column dropped or recreated with another type
+      outside this pipeline leaves it saying otherwise, so reuse would answer a
+      request with a hit naming a column that is gone (the caller's next query
+      then failing with a raw binder error, far from the cause) or silently
+      read values back through the wrong codec.
+
+    All of it is workspace corruption, refused and deliberately not repaired:
+    re-deriving a column would mean rematerializing data this call promised
+    only to read.
     """
     columns = read_pkts_columns(con)
     absent: list[str] = []
     retyped: list[str] = []
+    for column, declared in SKELETON_COLUMN_TYPES.items():
+        found = columns.get(column)
+        if found is None:
+            absent.append(f"{column} (pkts row key)")
+        elif _normalize_sql_type(found) != _normalize_sql_type(declared):
+            retyped.append(f"{column} (pkts row key) is {found}, the layout declares {declared}")
     for record in stored_fields:
         found = columns.get(record.column_name)
         if found is None:
@@ -803,14 +830,14 @@ def _refuse_absent_columns(con: DuckDBPyConnection, stored_fields: Sequence[Fiel
         return
     parts: list[str] = []
     if absent:
-        parts.append(f"registered columns missing from pkts: {absent}")
+        parts.append(f"columns missing from pkts: {absent}")
     if retyped:
-        parts.append(f"registered columns whose type changed: {retyped}")
+        parts.append(f"columns whose type changed: {retyped}")
     raise WorkspaceError(
-        f"workspace is corrupt — {'; '.join(parts)}. meta.fields describes main.pkts, "
-        f"so reusing this workspace would serve a request from columns that are not "
-        f"there or no longer hold what they are registered to hold. Materialize into a "
-        f"fresh workspace file"
+        f"workspace is corrupt — {'; '.join(parts)}. main.pkts no longer matches what "
+        f"the layout and meta.fields describe, so reusing this workspace would serve a "
+        f"request from columns that are not there or no longer hold what they are "
+        f"declared to hold. Materialize into a fresh workspace file"
     )
 
 
@@ -894,7 +921,7 @@ def _reuse_or_backfill(
     # other, and the registry must agree with the physical table, before either
     # is trusted to answer a hit or to size a backfill delta.
     _refuse_inconsistent_catalog(stored, stored_by_abbrev)
-    _refuse_absent_columns(con, stored_fields)
+    _refuse_broken_pkts_schema(con, stored_fields)
     _refuse_redeclared_fields(stored_by_abbrev, material_refs)
     fingerprint = fingerprint_pcap(pcap)
     rendered = fingerprint.render()

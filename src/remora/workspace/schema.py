@@ -53,9 +53,10 @@ imports duckdb only for typing and stays importable without it.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final
 
 from remora.workspace.errors import SchemaVersionError, WorkspaceError
@@ -68,6 +69,7 @@ if TYPE_CHECKING:
 __all__ = [
     "BACKFILL_SCAN_TABLE",
     "SCHEMA_VERSION",
+    "SKELETON_COLUMN_TYPES",
     "CacheKeyRecord",
     "FieldRecord",
     "add_field_column",
@@ -164,6 +166,28 @@ _SCRATCH_DDL: Final[tuple[str, ...]] = (
     )
     """,
 )
+
+
+SKELETON_COLUMN_TYPES: Final[Mapping[str, str]] = MappingProxyType(
+    {"frame_number": "BIGINT", "frame_time": "TIMESTAMP"}
+)
+"""SQL types the layout declares for the ``pkts`` skeleton columns.
+
+The single authoritative statement of what ``frame_number`` and ``frame_time``
+*are*, for every layer that needs to know: the materialize pipeline binds
+values into them (#31) and verifies the live table still matches them before
+reusing a workspace (#32). Both used to restate the literals, which is the
+drift this constant exists to prevent — ``naming.SKELETON_COLUMNS`` does the
+same job for the names.
+
+It is declared beside :data:`_DDL` rather than parsed out of it: production
+code should not carry a SQL parser for two values. Drift is prevented
+executably instead —
+``tests/test_workspace_schema.py::TestCreateSchema::test_skeleton_column_types_match_the_ddl``
+runs :func:`create_schema` and asserts the live catalog reports exactly this
+mapping, so changing the DDL without changing this constant fails a test
+rather than silently disagreeing.
+"""
 
 
 def iter_ddl() -> tuple[str, ...]:
