@@ -5,9 +5,15 @@ on:
     branches: [main]
   pull_request:
 
+# Self-hosted runners: checks and wheels run on the Linux ARM64 runner.
+# codegen-drift stays on x64 because the committed codegen fingerprints only
+# reproduce on amd64 — the env: line hashes the raw `tshark -G plugins` dump,
+# which embeds multiarch paths (x86_64-linux-gnu vs aarch64-linux-gnu); see
+# docs/codegen.md. Runner hosts need passwordless sudo for the apt steps, and
+# the x64 host needs software-properties-common for add-apt-repository.
 jobs:
   checks:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, ARM64]
     strategy:
       fail-fast: false
       matrix:
@@ -36,7 +42,8 @@ jobs:
           REMORA_REQUIRE_TSHARK: "1"
 
   codegen-drift:
-    runs-on: ubuntu-latest
+    # amd64-only: committed fingerprint hashes embed x86_64-linux-gnu paths.
+    runs-on: [self-hosted, linux, X64]
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.0.0
@@ -54,7 +61,7 @@ jobs:
         run: uv run python -m remora.codegen check
 
   wheels:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, ARM64]
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.0.0
