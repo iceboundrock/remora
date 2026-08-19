@@ -7,12 +7,13 @@ DuckDB actually executes them.
 
 No DDL is written here: tables come from remora.workspace.schema, which is the
 single source of the workspace layout.
+
+Import-purity testing is in tests/test_sql_import_purity.py (ungated so it
+runs in core-only environments).
 """
 
 from __future__ import annotations
 
-import subprocess
-import sys
 from collections.abc import Iterator
 from ipaddress import IPv4Address, IPv6Address
 from typing import TYPE_CHECKING, Any
@@ -203,21 +204,6 @@ class TestNaNAgainstRealDuckDB:
         )
         # Row 1 qualifies on its 1.5 alone; row 0's lone NaN must not qualify.
         assert select(con, DVALS > 1.0) == {1}
-
-
-class TestImportPurity:
-    def test_importing_the_backend_does_not_import_duckdb(self) -> None:
-        # The compiler emits plain strings and plain Python values; importing it
-        # must not pull the optional dependency in, even where it is installed.
-        code = (
-            "import sys\n"
-            "import remora.compile.sql\n"
-            "assert 'duckdb' not in sys.modules, 'duckdb imported by the sql backend'\n"
-        )
-        proc = subprocess.run(
-            [sys.executable, "-c", code], check=False, timeout=60, capture_output=True, text=True
-        )
-        assert proc.returncode == 0, proc.stderr
 
 
 #: Cases the SQL backend refuses outright, with the reason it refuses them.
