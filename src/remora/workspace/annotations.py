@@ -61,9 +61,13 @@ depends on whether it holds annotations:
   value known to exceed every id ever issued, e.g. inside
   ``Workspace.write()``::
 
-      INSERT INTO meta.info (key, value) VALUES ('next_annotation_id', '101')
+      INSERT INTO meta.info (key, value) VALUES ('next_annotation_id', '100')
 
-  The refusal itself modifies nothing.
+  The floor for that value is ``SELECT max(annotation_id) + 1 FROM
+  main.annotations``, and it has to go higher if ids were ever deleted:
+  ``main.annotations`` has no primary key, so a value chosen too low silently
+  hands out ids that already exist rather than failing on a constraint. The
+  refusal itself modifies nothing.
 
 Capture identity
 ----------------
@@ -266,7 +270,11 @@ def _allocate_annotation_id(con: DuckDBPyConnection) -> int:
             "will not guess at the cost of the never-reused guarantee. Set the mark "
             "by hand to a value you know exceeds every id ever issued, e.g. inside "
             "Workspace.write(): INSERT INTO meta.info (key, value) VALUES "
-            "('next_annotation_id', '<N>'). Nothing has been modified."
+            "('next_annotation_id', '<N>'). Choose <N> at minimum "
+            "SELECT max(annotation_id) + 1 FROM main.annotations, and higher if ids "
+            "were ever deleted: main.annotations has no primary key, so a too-low "
+            "<N> silently duplicates ids rather than failing. Nothing has been "
+            "modified."
         )
     # Empty table: seed silently. The INSERT is what makes a concurrent seed
     # fail loudly on meta.info's primary key rather than share id 1.
