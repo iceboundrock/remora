@@ -1,9 +1,9 @@
 """Import-purity test for the SQL backend (issue #29).
 
 Deliberately no ``pytest.importorskip("duckdb")``: this test asserts that
-importing the sql compiler pulls in neither duckdb nor any other optional
-dependency, and that a missing duckdb raises a helpful :class:`ImportError` —
-so it must run precisely where duckdb is *absent*.
+importing the sql compiler does not pull in duckdb. The assertion is meaningful
+both where duckdb is installed (it must stay unimported) and where it is absent
+(the import must still succeed) — which is why the module carries no importorskip.
 """
 
 from __future__ import annotations
