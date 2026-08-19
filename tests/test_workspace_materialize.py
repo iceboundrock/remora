@@ -392,16 +392,27 @@ class TestWorkspaceMethod:
         assert argv is not None
         assert argv[argv.index("-r") + 1] == str(pcap)
 
-    def test_ro_mode_raises_before_spawning(self, tmp_path: Path) -> None:
+    def test_ro_mode_raises_before_spawning(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         pcap = make_pcap(tmp_path)
         ws_path = tmp_path / "ws.duckdb"
         with Workspace(ws_path, mode="rw"):
             pass
         runner = FakeRunner(ROWS)
-        # No tshark_version: detection would spawn a subprocess, so reaching
-        # the mode refusal with argv still None pins the ordering too.
+        # Neither subprocess-spawning step may run: the version probe is
+        # replaced by a sentinel that records its calls, and no tshark_version
+        # is passed, so a detection would show up here.
+        detected: list[str] = []
+
+        def spy(tshark: str) -> str:
+            detected.append(tshark)
+            return "4.6.7"
+
+        monkeypatch.setattr("remora.workspace.workspace.detect_tshark_version", spy)
         with Workspace(ws_path) as ws, pytest.raises(WorkspaceModeError, match="read-only"):
             ws.materialize(pcap, [IP_SRC], runner=runner)
+        assert detected == []
         assert runner.argv is None
         assert_untouched(ws_path)
 

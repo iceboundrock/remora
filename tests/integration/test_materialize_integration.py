@@ -28,8 +28,7 @@ pytest.importorskip("duckdb")
 from remora import DNS, IP, TCP
 from remora.capture import _resolve_tshark
 from remora.reader.process import TsharkProcess
-from remora.workspace import Workspace, column_spec, detect_tshark_version
-from remora.workspace.schema import read_cache_key
+from remora.workspace import Workspace, column_spec, detect_tshark_version, read_cache_key
 
 FIXTURES_DIR = Path(__file__).resolve().parent.parent / "fixtures"
 TCP_MIXED = FIXTURES_DIR / "tcp_mixed.pcap"
@@ -68,7 +67,10 @@ class TestFilteredMaterialize:
     def test_filtered_materialize_matches_tshark_ground_truth(self, tmp_path: Path) -> None:
         with Workspace(tmp_path / "ws.duckdb", mode="rw") as ws:
             result = ws.materialize(TCP_MIXED, [IP.src, TCP.port], TCP.port == 443)
-            assert result.dfilter is not None
+            # Pin the rendered filter, not just that one exists: comparing
+            # against a live run of result.dfilter alone would pass just as
+            # happily on a wrong-but-self-consistent filter.
+            assert result.dfilter == "tcp.port == 443"
             expected = tshark_frame_numbers(TCP_MIXED, result.dfilter)
             with ws.read() as con:
                 stored = [
@@ -99,12 +101,18 @@ class TestFilteredMaterialize:
         # Both directions of the flow carry both ports; order differs per row.
         for row in rows:
             assert set(tcp_port.decode(row[1])) == {51234, 443}
+        # tests/fixtures/make_fixtures.py stamps frame i of tcp_mixed at
+        # base_ts 1700000100 + i seconds and i * 1000 microseconds, so the two
+        # selected frames (1 and 2) have exactly known timestamps. DuckDB
+        # TIMESTAMP is timezone-naive by design (#26): the workspace stores
+        # UTC and never lets a session time zone reshape it, so these are the
+        # naive-UTC renderings of those epochs.
+        assert [row[2] for row in rows] == [
+            datetime(2023, 11, 14, 22, 15, 0),
+            datetime(2023, 11, 14, 22, 15, 1, 1000),
+        ]
         for row in rows:
-            frame_time = row[2]
-            assert isinstance(frame_time, datetime)
-            # DuckDB TIMESTAMP is timezone-naive by design (#26): the workspace
-            # stores UTC and never lets a session time zone reshape it.
-            assert frame_time.tzinfo is None
+            assert row[2].tzinfo is None
 
 
 class TestUnfilteredMaterialize:

@@ -120,6 +120,12 @@ TsharkRunner: TypeAlias = Callable[[Sequence[str]], TsharkRun]
 #: Requested abbrevs whose data already lives in the pkts row-key skeleton.
 _SKELETON_ABBREVS: Final[frozenset[str]] = frozenset({"frame.number", "frame.time"})
 
+#: Wall-clock ceiling on the ``tshark --version`` probe. Generous, because it
+#: only has to bound a hung binary: the probe can run while
+#: ``Workspace.materialize`` holds the exclusive write lock, so a tshark that
+#: never returns would otherwise lock the workspace file forever.
+_VERSION_PROBE_TIMEOUT: Final[float] = 30.0
+
 _FRAME_NUMBER_SPEC: Final[ColumnSpec] = ColumnSpec(
     abbrev="frame.number",
     column_name="frame_number",
@@ -149,6 +155,10 @@ def detect_tshark_version(tshark: str) -> str:
     tshark releases can yield different fields, so a materialization records
     which one produced it.
 
+    The probe is bounded by ``_VERSION_PROBE_TIMEOUT`` seconds, because
+    ``Workspace.materialize`` calls it inside its write transaction: without a
+    timeout a hung binary would hold the workspace's exclusive lock forever.
+
     Args:
         tshark: Path or name of the tshark executable.
 
@@ -162,11 +172,19 @@ def detect_tshark_version(tshark: str) -> str:
             is not a runnable tshark), so all of them get the message that
             says how to fix it.
         subprocess.CalledProcessError: If tshark runs but exits non-zero.
+        subprocess.TimeoutExpired: If it does not answer within
+            ``_VERSION_PROBE_TIMEOUT`` seconds. Propagated as itself: a
+            binary that cannot report its version in 30 seconds is broken,
+            not merely absent.
         ValueError: If its output carries no recognizable version.
     """
     try:
         output = subprocess.run(
-            [tshark, "--version"], check=True, capture_output=True, text=True
+            [tshark, "--version"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=_VERSION_PROBE_TIMEOUT,
         ).stdout
     except OSError as exc:
         raise TsharkNotFoundError(
