@@ -104,19 +104,45 @@ a backfilled workspace indistinguishable from one materialized in a single run:
 the recorded key is recomputed over the *union* field set with the argv that
 single run would have used, so it is the same digest.
 
-Because the capture and the filter are identical, the scan must produce
-exactly the rows ``pkts`` already holds — one row per stored frame number,
-no more and no fewer. That is checked as a **set** comparison, not a count:
-a scan emitting one frame twice and another not at all has the right count
-while updating one row twice and leaving another at the ``NULL`` its
+Because the fingerprint and the filter are unchanged, the scan must produce
+the same *row-key set* ``pkts`` already holds — one row per stored frame
+number, no more and no fewer. That is checked as a **set** comparison, not a
+count: a scan emitting one frame twice and another not at all has the right
+count while updating one row twice and leaving another at the ``NULL`` its
 ``ADD COLUMN`` back-filled. Each scanned row key is therefore staged in
 DuckDB (:func:`~remora.workspace.schema.create_backfill_scan`, a session-
 scoped ``TEMP`` table that never reaches the file) and compared against
-``pkts`` in three directions — duplicates, scanned keys ``pkts`` does not
-hold, and stored rows the scan never produced. Staging in the database rather
-than a Python set is what keeps the check exact *and* the memory bounded on a
-capture of any size. Any discrepancy refuses and the caller's transaction
-rolls the whole backfill back.
+``pkts`` in four directions — scanned rows with no frame number at all,
+duplicates, scanned keys ``pkts`` does not hold, and stored rows the scan
+never produced. Staging in the database rather than a Python set is what
+keeps the check exact *and* the memory bounded on a capture of any size. Any
+discrepancy refuses and the caller's transaction rolls the whole backfill
+back.
+
+What a backfill does *not* verify
+---------------------------------
+The check above establishes **row alignment**: that the rescan's row keys are
+the ones already stored. It does not establish that the capture's bytes are
+unchanged, and it deliberately cannot — value identity of the columns a
+backfill does not rescan rests entirely on the #27 fingerprint, and that
+fingerprint is a sample (``st_size``, ``st_mtime_ns``, sha256 of the first
+and last 64 KiB), never a whole-file digest, because materializing a
+multi-gigabyte capture must not be preceded by reading it twice.
+
+So #27's named, pinned trade-off is inherited here with a sharper
+consequence. An in-place edit to the middle of a large capture that preserves
+size, mtime and both sampled blocks fingerprints identically
+(``tests/test_workspace_cachekey.py::TestFingerprint::test_middle_change_does_not_flip``
+pins exactly that); if it also preserves frame numbering, the row-key check
+passes and the backfill commits the *new* fields' values read from the edited
+capture beside the *old* columns read from the original — one row mixing two
+capture contents, under a cache key that looks entirely valid. This is an
+accepted cache-integrity limitation, not an oversight: closing it would mean
+either a whole-file digest (the cost #27 explicitly refused) or re-projecting
+columns that already exist (which is exactly what a backfill promises not to
+do). ``tests/test_workspace_cache.py`` pins the consequence rather than
+fixing it. Callers who need certainty against a mutated capture should
+materialize into a fresh workspace file.
 
 Integrity of the workspace being reused
 --------------------------------------
@@ -526,7 +552,10 @@ def materialize_into(
         mismatch. When the components agree, the field set decides: a subset
         of what is materialized is a **hit** served without running tshark at
         all, and anything more is a **backfill** that scans the capture for
-        the new fields only and leaves existing columns untouched. When any
+        the new fields only and leaves existing columns untouched — aligning
+        the rescan to the stored rows by frame-number set, which is row
+        alignment and not proof that the capture's bytes are unchanged (see
+        the module docs on what a backfill does not verify). When any
         component disagrees the call is **refused**; see the module docs for
         why refusing beats rematerializing in place.
 
@@ -554,7 +583,7 @@ def materialize_into(
             registered with, or (on the backfill path) ``pkts`` rows whose
             ``frame_number`` is duplicated or ``NULL``. Also if a requested
             field claims a ``pkts`` skeleton column name, or if a backfill
-            scan's row keys are not exactly the ones ``pkts`` already holds.
+            scan's row keys are not the same set ``pkts`` already holds.
         UnsupportedExprError: If ``filter`` cannot be pushed to tshark.
         TsharkError: If the run exits non-zero — ``TsharkProcess`` raises
             :class:`remora.reader.process.TsharkError` at end of stream, so it
@@ -952,11 +981,22 @@ def _backfill(
     batch_size: int,
     created_at: datetime | None,
 ) -> MaterializeResult:
-    """Add the requested fields' columns without rewriting the stored ones."""
+    """Add the requested fields' columns without rewriting the stored ones.
+
+    The rescan is aligned to the stored rows by frame number, verified as an
+    exact set match (:func:`_refuse_scan_drift`). That is **row alignment**
+    only: it says the rescan covered the rows already stored, one for one, not
+    that the capture still holds the bytes those rows were read from. Value
+    identity of the untouched columns rests on the #27 fingerprint's sample,
+    whose blind spot the module docs spell out under "What a backfill does not
+    verify".
+    """
     new_specs = [spec for spec in union_specs if spec.abbrev not in stored_by_abbrev]
     # The recorded key describes the union, under the argv a single run would
     # have used: a workspace built incrementally is then indistinguishable
-    # from one built in one go, key included.
+    # from one built in one go, key included — which is also why the
+    # fingerprint's blind spot is inherited rather than narrowed, since the
+    # key cannot record what the sample did not see.
     record = make_cache_key(
         pcap=pcap,
         fields=tuple(set(stored.fields) | set(requested)),
@@ -1037,7 +1077,15 @@ def _backfill(
 def _apply_backfill_batch(
     con: DuckDBPyConnection, update_sql: str, stage_sql: str, batch: Sequence[Sequence[Any]]
 ) -> None:
-    """Apply one batch's updates and stage its row keys for validation."""
+    """Apply one batch's updates and stage its row keys for validation.
+
+    Two ``executemany`` calls over the same batch: the ``UPDATE`` that fills
+    the new columns, matching on ``frame_number``, and the ``INSERT`` that
+    records that row key so :func:`_refuse_scan_drift` can compare the scan's
+    keys against ``pkts``'s as sets afterwards. The staged keys establish
+    which rows were covered — not that the capture's bytes are unchanged,
+    which the #27 fingerprint alone speaks to (module docs).
+    """
     con.executemany(update_sql, [list(values) for values in batch])
     con.executemany(stage_sql, [[values[-1]] for values in batch])
 
@@ -1048,28 +1096,34 @@ _DRIFT_EXAMPLES: Final[int] = 5
 
 
 def _drift_examples(con: DuckDBPyConnection, sql: str) -> list[int]:
-    """Run one bounded diagnostic query and return its frame numbers."""
-    return [int(row[0]) for row in con.execute(sql).fetchall()]
+    """Run one bounded diagnostic query and return its frame numbers.
+
+    ``NULL`` row keys are dropped rather than coerced: they are counted and
+    reported separately by :func:`_refuse_scan_drift`, and an ``int(None)``
+    here would replace a bounded, diagnosable refusal with a bare
+    ``TypeError`` from inside the error path itself.
+    """
+    return [int(row[0]) for row in con.execute(sql).fetchall() if row[0] is not None]
 
 
 def _refuse_scan_drift(con: DuckDBPyConnection, scan_table: str) -> None:
     """Refuse a backfill scan whose row keys are not exactly ``pkts``'s.
 
-    Same capture, same display filter, same tshark: the scan must select
-    exactly the rows the first run did, one row per frame number, so every
-    ``UPDATE`` matches exactly one stored row and every stored row is matched.
-    Comparing *counts* alone is not enough — a scan that emits one frame twice
-    and another not at all has the right count while updating one row twice
-    and leaving another at the ``NULL`` its ``ADD COLUMN`` back-filled — so
-    the row keys are compared as sets, in SQL, in three directions:
-    duplicates within the scan, scanned keys absent from ``pkts``, and stored
-    rows the scan never produced.
+    Same fingerprint, same display filter, same tshark: the scan must select
+    the same *row-key set* the first run did, one row per frame number, so
+    every ``UPDATE`` matches exactly one stored row and every stored row is
+    matched. Comparing *counts* alone is not enough — a scan that emits one
+    frame twice and another not at all has the right count while updating one
+    row twice and leaving another at the ``NULL`` its ``ADD COLUMN``
+    back-filled — so the row keys are compared as sets, in SQL, in four
+    directions: scanned rows carrying no frame number at all, duplicates
+    within the scan, scanned keys absent from ``pkts``, and stored rows the
+    scan never produced.
 
-    Any of the three means the capture no longer dissects to the rows this
-    workspace stores, despite an unchanged fingerprint — #27's documented
-    blind spot is an in-place edit preserving size and mtime. The whole
-    transaction is rolled back by the caller rather than committing a
-    half-filled column that nothing would flag.
+    What this establishes is **row alignment**, not that the capture's bytes
+    are unchanged: value identity of the columns this backfill does not
+    rescan rests on the #27 fingerprint, whose sampling blind spot is
+    inherited here (see the module docs).
 
     Args:
         con: The connection the backfill is running on.
@@ -1080,24 +1134,36 @@ def _refuse_scan_drift(con: DuckDBPyConnection, scan_table: str) -> None:
             naming each kind of discrepancy with up to
             :data:`_DRIFT_EXAMPLES` frame numbers.
     """
+    null_row = con.execute(
+        f"SELECT count(*) FROM {scan_table} WHERE frame_number IS NULL"
+    ).fetchone()
+    null_keys = 0 if null_row is None else int(null_row[0])
+    # NULL keys are excluded from the other three probes and reported on their
+    # own: SQL equality never matches NULL, so they would otherwise masquerade
+    # as "keys pkts does not hold" (and two of them as a duplicate of each
+    # other), naming the symptom instead of the cause.
     duplicated = _drift_examples(
         con,
-        f"SELECT frame_number FROM {scan_table} GROUP BY frame_number "
-        f"HAVING count(*) > 1 ORDER BY frame_number LIMIT {_DRIFT_EXAMPLES}",
+        f"SELECT frame_number FROM {scan_table} WHERE frame_number IS NOT NULL "
+        f"GROUP BY frame_number HAVING count(*) > 1 "
+        f"ORDER BY frame_number LIMIT {_DRIFT_EXAMPLES}",
     )
     unmatched = _drift_examples(
         con,
         f"SELECT s.frame_number FROM {scan_table} s ANTI JOIN main.pkts p "
-        f"ON s.frame_number = p.frame_number ORDER BY s.frame_number LIMIT {_DRIFT_EXAMPLES}",
+        f"ON s.frame_number = p.frame_number WHERE s.frame_number IS NOT NULL "
+        f"ORDER BY s.frame_number LIMIT {_DRIFT_EXAMPLES}",
     )
     missing = _drift_examples(
         con,
         f"SELECT p.frame_number FROM main.pkts p ANTI JOIN {scan_table} s "
         f"ON s.frame_number = p.frame_number ORDER BY p.frame_number LIMIT {_DRIFT_EXAMPLES}",
     )
-    if not duplicated and not unmatched and not missing:
+    if not null_keys and not duplicated and not unmatched and not missing:
         return
     parts: list[str] = []
+    if null_keys:
+        parts.append(f"scanned rows carrying no frame number at all: {null_keys}")
     if duplicated:
         parts.append(f"frame numbers the scan produced more than once: {duplicated}")
     if unmatched:

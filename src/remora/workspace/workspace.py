@@ -525,6 +525,18 @@ class Workspace:
         fields backfills just those columns, and a request that changes the
         capture, the filter, the tshark version or its arguments is refused
         with :class:`~remora.workspace.errors.MaterializationMismatchError`.
+
+        A backfill aligns its rescan to the stored rows by matching frame
+        numbers as a set, which establishes row alignment only. Whether the
+        columns it does *not* rescan still hold values from the same capture
+        contents rests on the #27 fingerprint, which is a sample rather than a
+        whole-file digest: an in-place middle edit preserving size, mtime and
+        the sampled blocks is invisible to it, so a backfill can in principle
+        join new-field values from an edited capture to older columns read
+        from the original. That is an accepted cache-integrity limitation
+        inherited from #27 and documented in
+        :mod:`remora.workspace.materialize`; materialize into a fresh
+        workspace file when a capture may have been mutated in place.
         :func:`~remora.workspace.materialize.materialize_into` documents the
         comparison rule and why refusing beats rematerializing in place.
 

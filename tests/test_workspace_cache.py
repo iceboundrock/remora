@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import os
 import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -534,6 +535,33 @@ class TestBackfill:
             )
         assert runner.argv is None
 
+    def test_null_scan_frame_number_refused(self, tmp_path: Path) -> None:
+        # A scanned row carrying no frame number at all matches nothing, and
+        # SQL equality never matches NULL — so it must be counted and reported
+        # on its own rather than reaching the diagnostics as a value to render
+        # (which used to escape as a bare TypeError from int(None), replacing
+        # the bounded refusal with a traceback from inside the error path).
+        pcap = make_pcap(tmp_path)
+        ws_path = tmp_path / "ws.duckdb"
+        run(ws_path, pcap, [IP_SRC])
+        self.refuse_backfill(
+            ws_path,
+            pcap,
+            [line("1", "51234"), line("", "443"), line("3", "8080")],
+            r"carrying no frame number at all: 1",
+        )
+
+    def test_every_scan_frame_number_null_refused(self, tmp_path: Path) -> None:
+        pcap = make_pcap(tmp_path)
+        ws_path = tmp_path / "ws.duckdb"
+        run(ws_path, pcap, [IP_SRC])
+        self.refuse_backfill(
+            ws_path,
+            pcap,
+            [line("", "51234"), line("", "443"), line("", "8080")],
+            r"carrying no frame number at all: 3.*never produced: \[1, 2, 3\]",
+        )
+
     def test_drift_examples_are_bounded(self, tmp_path: Path) -> None:
         # A wholly mismatched scan must not build a message naming every row.
         pcap = make_pcap(tmp_path)
@@ -833,6 +861,91 @@ class TestRefusedComponents:
         with Workspace(ws_path, mode="rw") as ws, ws.write() as con:
             record_cache_key(con, planted)
         refuse(ws_path, pcap, [IP_SRC], WorkspaceError, "2 cache keys")
+
+
+class TestInheritedFingerprintBlindSpot:
+    """What a backfill does *not* verify — pinned, not fixed.
+
+    Row alignment between the rescan and the stored rows is verified exactly
+    (frame-number set match). Value identity of the columns a backfill does
+    not rescan rests entirely on the #27 fingerprint, which is a sample of the
+    first and last 64 KiB plus size and mtime — never a whole-file digest,
+    because materializing a multi-gigabyte capture must not read it twice.
+
+    So #27's pinned trade-off
+    (``test_workspace_cachekey.py::TestFingerprint::test_middle_change_does_not_flip``)
+    is inherited here with a sharper consequence: an in-place middle edit that
+    preserves size, mtime and both sampled blocks is invisible, and if it also
+    preserves frame numbering the backfill joins new-field values read from
+    the edited capture to old columns read from the original. This test
+    documents that, so the limitation cannot be lost silently; closing it
+    would need either the whole-file digest #27 refused or a re-projection of
+    columns the backfill promises not to rewrite.
+    """
+
+    def rewrite_keeping_mtime(self, path: Path, body: bytes) -> None:
+        """Replace a capture's bytes and restore its mtime (as #27's suite does)."""
+        stamp = path.stat().st_mtime_ns
+        path.write_bytes(body)
+        os.utime(path, ns=(stamp, stamp))
+
+    def test_middle_edit_is_invisible_to_a_backfill(self, tmp_path: Path) -> None:
+        # Comfortably past head + tail, so the middle is unsampled.
+        large = 300 * 1024
+        body = bytearray(b"\x00" * large)
+        body[:16] = b"HEAD" * 4
+        body[-16:] = b"TAIL" * 4
+        pcap = tmp_path / "big.pcap"
+        pcap.write_bytes(bytes(body))
+        ws_path = tmp_path / "ws.duckdb"
+
+        first_lines = [
+            line("1", "1614597071.5", "10.0.0.1"),
+            line("2", "1614597072.25", "10.0.0.2"),
+        ]
+        run(ws_path, pcap, [IP_SRC], lines=first_lines)
+        before = fingerprint_pcap(pcap)
+
+        # Edit the unsampled middle in place, keeping size and mtime.
+        body[large // 2 : large // 2 + 3] = b"ZAP"
+        self.rewrite_keeping_mtime(pcap, bytes(body))
+        # The precondition this test rests on: #27's fingerprint cannot see it.
+        assert fingerprint_pcap(pcap) == before
+
+        # A rescan of the edited capture, same frame numbers, values that
+        # could only have come from the edited bytes.
+        runner, second = run(
+            ws_path, pcap, [IP_SRC, TCP_PORT], lines=[line("1", "9999"), line("2", "8888")]
+        )
+        assert runner.argv is not None
+
+        # Documenting the limitation: this succeeds.
+        assert second.outcome == "backfilled"
+        with reading(ws_path) as con:
+            rows = con.execute(
+                "SELECT ip_src, tcp_port FROM main.pkts ORDER BY frame_number"
+            ).fetchall()
+        # One row, two capture contents: ip_src read from the original bytes,
+        # tcp_port from the edited ones, under a cache key that looks valid.
+        assert rows == [
+            (int(IPv4Address("10.0.0.1")), [9999]),
+            (int(IPv4Address("10.0.0.2")), [8888]),
+        ]
+
+    def test_a_visible_edit_is_still_refused(self, tmp_path: Path) -> None:
+        # The limitation is specific to edits the sample cannot see. An edit
+        # that changes size, mtime or a sampled block refuses as it should, so
+        # the test above is documenting a narrow blind spot rather than an
+        # absent check.
+        pcap = make_pcap(tmp_path)
+        ws_path = tmp_path / "ws.duckdb"
+        run(ws_path, pcap, [IP_SRC])
+        body = bytearray(pcap.read_bytes())
+        body[0:4] = b"ZAPZ"
+        self.rewrite_keeping_mtime(pcap, bytes(body))
+        refuse(
+            ws_path, pcap, [IP_SRC, TCP_PORT], MaterializationMismatchError, "capture fingerprint"
+        )
 
 
 class TestBackfillAfterNarrowing:
