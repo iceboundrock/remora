@@ -28,7 +28,14 @@ pytest.importorskip("duckdb")
 from remora import DNS, IP, TCP
 from remora.capture import _resolve_tshark
 from remora.reader.process import TsharkProcess
-from remora.workspace import Workspace, column_spec, detect_tshark_version, read_cache_key
+from remora.workspace import (
+    MaterializationMismatchError,
+    Workspace,
+    column_spec,
+    detect_tshark_version,
+    read_cache_key,
+    read_cache_keys,
+)
 
 FIXTURES_DIR = Path(__file__).resolve().parent.parent / "fixtures"
 TCP_MIXED = FIXTURES_DIR / "tcp_mixed.pcap"
@@ -141,6 +148,68 @@ class TestUnfilteredMaterialize:
         assert stored_key.tshark_version == detect_tshark_version(_resolve_tshark(None))
         assert stored_key.fields == ("ip.src", "tcp.port")
         assert stored_key.dfilter is None
+
+
+class TestReuse:
+    """#32's hit/backfill/refuse decision against a real dissection."""
+
+    def test_identical_request_is_a_hit(self, tmp_path: Path) -> None:
+        with Workspace(tmp_path / "ws.duckdb", mode="rw") as ws:
+            first = ws.materialize(TCP_MIXED, [IP.src, TCP.port])
+            second = ws.materialize(TCP_MIXED, [IP.src, TCP.port])
+            with ws.read() as con:
+                rows = con.execute("SELECT count(*) FROM main.pkts").fetchone()
+        assert first.outcome == "materialized"
+        assert second.outcome == "hit"
+        assert second.cache_key == first.cache_key
+        # The second call appended nothing: reuse, not a second run's rows
+        # landing on top of the first's.
+        assert rows is not None
+        assert rows[0] == first.row_count
+
+    def test_backfill_matches_a_one_shot_materialization(self, tmp_path: Path) -> None:
+        incremental = tmp_path / "incremental.duckdb"
+        with Workspace(incremental, mode="rw") as ws:
+            ws.materialize(TCP_MIXED, [IP.src])
+            with ws.read() as con:
+                before = con.execute(
+                    "SELECT frame_number, frame_time, ip_src FROM main.pkts ORDER BY frame_number"
+                ).fetchall()
+            backfilled = ws.materialize(TCP_MIXED, [IP.src, TCP.port])
+            with ws.read() as con:
+                after = con.execute(
+                    "SELECT frame_number, frame_time, ip_src FROM main.pkts ORDER BY frame_number"
+                ).fetchall()
+                incremental_rows = con.execute(
+                    "SELECT frame_number, ip_src, tcp_port FROM main.pkts ORDER BY frame_number"
+                ).fetchall()
+
+        one_shot_path = tmp_path / "one_shot.duckdb"
+        with Workspace(one_shot_path, mode="rw") as ws:
+            one_shot = ws.materialize(TCP_MIXED, [IP.src, TCP.port])
+            with ws.read() as con:
+                one_shot_rows = con.execute(
+                    "SELECT frame_number, ip_src, tcp_port FROM main.pkts ORDER BY frame_number"
+                ).fetchall()
+
+        assert backfilled.outcome == "backfilled"
+        assert [record.abbrev for record in backfilled.added_fields] == ["tcp.port"]
+        # The columns that were already there are untouched by the backfill...
+        assert after == before
+        # ...and what the workspace holds afterwards — rows and cache key
+        # alike — is exactly what materializing both fields at once produces.
+        assert incremental_rows == one_shot_rows
+        assert backfilled.cache_key.key == one_shot.cache_key.key
+
+    def test_changed_dfilter_refused(self, tmp_path: Path) -> None:
+        with Workspace(tmp_path / "ws.duckdb", mode="rw") as ws:
+            ws.materialize(TCP_MIXED, [IP.src], TCP.port == 443)
+            with pytest.raises(MaterializationMismatchError, match="display filter"):
+                ws.materialize(TCP_MIXED, [IP.src], TCP.port == 80)
+            with ws.read() as con:
+                stored = read_cache_keys(con)
+        assert len(stored) == 1
+        assert stored[0].dfilter == "tcp.port == 443"
 
 
 class TestMultiOccurrenceField:

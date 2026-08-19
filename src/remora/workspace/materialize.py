@@ -50,39 +50,94 @@ taken — :mod:`remora.workspace.types` documents the hazard: DuckDB exports
 traffic) would arrive two's-complement negative. The DuckDB-native bind path is
 exact.
 
-One materialization per workspace
----------------------------------
-A workspace that already holds packet rows, registered fields *or* a recorded
-cache key is refused. Appending a second run's rows would misalign them against
-columns the first run added, and deciding that a stored table already covers a
-request — or backfilling the columns it lacks — is issue #32's job, not this
-one's. The cache key counts because a run can legitimately write nothing else:
-``fields=()`` with a filter that matches no packet leaves no rows and no
-registry entries, and admitting a second run over that workspace would leave the
-first run's key describing rows it never produced.
+Reuse: hit, backfill, or refuse (#32)
+-------------------------------------
+A workspace records exactly one materialization — one row in
+``meta.cache_keys``, describing what ``pkts`` currently *is*. A second
+:func:`materialize_into` call against it is decided against that row, never
+blindly re-run:
+
+* **hit** — the requested field set is a subset of the materialized one and
+  every other component is identical. Nothing is scanned and nothing is
+  written; the stored rows already answer the request. An exact repeat is the
+  special case where the subset is the whole set.
+* **backfill** — the components match but the request asks for fields the
+  workspace does not hold. Only the new ones are scanned (tshark has to
+  dissect the capture again — that cost is unavoidable), their columns are
+  added, and the existing columns are left exactly as they were.
+* **refuse** — any other component differs. See below.
+
+The decision compares *components*, not digests. The stored key's digest covers
+the full field set that was asked for, so two requests differing only in their
+projection have different digests and comparing those would report every
+widening as a mismatch. What is compared is: the capture's fingerprint, the
+display filter (``None`` and ``""`` distinct, as #27 digests them), the tshark
+version, and the argv **modulo the parts other components already own** —
+``-e`` (owned by the field set), ``-r`` (owned by the fingerprint, which
+identifies a capture by its bytes, so the same capture under a new path is the
+same capture) and ``-Y`` (owned by the dfilter). What is left is argv[0] and
+every option that changes how bytes are dissected — ``-X lua_script:``, ``-d``,
+``-o`` — which is exactly the omission that makes a cache silently wrong. The
+subset test itself is a ``list_has_all`` predicate in SQL
+(:func:`~remora.workspace.schema.find_covering_cache_key`), which is why #27
+canonicalizes the stored field set and #25 stores it as a native ``VARCHAR[]``.
+
+A mismatch **refuses** with
+:class:`~remora.workspace.errors.MaterializationMismatchError`, naming every
+component that changed and telling the caller to materialize into a fresh
+workspace file. Rematerializing in place under a policy is deliberately future
+work: dropping rows a caller may already have annotated (#30) is not a decision
+this function may take on its own. A workspace holding rows or registered
+fields but *no* cache key is refused too — it was not written by this pipeline,
+so nothing can be said about what its rows cover.
+
+How a backfill writes
+---------------------
+The second scan projects ``frame.number`` plus the new fields and nothing else:
+``frame.time_epoch`` is already stored, and re-projecting fields that already
+have columns would rewrite data that is by definition unchanged. Rows are
+matched on ``frame_number`` — the row key by convention (#25) — and each new
+column is filled by ``UPDATE``, so no existing column is touched. Absent values
+are encoded exactly as a fresh run encodes them (``NULL`` for a scalar, ``[]``
+for a multi-value column, never ``NULL`` in a list column), which is what makes
+a backfilled workspace indistinguishable from one materialized in a single run:
+the recorded key is recomputed over the *union* field set with the argv that
+single run would have used, so it is the same digest. Because the capture and
+the filter are identical, the scan must produce exactly the rows ``pkts``
+already holds; a differing row count means the capture changed underneath the
+fingerprint's known blind spot, and the whole transaction is refused and rolled
+back rather than leaving rows the ``UPDATE`` never matched.
 """
 
 from __future__ import annotations
 
 import os
 import subprocess
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Final, Protocol, TypeAlias
+from typing import TYPE_CHECKING, Any, Final, Literal, Protocol, TypeAlias
 
 from remora.compile.dfilter import compile_dfilter
 from remora.expr import Expr
 from remora.fields import FieldRef
 from remora.reader.fields_reader import FieldsReader, fields_argv
 from remora.reader.process import TsharkNotFoundError
-from remora.workspace.cachekey import make_cache_key
-from remora.workspace.errors import ColumnNameCollisionError, WorkspaceError
+from remora.workspace.cachekey import PcapFingerprint, fingerprint_pcap, make_cache_key
+from remora.workspace.errors import (
+    ColumnNameCollisionError,
+    MaterializationMismatchError,
+    WorkspaceError,
+)
 from remora.workspace.naming import find_collisions
 from remora.workspace.schema import (
     CacheKeyRecord,
     FieldRecord,
     add_field_column,
+    delete_cache_key,
+    find_covering_cache_key,
+    read_cache_keys,
+    read_fields,
     record_cache_key,
     register_fields,
 )
@@ -92,6 +147,7 @@ if TYPE_CHECKING:
     from duckdb import DuckDBPyConnection
 
 __all__ = [
+    "MaterializeOutcome",
     "MaterializeResult",
     "TsharkRun",
     "TsharkRunner",
@@ -123,6 +179,11 @@ TsharkRunner: TypeAlias = Callable[[Sequence[str]], TsharkRun]
 #: Requested abbrevs whose data already lives in the pkts row-key skeleton.
 _SKELETON_ABBREVS: Final[frozenset[str]] = frozenset({"frame.number", "frame.time"})
 
+#: argv options whose value another cache-key component already owns, and which
+#: are therefore stripped before two argvs are compared: ``-e`` belongs to the
+#: field set, ``-r`` to the capture fingerprint, ``-Y`` to the display filter.
+_ARGV_OPTIONS_OWNED_ELSEWHERE: Final[frozenset[str]] = frozenset({"-e", "-r", "-Y"})
+
 #: Wall-clock ceiling on the ``tshark --version`` probe. Generous, because it
 #: only has to bound a hung binary: the probe can run while
 #: ``Workspace.materialize`` holds the exclusive write lock, so a tshark that
@@ -148,6 +209,11 @@ _FRAME_TIME_SPEC: Final[ColumnSpec] = ColumnSpec(
     ftype="FT_ABSOLUTE_TIME",
     multi=False,
     sql_type="TIMESTAMP",
+)
+
+_FRAME_NUMBER_REF: Final[FieldRef[int]] = FieldRef("frame.number", "FT_FRAMENUM", False)
+_FRAME_TIME_EPOCH_REF: Final[FieldRef[datetime]] = FieldRef(
+    "frame.time_epoch", "FT_ABSOLUTE_TIME", False
 )
 
 
@@ -203,25 +269,41 @@ def detect_tshark_version(tshark: str) -> str:
     return parse_tshark_version(output)
 
 
+MaterializeOutcome: TypeAlias = Literal["materialized", "hit", "backfilled"]
+"""What a :func:`materialize_into` call decided (see the module docs).
+
+``"materialized"`` is a first materialization, ``"hit"`` is reuse with no
+tshark run at all, ``"backfilled"`` is reuse plus a scan for the new fields
+only.
+"""
+
+
 @dataclass(frozen=True)
 class MaterializeResult:
-    """What one :func:`materialize_into` call wrote.
+    """What one :func:`materialize_into` call decided and wrote.
 
     Attributes:
-        row_count: Packet rows appended to ``main.pkts``.
+        outcome: Whether the call materialized, hit the cache, or backfilled.
+        row_count: Packet rows this call wrote — appended on a first
+            materialization, updated on a backfill, ``0`` on a hit.
         batch_count: ``executemany`` batches those rows were written in.
-        cache_key: The recorded cache key and every component it covers.
+        cache_key: The cache key the workspace now holds, and every component
+            it covers. On a backfill it describes the *union* field set.
         dfilter: Display filter pushed to tshark, or ``None`` when unfiltered.
-        fields: Registry entries written to ``meta.fields`` — one per
-            materialized column, so a request satisfied by the row-key
-            skeleton is absent here.
+        fields: Registry entries for every materialized column in the
+            workspace *after* this call, ascending by abbrev — so a request
+            satisfied by the row-key skeleton is absent here, and a narrower
+            request still reports the columns it did not ask for.
+        added_fields: The subset of ``fields`` this call added. Empty on a hit.
     """
 
+    outcome: MaterializeOutcome
     row_count: int
     batch_count: int
     cache_key: CacheKeyRecord
     dfilter: str | None
     fields: tuple[FieldRecord, ...]
+    added_fields: tuple[FieldRecord, ...]
 
 
 def _quote_identifier(name: str) -> str:
@@ -229,28 +311,131 @@ def _quote_identifier(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
-def _refuse_second_materialization(con: DuckDBPyConnection) -> None:
-    """Refuse a workspace that already holds a materialization.
+def _argv_residue(argv: Sequence[str]) -> tuple[str, ...]:
+    """Strip the argv parts other cache-key components own (module docs).
 
-    All three of the tables a run writes are probed, not just ``pkts`` and
-    ``meta.fields``: a first run with ``fields=()`` and a filter matching
-    nothing writes no rows and registers no fields, yet still records its
-    cache key — so keying the refusal on rows and fields alone would admit a
-    second run and leave the stored key permanently describing rows it did
-    not produce.
+    Two materializations of one capture differ in their ``-e`` projection by
+    construction, and may differ in how they spell ``-r``; the field set and
+    the fingerprint compare those. What is left is argv[0] and every option
+    that changes the dissection itself, which must match exactly.
+    """
+    residue: list[str] = []
+    skip = False
+    for argument in argv:
+        if skip:
+            skip = False
+            continue
+        if argument in _ARGV_OPTIONS_OWNED_ELSEWHERE:
+            skip = True
+            continue
+        residue.append(argument)
+    return tuple(residue)
+
+
+def _build_argv(
+    tshark: str,
+    pcap: str | os.PathLike[str],
+    dfilter: str | None,
+    projection: Sequence[FieldRef[Any]],
+) -> list[str]:
+    """Build the effective tshark argv for one run."""
+    argv = [tshark, "-r", os.fspath(pcap)]
+    if dfilter is not None:
+        argv += ["-Y", dfilter]
+    return argv + fields_argv(projection)
+
+
+def _full_projection(specs: Sequence[ColumnSpec]) -> tuple[FieldRef[Any], ...]:
+    """The projection a single run materializing ``specs`` asks tshark for.
+
+    Skeleton first, then the specs in the order given, deduplicated by abbrev
+    so a caller who explicitly requests ``frame.time_epoch`` does not get it
+    projected twice. Callers pass ``specs`` abbrev-sorted, which is what makes
+    the argv — and therefore the cache key — of a backfilled workspace equal
+    the argv of the one-shot run that would have produced the same columns.
+    """
+    projection: dict[str, FieldRef[Any]] = {
+        _FRAME_NUMBER_REF.name: _FRAME_NUMBER_REF,
+        _FRAME_TIME_EPOCH_REF.name: _FRAME_TIME_EPOCH_REF,
+    }
+    for spec in specs:
+        projection.setdefault(spec.abbrev, FieldRef(spec.abbrev, spec.ftype, spec.multi))
+    return tuple(projection.values())
+
+
+def _sorted_specs(refs: Mapping[str, FieldRef[Any]]) -> list[ColumnSpec]:
+    """Column specs for material field refs, abbrev-sorted (canonical order)."""
+    return [column_spec(name, refs[name].ftype, refs[name].multi) for name in sorted(refs)]
+
+
+def _spec_of(record: FieldRecord) -> ColumnSpec:
+    """Rebuild the column spec of an already-materialized field."""
+    return ColumnSpec(
+        abbrev=record.abbrev,
+        column_name=record.column_name,
+        ftype=record.ftype,
+        multi=record.multi,
+        sql_type=record.column_type,
+    )
+
+
+def _refuse_unowned_workspace(con: DuckDBPyConnection) -> None:
+    """Refuse a workspace holding packet data no cache key describes.
+
+    Every run this pipeline performs records a key — including one that writes
+    nothing else, since ``fields=()`` with a filter matching no packet leaves
+    no rows and no registry entries. So rows or registered fields without a
+    key mean the file was populated by something else, and nothing can be
+    concluded about what those rows cover.
     """
     rows = con.execute("SELECT count(*) FROM main.pkts").fetchone()
     fields = con.execute("SELECT count(*) FROM meta.fields").fetchone()
-    keys = con.execute("SELECT count(*) FROM meta.cache_keys").fetchone()
     n_rows = 0 if rows is None else int(rows[0])
     n_fields = 0 if fields is None else int(fields[0])
-    n_keys = 0 if keys is None else int(keys[0])
-    if n_rows or n_fields or n_keys:
+    if n_rows or n_fields:
         raise WorkspaceError(
-            f"workspace already holds a materialization ({n_rows} pkts rows, "
-            f"{n_fields} registered fields, {n_keys} cache keys); cache-hit and "
-            f"backfill land with issue #32 — materialize into a fresh workspace file"
+            f"workspace holds {n_rows} pkts rows and {n_fields} registered fields but "
+            f"no cache key describing them, so it was not written by remora's "
+            f"materialize pipeline and nothing about it can be reused; materialize "
+            f"into a fresh workspace file"
         )
+
+
+def _refuse_collisions(stored: Sequence[FieldRecord], refs: Mapping[str, FieldRef[Any]]) -> None:
+    """Refuse when the union of stored and requested abbrevs shares a column.
+
+    Checked over the union, not the request alone: the column-name policy is
+    not injective, so a *new* abbrev can claim the column an earlier run's
+    abbrev already owns, and that must be refused before a single column is
+    added rather than discovered halfway through the ``ALTER``s.
+    """
+    collisions = find_collisions([record.abbrev for record in stored] + list(refs))
+    if collisions:
+        detail = "; ".join(
+            f"{column} <- {', '.join(owners)}" for column, owners in sorted(collisions.items())
+        )
+        raise ColumnNameCollisionError(f"field set maps distinct abbrevs onto one column: {detail}")
+
+
+def _render_component(value: object) -> str:
+    """Render a mismatching component for the refusal message, bounded."""
+    text = value if isinstance(value, str) else repr(value)
+    return text if len(text) <= 160 else text[:157] + "..."
+
+
+def _refuse_mismatch(changed: Sequence[tuple[str, object, object]]) -> None:
+    """Raise naming every cache-key component that changed."""
+    detail = "; ".join(
+        f"{component} (stored {_render_component(stored)}, "
+        f"requested {_render_component(requested)})"
+        for component, stored, requested in changed
+    )
+    raise MaterializationMismatchError(
+        f"workspace already materializes a different request and cannot be reused — "
+        f"changed: {detail}. Materialize into a fresh workspace file; rematerializing "
+        f"in place under a policy is deliberately not done here, because it would "
+        f"discard rows that may already carry annotations"
+    )
 
 
 def materialize_into(
@@ -292,18 +477,41 @@ def materialize_into(
         created_at: Timestamp for the catalog rows; ``now`` in UTC when
             omitted.
 
+    Reuse:
+        A workspace that already holds a materialization is not re-run
+        blindly. The stored cache key is compared **component by component**
+        — capture fingerprint, display filter, tshark version, and the argv
+        with the ``-e`` / ``-r`` / ``-Y`` parts those other components own
+        stripped out — never digest against digest, because the digest covers
+        the requested field set and would therefore call every widening a
+        mismatch. When the components agree, the field set decides: a subset
+        of what is materialized is a **hit** served without running tshark at
+        all, and anything more is a **backfill** that scans the capture for
+        the new fields only and leaves existing columns untouched. When any
+        component disagrees the call is **refused**; see the module docs for
+        why refusing beats rematerializing in place.
+
     Returns:
-        What was written — row and batch counts, the cache key, the pushed
-        filter and the field registry entries.
+        What was decided and written — the outcome, row and batch counts, the
+        cache key the workspace now holds, the pushed filter, every
+        materialized field and the ones this call added.
 
     Raises:
         ValueError: If ``batch_size`` is below 1, if a capture path or argv
             element cannot be stored (see
             :func:`~remora.workspace.cachekey.make_cache_key`), or if a field
             declared scalar occurs more than once in one packet.
-        ColumnNameCollisionError: If two distinct abbrevs claim one column.
-        WorkspaceError: If the workspace already holds a materialization, or
-            if a requested field claims a ``pkts`` skeleton column name.
+        ColumnNameCollisionError: If two distinct abbrevs — from the request,
+            or one requested and one already materialized — claim one column.
+        MaterializationMismatchError: If the workspace materializes a
+            different capture, display filter, tshark version or tshark
+            argument vector, or if a requested field is already materialized
+            under a different ftype or multiplicity.
+        WorkspaceError: If the workspace holds packet rows or registered
+            fields but no cache key describing them, if it holds more than one
+            cache key, if a requested field claims a ``pkts`` skeleton column
+            name, or if a backfill scan does not produce exactly the rows
+            ``pkts`` already holds.
         UnsupportedExprError: If ``filter`` cannot be pushed to tshark.
         TsharkError: If the run exits non-zero — ``TsharkProcess`` raises
             :class:`remora.reader.process.TsharkError` at end of stream, so it
@@ -326,35 +534,66 @@ def materialize_into(
     requested: dict[str, FieldRef[Any]] = {}
     for ref in fields:
         requested.setdefault(ref.name, ref)
-    collisions = find_collisions(requested)
-    if collisions:
-        detail = "; ".join(
-            f"{column} <- {', '.join(owners)}" for column, owners in sorted(collisions.items())
-        )
-        raise ColumnNameCollisionError(f"field set maps distinct abbrevs onto one column: {detail}")
     # Skeleton-backed requests need no column; anything else claiming a
     # skeleton column name falls through to add_field_column's refusal.
-    material_specs = [
-        column_spec(ref.name, ref.ftype, ref.multi)
-        for name, ref in requested.items()
-        if name not in _SKELETON_ABBREVS
-    ]
-    _refuse_second_materialization(con)
+    material_refs = {name: ref for name, ref in requested.items() if name not in _SKELETON_ABBREVS}
+    stored_fields = read_fields(con)
+    stored_keys = read_cache_keys(con)
+    _refuse_collisions(stored_fields, material_refs)
     dfilter = compile_dfilter(filter) if filter is not None else None
-    # Projection: skeleton first, then requested fields, dedup by name so a
-    # requested frame.time_epoch is projected once.
-    projection: dict[str, FieldRef[Any]] = {
-        "frame.number": FieldRef("frame.number", "FT_FRAMENUM", False),
-        "frame.time_epoch": FieldRef("frame.time_epoch", "FT_ABSOLUTE_TIME", False),
-    }
-    for name, ref in requested.items():
-        if name not in _SKELETON_ABBREVS:
-            projection.setdefault(name, ref)
-    projection_refs = tuple(projection.values())
-    argv = [tshark, "-r", os.fspath(pcap)]
-    if dfilter is not None:
-        argv += ["-Y", dfilter]
-    argv += fields_argv(projection_refs)
+    if not stored_keys:
+        _refuse_unowned_workspace(con)
+        return _materialize_fresh(
+            con,
+            pcap=pcap,
+            requested=requested,
+            material_refs=material_refs,
+            dfilter=dfilter,
+            tshark=tshark,
+            tshark_version=tshark_version,
+            runner=runner,
+            batch_size=batch_size,
+            created_at=created_at,
+        )
+    if len(stored_keys) > 1:
+        raise WorkspaceError(
+            f"workspace holds {len(stored_keys)} cache keys, but records exactly one "
+            f"materialization; its catalog was written by something other than "
+            f"remora's materialize pipeline"
+        )
+    return _reuse_or_backfill(
+        con,
+        stored=stored_keys[0],
+        stored_fields=stored_fields,
+        pcap=pcap,
+        requested=requested,
+        material_refs=material_refs,
+        dfilter=dfilter,
+        tshark=tshark,
+        tshark_version=tshark_version,
+        runner=runner,
+        batch_size=batch_size,
+        created_at=created_at,
+    )
+
+
+def _materialize_fresh(
+    con: DuckDBPyConnection,
+    *,
+    pcap: str | os.PathLike[str],
+    requested: Mapping[str, FieldRef[Any]],
+    material_refs: Mapping[str, FieldRef[Any]],
+    dfilter: str | None,
+    tshark: str,
+    tshark_version: str,
+    runner: TsharkRunner,
+    batch_size: int,
+    created_at: datetime | None,
+) -> MaterializeResult:
+    """Stream the whole capture into an empty workspace (the #31 pipeline)."""
+    specs = _sorted_specs(material_refs)
+    projection_refs = _full_projection(specs)
+    argv = _build_argv(tshark, pcap, dfilter, projection_refs)
     # Computed before any mutation: validates storability and fingerprints the
     # capture, so a missing/unstorable input fails with nothing to roll back.
     record = make_cache_key(
@@ -365,9 +604,9 @@ def materialize_into(
         argv=argv,
         created_at=created_at,
     )
-    for spec in material_specs:
+    for spec in specs:
         add_field_column(con, spec.column_name, spec.sql_type)
-    insert_specs = [_FRAME_NUMBER_SPEC, _FRAME_TIME_SPEC, *material_specs]
+    insert_specs = [_FRAME_NUMBER_SPEC, _FRAME_TIME_SPEC, *specs]
     insert_sql = "INSERT INTO main.pkts ({}) VALUES ({})".format(
         ", ".join(_quote_identifier(spec.column_name) for spec in insert_specs),
         ", ".join("?" for _ in insert_specs),
@@ -387,23 +626,254 @@ def materialize_into(
         con.executemany(insert_sql, batch)
         row_count += len(batch)
         batch_count += 1
-    field_records = tuple(
+    field_records = _field_records(specs, record.created_at)
+    register_fields(con, field_records)
+    record_cache_key(con, record)
+    return MaterializeResult(
+        outcome="materialized",
+        row_count=row_count,
+        batch_count=batch_count,
+        cache_key=record,
+        dfilter=dfilter,
+        fields=field_records,
+        added_fields=field_records,
+    )
+
+
+def _field_records(
+    specs: Sequence[ColumnSpec], materialized_at: datetime
+) -> tuple[FieldRecord, ...]:
+    """Registry entries for freshly materialized columns."""
+    return tuple(
         FieldRecord(
             abbrev=spec.abbrev,
             column_name=spec.column_name,
             ftype=spec.ftype,
             multi=spec.multi,
             column_type=spec.sql_type,
-            materialized_at=record.created_at,
+            materialized_at=materialized_at,
         )
-        for spec in material_specs
+        for spec in specs
     )
-    register_fields(con, field_records)
+
+
+def _refuse_redeclared_fields(
+    stored_by_abbrev: Mapping[str, FieldRecord], material_refs: Mapping[str, FieldRef[Any]]
+) -> None:
+    """Refuse a field whose stored column disagrees with how it is now declared.
+
+    A column's SQL type follows from the ftype and the multiplicity, so a
+    request that redeclares either cannot read the stored column as it means
+    to — and rewriting the column would rewrite data this call promises not to
+    touch.
+    """
+    changed: list[tuple[str, object, object]] = []
+    for name, ref in material_refs.items():
+        record = stored_by_abbrev.get(name)
+        if record is None:
+            continue
+        if record.ftype != ref.ftype or record.multi != ref.multi:
+            changed.append(
+                (
+                    f"field {name}",
+                    f"{record.ftype}{'[]' if record.multi else ''}",
+                    f"{ref.ftype}{'[]' if ref.multi else ''}",
+                )
+            )
+    if changed:
+        _refuse_mismatch(changed)
+
+
+def _reuse_or_backfill(
+    con: DuckDBPyConnection,
+    *,
+    stored: CacheKeyRecord,
+    stored_fields: Sequence[FieldRecord],
+    pcap: str | os.PathLike[str],
+    requested: Mapping[str, FieldRef[Any]],
+    material_refs: Mapping[str, FieldRef[Any]],
+    dfilter: str | None,
+    tshark: str,
+    tshark_version: str,
+    runner: TsharkRunner,
+    batch_size: int,
+    created_at: datetime | None,
+) -> MaterializeResult:
+    """Decide hit / backfill / refuse against the workspace's stored key."""
+    stored_by_abbrev = {record.abbrev: record for record in stored_fields}
+    _refuse_redeclared_fields(stored_by_abbrev, material_refs)
+    fingerprint = fingerprint_pcap(pcap)
+    rendered = fingerprint.render()
+    # The union of what is stored and what is asked for, in the canonical
+    # (abbrev-sorted) order — so its argv is the argv the equivalent one-shot
+    # run would have used, which is both what gets compared and what gets
+    # recorded.
+    union_specs = _union_specs(stored_fields, material_refs)
+    union_argv = _build_argv(tshark, pcap, dfilter, _full_projection(union_specs))
+    changed: list[tuple[str, object, object]] = []
+    if rendered != stored.pcap_fingerprint:
+        changed.append(("capture fingerprint", stored.pcap_fingerprint, rendered))
+    if dfilter != stored.dfilter:
+        changed.append(("display filter", stored.dfilter, dfilter))
+    if tshark_version != stored.tshark_version:
+        changed.append(("tshark version", stored.tshark_version, tshark_version))
+    stored_residue = _argv_residue(stored.argv)
+    request_residue = _argv_residue(union_argv)
+    if request_residue != stored_residue:
+        changed.append(("tshark arguments", stored_residue, request_residue))
+    if changed:
+        _refuse_mismatch(changed)
+    covering = find_covering_cache_key(
+        con,
+        pcap_fingerprint=rendered,
+        dfilter=dfilter,
+        tshark_version=tshark_version,
+        fields=tuple(requested),
+    )
+    if covering is not None:
+        return MaterializeResult(
+            outcome="hit",
+            row_count=0,
+            batch_count=0,
+            cache_key=covering,
+            dfilter=dfilter,
+            fields=tuple(stored_fields),
+            added_fields=(),
+        )
+    return _backfill(
+        con,
+        stored=stored,
+        stored_fields=stored_fields,
+        stored_by_abbrev=stored_by_abbrev,
+        pcap=pcap,
+        fingerprint=fingerprint,
+        requested=requested,
+        union_specs=union_specs,
+        union_argv=union_argv,
+        dfilter=dfilter,
+        tshark=tshark,
+        tshark_version=tshark_version,
+        runner=runner,
+        batch_size=batch_size,
+        created_at=created_at,
+    )
+
+
+def _union_specs(
+    stored_fields: Sequence[FieldRecord], material_refs: Mapping[str, FieldRef[Any]]
+) -> list[ColumnSpec]:
+    """Column specs for every field the workspace will hold, abbrev-sorted."""
+    specs = {record.abbrev: _spec_of(record) for record in stored_fields}
+    for spec in _sorted_specs(material_refs):
+        specs.setdefault(spec.abbrev, spec)
+    return [specs[abbrev] for abbrev in sorted(specs)]
+
+
+def _backfill(
+    con: DuckDBPyConnection,
+    *,
+    stored: CacheKeyRecord,
+    stored_fields: Sequence[FieldRecord],
+    stored_by_abbrev: Mapping[str, FieldRecord],
+    pcap: str | os.PathLike[str],
+    fingerprint: PcapFingerprint,
+    requested: Mapping[str, FieldRef[Any]],
+    union_specs: Sequence[ColumnSpec],
+    union_argv: Sequence[str],
+    dfilter: str | None,
+    tshark: str,
+    tshark_version: str,
+    runner: TsharkRunner,
+    batch_size: int,
+    created_at: datetime | None,
+) -> MaterializeResult:
+    """Add the requested fields' columns without rewriting the stored ones."""
+    new_specs = [spec for spec in union_specs if spec.abbrev not in stored_by_abbrev]
+    # The recorded key describes the union, under the argv a single run would
+    # have used: a workspace built incrementally is then indistinguishable
+    # from one built in one go, key included.
+    record = make_cache_key(
+        pcap=pcap,
+        fields=tuple(set(stored.fields) | set(requested)),
+        dfilter=dfilter,
+        tshark_version=tshark_version,
+        argv=union_argv,
+        fingerprint=fingerprint,
+        created_at=created_at,
+    )
+    if not new_specs:
+        # Only row-key-backed abbrevs were added, so there is nothing to scan;
+        # the key is widened all the same, so the next identical request is a
+        # plain hit rather than this decision over again.
+        delete_cache_key(con, stored.key)
+        record_cache_key(con, record)
+        return MaterializeResult(
+            outcome="hit",
+            row_count=0,
+            batch_count=0,
+            cache_key=record,
+            dfilter=dfilter,
+            fields=tuple(stored_fields),
+            added_fields=(),
+        )
+    projection_refs = (
+        _FRAME_NUMBER_REF,
+        *(FieldRef(spec.abbrev, spec.ftype, spec.multi) for spec in new_specs),
+    )
+    argv = _build_argv(tshark, pcap, dfilter, projection_refs)
+    for spec in new_specs:
+        add_field_column(con, spec.column_name, spec.sql_type)
+    update_sql = "UPDATE main.pkts SET {} WHERE frame_number = ?".format(
+        ", ".join(f"{_quote_identifier(spec.column_name)} = ?" for spec in new_specs)
+    )
+    row_count = 0
+    batch_count = 0
+    batch: list[list[Any]] = []
+    with runner(argv) as lines:
+        for row in FieldsReader(lines, projection_refs):
+            values = [spec.encode_raw(row.get_raw(spec.abbrev)) for spec in new_specs]
+            values.append(_FRAME_NUMBER_SPEC.encode_raw(row.get_raw(_FRAME_NUMBER_REF.name)))
+            batch.append(values)
+            if len(batch) >= batch_size:
+                con.executemany(update_sql, batch)
+                row_count += len(batch)
+                batch_count += 1
+                batch = []
+    if batch:
+        con.executemany(update_sql, batch)
+        row_count += len(batch)
+        batch_count += 1
+    _refuse_row_count_drift(con, row_count)
+    new_records = _field_records(new_specs, record.created_at)
+    register_fields(con, new_records)
+    delete_cache_key(con, stored.key)
     record_cache_key(con, record)
     return MaterializeResult(
+        outcome="backfilled",
         row_count=row_count,
         batch_count=batch_count,
         cache_key=record,
         dfilter=dfilter,
-        fields=field_records,
+        fields=tuple(sorted((*stored_fields, *new_records), key=lambda item: item.abbrev)),
+        added_fields=new_records,
     )
+
+
+def _refuse_row_count_drift(con: DuckDBPyConnection, scanned: int) -> None:
+    """Refuse a backfill scan that did not cover every stored row.
+
+    Same capture, same display filter, same tshark: the scan must select
+    exactly the rows the first run did, so every ``UPDATE`` matches. A
+    different count means the capture changed under the fingerprint's
+    documented blind spot (an in-place edit preserving size and mtime), which
+    would otherwise leave rows holding the ``NULL`` ``ADD COLUMN`` back-fills
+    and no sign that anything went wrong.
+    """
+    row = con.execute("SELECT count(*) FROM main.pkts").fetchone()
+    stored_rows = 0 if row is None else int(row[0])
+    if scanned != stored_rows:
+        raise WorkspaceError(
+            f"backfill scan produced {scanned} rows but pkts holds {stored_rows}; the "
+            f"capture no longer dissects to the rows this workspace stores even though "
+            f"its fingerprint is unchanged — materialize into a fresh workspace file"
+        )

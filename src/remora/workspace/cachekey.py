@@ -16,7 +16,10 @@ This module computes; it stores nothing. :func:`make_cache_key` returns the
 :class:`~remora.workspace.schema.CacheKeyRecord` that
 :func:`~remora.workspace.schema.record_cache_key` persists, so the components
 that were hashed and the components that get written cannot drift apart.
-Hit/miss and backfill are issue #32's.
+Hit/miss and backfill belong to :mod:`remora.workspace.materialize` (#32),
+which compares these components one by one rather than the digest — the digest
+covers the requested field set, so two requests differing only in their
+projection have different digests by construction.
 
 Hashing and storing draw their boundaries in different places, deliberately.
 Hashing tolerates any ``str``: :func:`_to_bytes` encodes with

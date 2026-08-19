@@ -22,7 +22,9 @@ Table                Holds
 ``meta.fields``      What has been materialized: abbrev, column, ftype,
                      multiplicity, column type, timestamp.
 ``meta.cache_keys``  Materialization cache keys and their components. This
-                     module stores them; #27 computes them.
+                     module stores them; #27 computes them and #32 decides
+                     reuse from them — one row per workspace, describing the
+                     materialization the file currently is.
 ===================  =======================================================
 
 ``pkts`` deliberately has no ``PRIMARY KEY``: DuckDB backs one with an ART
@@ -54,7 +56,7 @@ import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final
 
 from remora.workspace.errors import SchemaVersionError, WorkspaceError
 from remora.workspace.naming import SKELETON_COLUMNS
@@ -70,8 +72,11 @@ __all__ = [
     "add_field_column",
     "check_compatible",
     "create_schema",
+    "delete_cache_key",
+    "find_covering_cache_key",
     "iter_ddl",
     "read_cache_key",
+    "read_cache_keys",
     "read_fields",
     "read_schema_version",
     "record_cache_key",
@@ -395,6 +400,25 @@ def record_cache_key(con: DuckDBPyConnection, record: CacheKeyRecord) -> None:
     )
 
 
+_CACHE_KEY_COLUMNS: Final[str] = (
+    "key, pcap_path, pcap_fingerprint, fields, dfilter, tshark_version, argv, created_at"
+)
+
+
+def _to_cache_key_record(row: tuple[Any, ...]) -> CacheKeyRecord:
+    """Build a record from one ``_CACHE_KEY_COLUMNS`` row."""
+    return CacheKeyRecord(
+        key=row[0],
+        pcap_path=row[1],
+        pcap_fingerprint=row[2],
+        fields=tuple(row[3]),
+        dfilter=row[4],
+        tshark_version=row[5],
+        argv=tuple(row[6]),
+        created_at=from_db_timestamp(row[7]),
+    )
+
+
 def read_cache_key(con: DuckDBPyConnection, key: str) -> CacheKeyRecord | None:
     """Read one cache key by digest, or ``None`` when it is not stored.
 
@@ -406,25 +430,99 @@ def read_cache_key(con: DuckDBPyConnection, key: str) -> CacheKeyRecord | None:
         The stored record, or ``None`` when the key is not present.
     """
     row = con.execute(
-        """
-        SELECT key, pcap_path, pcap_fingerprint, fields, dfilter, tshark_version,
-               argv, created_at
-        FROM meta.cache_keys WHERE key = ?
-        """,
+        f"SELECT {_CACHE_KEY_COLUMNS} FROM meta.cache_keys WHERE key = ?",
         [key],
     ).fetchone()
-    if row is None:
-        return None
-    return CacheKeyRecord(
-        key=row[0],
-        pcap_path=row[1],
-        pcap_fingerprint=row[2],
-        fields=tuple(row[3]),
-        dfilter=row[4],
-        tshark_version=row[5],
-        argv=tuple(row[6]),
-        created_at=from_db_timestamp(row[7]),
-    )
+    return None if row is None else _to_cache_key_record(row)
+
+
+def read_cache_keys(con: DuckDBPyConnection) -> tuple[CacheKeyRecord, ...]:
+    """Read every stored cache key, oldest first.
+
+    A workspace written by :mod:`remora.workspace.materialize` holds at most
+    one: the key describes *the* materialization the file currently is, and a
+    backfill replaces it with the key of the widened one. Reading them all is
+    what lets that invariant be checked rather than assumed.
+
+    Args:
+        con: An open connection to the workspace.
+
+    Returns:
+        Every stored key, ascending by ``created_at`` then ``key``.
+    """
+    rows = con.execute(
+        f"SELECT {_CACHE_KEY_COLUMNS} FROM meta.cache_keys ORDER BY created_at, key"
+    ).fetchall()
+    return tuple(_to_cache_key_record(row) for row in rows)
+
+
+def find_covering_cache_key(
+    con: DuckDBPyConnection,
+    *,
+    pcap_fingerprint: str,
+    dfilter: str | None,
+    tshark_version: str,
+    fields: Iterable[str],
+) -> CacheKeyRecord | None:
+    """Find a stored key that already covers a request's field set (#32).
+
+    This is the subset rule as a SQL predicate, which is why #27 canonicalizes
+    the stored field set (sorted, deduplicated) and #25 stores it as a native
+    ``VARCHAR[]``: ``list_has_all`` decides coverage inside the database
+    instead of fetching every key and comparing in Python, and the same
+    predicate is available to anyone querying the workspace file directly.
+
+    The components matched here are the ones that must be *identical* for
+    stored rows to answer the request. ``argv`` is deliberately not among
+    them: parts of it are derived from the very things compared separately
+    (the projection, the capture path, the display filter), so the caller
+    compares what is left — see
+    :func:`remora.workspace.materialize.materialize_into`.
+
+    Args:
+        con: An open connection to the workspace.
+        pcap_fingerprint: Rendered fingerprint of the capture being requested.
+        dfilter: Display filter of the request, or ``None``. ``NULL`` matches
+            ``None`` and nothing else (``IS NOT DISTINCT FROM``), so an
+            unfiltered materialization never answers a filtered request.
+        tshark_version: Version of the tshark producing the request.
+        fields: Field abbrevs the request asks for.
+
+    Returns:
+        The newest matching key whose field set contains every requested
+        field, or ``None`` when no stored key covers the request.
+    """
+    row = con.execute(
+        f"""
+        SELECT {_CACHE_KEY_COLUMNS} FROM meta.cache_keys
+        WHERE pcap_fingerprint = ?
+          AND tshark_version = ?
+          AND dfilter IS NOT DISTINCT FROM CAST(? AS VARCHAR)
+          AND list_has_all(fields, CAST(? AS VARCHAR[]))
+        ORDER BY created_at DESC, key DESC
+        LIMIT 1
+        """,
+        [pcap_fingerprint, tshark_version, dfilter, list(fields)],
+    ).fetchone()
+    return None if row is None else _to_cache_key_record(row)
+
+
+def delete_cache_key(con: DuckDBPyConnection, key: str) -> bool:
+    """Remove one stored cache key.
+
+    A backfill widens the materialization, so the key describing the narrower
+    one must go: the workspace records what it *is*, not what it once was.
+
+    Args:
+        con: A read-write connection to the workspace.
+        key: The cache-key digest to remove.
+
+    Returns:
+        Whether a row was removed.
+    """
+    before = con.execute("SELECT count(*) FROM meta.cache_keys WHERE key = ?", [key]).fetchone()
+    con.execute("DELETE FROM meta.cache_keys WHERE key = ?", [key])
+    return before is not None and int(before[0]) > 0
 
 
 def add_field_column(con: DuckDBPyConnection, column: str, sql_type: str = "VARCHAR") -> None:

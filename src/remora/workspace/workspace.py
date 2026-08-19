@@ -519,9 +519,17 @@ class Workspace:
         if the ``-Y`` alone had selected them, and a later query with a
         different residual would silently reuse them.
 
-        A workspace that already holds a materialization is refused —
-        deciding that stored rows already cover a request, and backfilling
-        the columns they lack, is issue #32's job.
+        A workspace that already holds a materialization is *reused* rather
+        than re-run: a request whose fields are a subset of what is stored is
+        a cache hit that spawns no dissecting tshark at all, a request adding
+        fields backfills just those columns, and a request that changes the
+        capture, the filter, the tshark version or its arguments is refused
+        with :class:`~remora.workspace.errors.MaterializationMismatchError`.
+        :func:`~remora.workspace.materialize.materialize_into` documents the
+        comparison rule and why refusing beats rematerializing in place. Note
+        that a hit still runs the ``tshark --version`` probe unless
+        ``tshark_version`` is given — the version is one of the components the
+        decision compares, so it has to be known before the decision is made.
 
         Args:
             pcap: Capture file to read.
@@ -542,17 +550,22 @@ class Workspace:
                 :class:`~remora.reader.process.TsharkProcess`.
 
         Returns:
-            What was written: row and batch counts, the cache key, the
-            pushed filter and the field registry entries.
+            What was decided and written: the outcome, row and batch counts,
+            the cache key the workspace now holds, the pushed filter, every
+            materialized field and the ones this call added.
 
         Raises:
             WorkspaceModeError: In ro mode. Raised before anything is
                 spawned or probed, so a read-only workspace has no
                 subprocess side effects.
-            WorkspaceError: If the workspace already holds a
-                materialization, if a requested field claims a ``pkts``
-                skeleton column name, or if a :meth:`compact` on this file
-                is in progress in this process.
+            WorkspaceError: If the workspace holds packet data no cache key
+                describes, if a requested field claims a ``pkts`` skeleton
+                column name, if a backfill scan does not cover every stored
+                row, or if a :meth:`compact` on this file is in progress in
+                this process.
+            MaterializationMismatchError: If the workspace already
+                materializes a different capture, filter, tshark version or
+                tshark argument vector.
             ColumnNameCollisionError: If two distinct abbrevs map onto one
                 column name.
             UnsupportedExprError: If ``filter`` cannot be pushed to tshark.
