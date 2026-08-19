@@ -1,0 +1,350 @@
+"""Unit tests for the #31 streaming materialize pipeline (fake runner, real DuckDB)."""
+
+from __future__ import annotations
+
+from contextlib import contextmanager
+from ipaddress import IPv4Address, IPv6Address
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, cast
+
+import pytest
+
+if TYPE_CHECKING:
+    from duckdb import DuckDBPyConnection
+
+duckdb = pytest.importorskip("duckdb")
+
+from collections.abc import Iterable, Iterator, Sequence  # noqa: E402
+from datetime import datetime, timezone  # noqa: E402
+
+from remora.compile.dfilter import UnsupportedExprError, compile_dfilter  # noqa: E402
+from remora.fields import FieldRef  # noqa: E402
+from remora.reader.fields_reader import OCC_SEP, UNIT_SEP  # noqa: E402
+from remora.workspace import (  # noqa: E402
+    ColumnNameCollisionError,
+    MaterializeResult,
+    Workspace,
+    WorkspaceError,
+    materialize_into,
+)
+from remora.workspace.schema import read_cache_key, read_fields  # noqa: E402
+
+IP_SRC: FieldRef[IPv4Address] = FieldRef("ip.src", "FT_IPv4", False)
+TCP_PORT: FieldRef[int] = FieldRef("tcp.port", "FT_UINT16", True)
+FRAME_TIME_T: FieldRef[datetime] = FieldRef("frame.time", "FT_ABSOLUTE_TIME", False)
+FRAME_NUMBER: FieldRef[int] = FieldRef("frame.number", "FT_FRAMENUM", False)
+IPV6_ADDR: FieldRef[IPv6Address] = FieldRef("ipv6.addr", "FT_IPv6", True)
+
+
+def line(*cols: tuple[str, ...] | str) -> str:
+    """Join projected columns with the real separators tshark uses."""
+    return UNIT_SEP.join(OCC_SEP.join((c,) if isinstance(c, str) else c) for c in cols)
+
+
+class FakeRunner:
+    """Runner double: records argv, streams canned lines, optionally fails mid-stream."""
+
+    def __init__(self, lines: Sequence[str], fail_after: int | None = None) -> None:
+        self._lines = list(lines)
+        self._fail_after = fail_after
+        self.argv: list[str] | None = None
+        self.pulled = 0
+
+    def __call__(self, argv: Sequence[str]) -> Any:
+        self.argv = list(argv)
+
+        @contextmanager
+        def ctx() -> Iterator[Iterable[str]]:
+            yield self._iter()
+
+        return ctx()
+
+    def _iter(self) -> Iterator[str]:
+        for i, text in enumerate(self._lines):
+            if self._fail_after is not None and i >= self._fail_after:
+                raise RuntimeError("mid-stream failure injected by test")
+            self.pulled += 1
+            yield text
+
+
+class SpyCon:
+    """Connection proxy recording, per ``executemany``, its size and input consumed."""
+
+    def __init__(self, con: DuckDBPyConnection, runner: FakeRunner) -> None:
+        self._con = con
+        self._runner = runner
+        self.batches: list[tuple[int, int]] = []
+
+    def execute(self, *args: Any, **kwargs: Any) -> Any:
+        return self._con.execute(*args, **kwargs)
+
+    def executemany(self, sql: str, parameters: Any) -> Any:
+        self.batches.append((len(parameters), self._runner.pulled))
+        return self._con.executemany(sql, parameters)
+
+
+ROWS = [
+    line("1", "1614597071.5", "10.0.0.1", ("51234", "443")),
+    line("2", "1614597072.25", "10.0.0.2", ("443", "51234")),
+    line("3", "1614597073.0", "", ""),
+]
+
+
+def make_pcap(tmp_path: Path) -> Path:
+    """A real (tiny) file for make_cache_key to fingerprint; tshark never runs."""
+    pcap = tmp_path / "cap.pcap"
+    pcap.write_bytes(b"\x00" * 128)
+    return pcap
+
+
+def materialized(tmp_path: Path, **kwargs: Any) -> tuple[Path, FakeRunner, MaterializeResult]:
+    """Open a fresh rw workspace, materialize ROWS (or kwargs overrides), return handles."""
+    runner = FakeRunner(kwargs.pop("lines", ROWS), fail_after=kwargs.pop("fail_after", None))
+    kwargs.setdefault("fields", [IP_SRC, TCP_PORT])
+    pcap = make_pcap(tmp_path)
+    ws_path = tmp_path / "ws.duckdb"
+    with Workspace(ws_path, mode="rw") as ws, ws.write() as con:
+        result = materialize_into(
+            con,
+            pcap=pcap,
+            tshark="tshark",
+            tshark_version="4.6.7",
+            runner=runner,
+            **kwargs,
+        )
+    return ws_path, runner, result
+
+
+@contextmanager
+def reading(ws_path: Path) -> Iterator[DuckDBPyConnection]:
+    """Reopen a workspace read-only and yield its connection."""
+    with Workspace(ws_path, mode="ro") as ws, ws.read() as con:
+        yield con
+
+
+def pkts_columns(con: DuckDBPyConnection) -> list[str]:
+    """Column names of ``main.pkts``, in ordinal order."""
+    rows = con.execute(
+        "SELECT column_name FROM duckdb_columns() "
+        "WHERE database_name = current_database() AND schema_name = 'main' "
+        "AND table_name = 'pkts' ORDER BY column_index"
+    ).fetchall()
+    return [str(row[0]) for row in rows]
+
+
+def pkts_column_type(con: DuckDBPyConnection, column: str) -> str:
+    """DuckDB type of one ``main.pkts`` column."""
+    row = con.execute(
+        "SELECT data_type FROM duckdb_columns() "
+        "WHERE database_name = current_database() AND schema_name = 'main' "
+        "AND table_name = 'pkts' AND column_name = ?",
+        [column],
+    ).fetchone()
+    assert row is not None
+    return str(row[0])
+
+
+def count(con: DuckDBPyConnection, table: str) -> int:
+    """Row count of a table, by name."""
+    row = con.execute(f"SELECT count(*) FROM {table}").fetchone()
+    assert row is not None
+    return int(row[0])
+
+
+def assert_untouched(ws_path: Path) -> None:
+    """The workspace holds nothing but the empty skeleton."""
+    with reading(ws_path) as con:
+        assert pkts_columns(con) == ["frame_number", "frame_time"]
+        assert count(con, "main.pkts") == 0
+        assert count(con, "meta.fields") == 0
+        assert count(con, "meta.cache_keys") == 0
+
+
+class TestMaterializeInto:
+    """The pipeline's observable behaviour, driven through a fake tshark runner."""
+
+    def test_rows_and_types_land(self, tmp_path: Path) -> None:
+        ws_path, _runner, result = materialized(tmp_path)
+        assert result.row_count == 3
+        with reading(ws_path) as con:
+            assert count(con, "main.pkts") == 3
+            rows = con.execute(
+                "SELECT ip_src, tcp_port FROM main.pkts ORDER BY frame_number"
+            ).fetchall()
+            assert rows == [
+                (int(IPv4Address("10.0.0.1")), [51234, 443]),
+                (int(IPv4Address("10.0.0.2")), [443, 51234]),
+                (None, []),
+            ]
+            assert pkts_column_type(con, "ip_src") == "UINTEGER"
+            assert pkts_column_type(con, "tcp_port") == "USMALLINT[]"
+            times = con.execute("SELECT frame_time FROM main.pkts ORDER BY frame_number").fetchall()
+            assert times[0][0] == datetime(2021, 3, 1, 11, 11, 11, 500000)
+            assert times[2][0] == datetime(2021, 3, 1, 11, 11, 13)
+
+    def test_registry_and_cache_key_written(self, tmp_path: Path) -> None:
+        ws_path, _runner, result = materialized(tmp_path)
+        assert result.row_count == 3
+        assert result.dfilter is None
+        with reading(ws_path) as con:
+            records = read_fields(con)
+            assert [record.abbrev for record in records] == ["ip.src", "tcp.port"]
+            assert [record.column_name for record in records] == ["ip_src", "tcp_port"]
+            assert [record.column_type for record in records] == ["UINTEGER", "USMALLINT[]"]
+            assert [record.multi for record in records] == [False, True]
+            assert all(record.materialized_at == result.cache_key.created_at for record in records)
+            assert records == result.fields
+            stored = read_cache_key(con, result.cache_key.key)
+            assert stored == result.cache_key
+
+    def test_filter_lands_in_argv_as_dash_y(self, tmp_path: Path) -> None:
+        expected = compile_dfilter(TCP_PORT == 443)
+        ws_path, runner, result = materialized(tmp_path, filter=TCP_PORT == 443)
+        assert result.dfilter == expected
+        argv = runner.argv
+        assert argv is not None
+        assert argv[argv.index("-Y") + 1] == expected
+        assert argv[argv.index("-r") + 1] == str(tmp_path / "cap.pcap")
+        projected = [argv[i + 1] for i, arg in enumerate(argv) if arg == "-e"]
+        assert projected == ["frame.number", "frame.time_epoch", "ip.src", "tcp.port"]
+        with reading(ws_path) as con:
+            stored = read_cache_key(con, result.cache_key.key)
+            assert stored is not None
+            assert stored.dfilter == expected
+
+    def test_unpushable_filter_refused_untouched(self, tmp_path: Path) -> None:
+        # SIM300: the field ref must be on the left; that is what builds an Expr.
+        unpushable = FRAME_TIME_T == datetime(2021, 3, 1, tzinfo=timezone.utc)  # noqa: SIM300
+        runner = FakeRunner(ROWS)
+        pcap = make_pcap(tmp_path)
+        ws_path = tmp_path / "ws.duckdb"
+        with (
+            Workspace(ws_path, mode="rw") as ws,
+            pytest.raises(UnsupportedExprError),
+            ws.write() as con,
+        ):
+            materialize_into(
+                con,
+                pcap=pcap,
+                fields=[IP_SRC, TCP_PORT],
+                filter=unpushable,
+                tshark="tshark",
+                tshark_version="4.6.7",
+                runner=runner,
+            )
+        assert runner.argv is None
+        assert_untouched(ws_path)
+
+    def test_midstream_failure_rolls_back_everything(self, tmp_path: Path) -> None:
+        with pytest.raises(RuntimeError, match="mid-stream failure"):
+            materialized(tmp_path, fail_after=2, batch_size=1)
+        assert_untouched(tmp_path / "ws.duckdb")
+
+    def test_scalar_multi_occurrence_rolls_back(self, tmp_path: Path) -> None:
+        bad = [line("1", "1614597071.5", ("10.0.0.1", "10.0.0.2"), "443")]
+        with pytest.raises(ValueError, match="declared scalar but occurred 2 times"):
+            materialized(tmp_path, lines=bad)
+        assert_untouched(tmp_path / "ws.duckdb")
+
+    def test_batching_is_bounded_and_streaming(self, tmp_path: Path) -> None:
+        lines = [line(str(n), f"16145970{70 + n}.0", "10.0.0.1", "443") for n in range(1, 11)]
+        runner = FakeRunner(lines)
+        pcap = make_pcap(tmp_path)
+        ws_path = tmp_path / "ws.duckdb"
+        with Workspace(ws_path, mode="rw") as ws, ws.write() as con:
+            spy = SpyCon(con, runner)
+            result = materialize_into(
+                cast("DuckDBPyConnection", spy),
+                pcap=pcap,
+                fields=[IP_SRC, TCP_PORT],
+                tshark="tshark",
+                tshark_version="4.6.7",
+                runner=runner,
+                batch_size=4,
+            )
+            recorded = list(spy.batches)
+        assert result.row_count == 10
+        assert result.batch_count == 3
+        assert [size for size, _ in recorded] == [4, 4, 2]
+        assert recorded[0][1] == 4
+        with reading(ws_path) as con:
+            assert count(con, "main.pkts") == 10
+
+    def test_ipv6_multi_mixed_magnitude_binds(self, tmp_path: Path) -> None:
+        lines = [line("1", "1614597071.5", ("::", "ff02::1:2"))]
+        ws_path, _runner, result = materialized(tmp_path, lines=lines, fields=[IPV6_ADDR])
+        assert result.row_count == 1
+        with reading(ws_path) as con:
+            row = con.execute("SELECT ipv6_addr FROM main.pkts").fetchone()
+            assert row is not None
+            assert row[0] == [0, int(IPv6Address("ff02::1:2"))]
+            assert pkts_column_type(con, "ipv6_addr") == "UHUGEINT[]"
+
+    def test_skeleton_field_requests_are_satisfied_by_row_key(self, tmp_path: Path) -> None:
+        lines = [line("1", "1614597071.5", "10.0.0.1")]
+        ws_path, runner, result = materialized(tmp_path, lines=lines, fields=[FRAME_NUMBER, IP_SRC])
+        assert result.cache_key.fields == ("frame.number", "ip.src")
+        argv = runner.argv
+        assert argv is not None
+        projected = [argv[i + 1] for i, arg in enumerate(argv) if arg == "-e"]
+        assert projected == ["frame.number", "frame.time_epoch", "ip.src"]
+        with reading(ws_path) as con:
+            assert [record.abbrev for record in read_fields(con)] == ["ip.src"]
+            assert pkts_columns(con) == ["frame_number", "frame_time", "ip_src"]
+            row = con.execute("SELECT frame_number FROM main.pkts").fetchone()
+            assert row is not None
+            assert row[0] == 1
+
+    def test_collision_refused(self, tmp_path: Path) -> None:
+        runner = FakeRunner(ROWS)
+        pcap = make_pcap(tmp_path)
+        ws_path = tmp_path / "ws.duckdb"
+        with (
+            Workspace(ws_path, mode="rw") as ws,
+            pytest.raises(ColumnNameCollisionError, match="tcp_port"),
+            ws.write() as con,
+        ):
+            materialize_into(
+                con,
+                pcap=pcap,
+                fields=[TCP_PORT, FieldRef("tcp_port", "FT_UINT16", False)],
+                tshark="tshark",
+                tshark_version="4.6.7",
+                runner=runner,
+            )
+        assert runner.argv is None
+        assert_untouched(ws_path)
+
+    def test_second_materialization_refused(self, tmp_path: Path) -> None:
+        ws_path, _runner, first = materialized(tmp_path)
+        again = FakeRunner(ROWS)
+        with (
+            Workspace(ws_path, mode="rw") as ws,
+            pytest.raises(WorkspaceError, match="#32"),
+            ws.write() as con,
+        ):
+            materialize_into(
+                con,
+                pcap=tmp_path / "cap.pcap",
+                fields=[IP_SRC],
+                tshark="tshark",
+                tshark_version="4.6.7",
+                runner=again,
+            )
+        with reading(ws_path) as con:
+            assert count(con, "main.pkts") == 3
+            assert read_cache_key(con, first.cache_key.key) == first.cache_key
+
+    def test_empty_capture(self, tmp_path: Path) -> None:
+        ws_path, _runner, result = materialized(tmp_path, lines=[])
+        assert result.row_count == 0
+        assert result.batch_count == 0
+        with reading(ws_path) as con:
+            assert count(con, "main.pkts") == 0
+            assert [record.abbrev for record in read_fields(con)] == ["ip.src", "tcp.port"]
+            assert read_cache_key(con, result.cache_key.key) == result.cache_key
+
+    def test_batch_size_validated(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="batch_size must be at least 1"):
+            materialized(tmp_path, batch_size=0)
+        assert_untouched(tmp_path / "ws.duckdb")

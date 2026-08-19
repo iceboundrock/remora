@@ -4,7 +4,8 @@ The workspace persists projected tshark output in DuckDB native storage. This
 package owns the storage layout (:mod:`remora.workspace.schema`), the
 column-name policy (:mod:`remora.workspace.naming`), the ftype -> column
 type map (:mod:`remora.workspace.types`), the cache-key computation
-(:mod:`remora.workspace.cachekey`), and the analyst-annotation API
+(:mod:`remora.workspace.cachekey`), the streaming materialize pipeline
+(:mod:`remora.workspace.materialize`), and the analyst-annotation API
 (:mod:`remora.workspace.annotations`); connection and lock ownership lives in
 :mod:`remora.workspace.workspace`'s ``Workspace`` class (#28).
 
@@ -40,6 +41,12 @@ from remora.workspace.errors import (
     SchemaVersionError,
     WorkspaceError,
     WorkspaceModeError,
+)
+from remora.workspace.materialize import (
+    MaterializeResult,
+    TsharkRunner,
+    detect_tshark_version,
+    materialize_into,
 )
 from remora.workspace.naming import SKELETON_COLUMNS, column_name, find_collisions
 from remora.workspace.schema import (
@@ -83,8 +90,10 @@ __all__ = [
     "ColumnSpec",
     "ColumnType",
     "FieldRecord",
+    "MaterializeResult",
     "PcapFingerprint",
     "SchemaVersionError",
+    "TsharkRunner",
     "Workspace",
     "WorkspaceError",
     "WorkspaceModeError",
@@ -96,6 +105,7 @@ __all__ = [
     "column_sql_type",
     "create_schema",
     "delete_orphan_annotations",
+    "detect_tshark_version",
     "find_collisions",
     "fingerprint_pcap",
     "from_db_timestamp",
@@ -103,6 +113,7 @@ __all__ = [
     "iter_ddl",
     "list_annotations",
     "make_cache_key",
+    "materialize_into",
     "read_cache_key",
     "read_fields",
     "read_schema_version",
