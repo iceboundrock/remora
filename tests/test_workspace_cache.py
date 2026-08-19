@@ -26,6 +26,7 @@ from remora.fields import FieldRef
 from remora.workspace import (
     CacheKeyRecord,
     ColumnNameCollisionError,
+    FieldRecord,
     MaterializationMismatchError,
     MaterializeResult,
     Workspace,
@@ -33,7 +34,12 @@ from remora.workspace import (
     fingerprint_pcap,
     materialize_into,
 )
-from remora.workspace.schema import read_cache_keys, read_fields, record_cache_key
+from remora.workspace.schema import (
+    read_cache_keys,
+    read_fields,
+    record_cache_key,
+    register_fields,
+)
 from workspace_doubles import (
     FRAME_NUMBER,
     IP_DST,
@@ -318,18 +324,16 @@ class TestBackfill:
         with reading(ws_path) as con:
             assert count(con, "main.pkts WHERE list_contains(tcp_port, 443)") == 10
 
-    def test_scan_row_count_mismatch_refused(self, tmp_path: Path) -> None:
-        # The fingerprint's known blind spot (an in-place edit that changes
-        # neither size nor mtime) would otherwise leave rows silently unmatched
-        # by the UPDATE, so the row counts are compared and the whole
-        # transaction rolled back when they disagree.
-        pcap = make_pcap(tmp_path)
-        ws_path = tmp_path / "ws.duckdb"
-        _first, first = run(ws_path, pcap, [IP_SRC])
-        runner = FakeRunner(BACKFILL_ROWS[:2])
+    def refuse_backfill(self, ws_path: Path, pcap: Path, lines: list[str], match: str) -> None:
+        """Assert a backfill scan is refused and leaves the workspace as it was."""
+        with reading(ws_path) as con:
+            before_columns = pkts_columns(con)
+            before_keys = read_cache_keys(con)
+            before_data = checksum(con, before_columns)
+        runner = FakeRunner(lines)
         with (
             Workspace(ws_path, mode="rw") as ws,
-            pytest.raises(WorkspaceError, match=r"produced 2 rows.*holds 3"),
+            pytest.raises(WorkspaceError, match=match),
             ws.write() as con,
         ):
             materialize_into(
@@ -341,8 +345,79 @@ class TestBackfill:
                 runner=runner,
             )
         with reading(ws_path) as con:
-            assert pkts_columns(con) == ["frame_number", "frame_time", "ip_src"]
-            assert read_cache_keys(con) == (first.cache_key,)
+            assert pkts_columns(con) == before_columns
+            assert read_cache_keys(con) == before_keys
+            assert checksum(con, before_columns) == before_data
+
+    def test_duplicate_and_missing_frame_at_equal_count_refused(self, tmp_path: Path) -> None:
+        # The case a row *count* cannot see: three scanned rows for three
+        # stored rows, but frame 2 twice and frame 3 never — one stored row
+        # updated twice, another left at the NULL its ADD COLUMN back-filled,
+        # and the cache key recorded as if the backfill were complete. The row
+        # keys are therefore compared as sets, not counted.
+        pcap = make_pcap(tmp_path)
+        ws_path = tmp_path / "ws.duckdb"
+        run(ws_path, pcap, [IP_SRC])
+        duplicated = [line("1", "51234"), line("2", "443"), line("2", "8080")]
+        self.refuse_backfill(
+            ws_path, pcap, duplicated, r"produced more than once: \[2\].*never produced: \[3\]"
+        )
+
+    def test_duplicate_frame_alone_refused(self, tmp_path: Path) -> None:
+        # A scan repeating a frame with no row missing: the count is *larger*
+        # than pkts, but what makes it wrong is the repeat, which is what the
+        # message must say.
+        pcap = make_pcap(tmp_path)
+        ws_path = tmp_path / "ws.duckdb"
+        run(ws_path, pcap, [IP_SRC])
+        duplicated = [*BACKFILL_ROWS, line("2", "8080")]
+        self.refuse_backfill(ws_path, pcap, duplicated, r"produced more than once: \[2\]")
+
+    def test_missing_frame_refused(self, tmp_path: Path) -> None:
+        # The fingerprint's known blind spot (an in-place edit that changes
+        # neither size nor mtime) would otherwise leave frame 3 silently
+        # unmatched by the UPDATE.
+        pcap = make_pcap(tmp_path)
+        ws_path = tmp_path / "ws.duckdb"
+        run(ws_path, pcap, [IP_SRC])
+        self.refuse_backfill(ws_path, pcap, BACKFILL_ROWS[:2], r"never produced: \[3\]")
+
+    def test_frame_absent_from_pkts_refused(self, tmp_path: Path) -> None:
+        # A scanned key matching no stored row: its UPDATE silently affects
+        # nothing, so it has to be caught by the anti-join in the other
+        # direction.
+        pcap = make_pcap(tmp_path)
+        ws_path = tmp_path / "ws.duckdb"
+        run(ws_path, pcap, [IP_SRC])
+        shifted = [line("1", "51234"), line("2", "443"), line("9", "8080")]
+        self.refuse_backfill(
+            ws_path, pcap, shifted, r"pkts does not hold: \[9\].*never produced: \[3\]"
+        )
+
+    def test_drift_examples_are_bounded(self, tmp_path: Path) -> None:
+        # A wholly mismatched scan must not build a message naming every row.
+        pcap = make_pcap(tmp_path)
+        ws_path = tmp_path / "ws.duckdb"
+        first_lines = [line(str(n), f"16145970{70 + n}.0", "10.0.0.1") for n in range(1, 21)]
+        run(ws_path, pcap, [IP_SRC], lines=first_lines)
+        shifted = [line(str(n + 100), "443") for n in range(1, 21)]
+        runner = FakeRunner(shifted)
+        with (
+            Workspace(ws_path, mode="rw") as ws,
+            pytest.raises(WorkspaceError) as excinfo,
+            ws.write() as con,
+        ):
+            materialize_into(
+                con,
+                pcap=pcap,
+                fields=[IP_SRC, TCP_PORT],
+                tshark="tshark",
+                tshark_version="4.6.7",
+                runner=runner,
+            )
+        message = str(excinfo.value)
+        assert "pkts does not hold: [101, 102, 103, 104, 105]" in message
+        assert "never produced: [1, 2, 3, 4, 5]" in message
 
     def test_midstream_failure_rolls_the_backfill_back(self, tmp_path: Path) -> None:
         pcap = make_pcap(tmp_path)
@@ -484,6 +559,63 @@ class TestRefusedComponents:
         with Workspace(ws_path, mode="rw") as ws, ws.write() as con:
             con.execute("INSERT INTO main.pkts (frame_number, frame_time) VALUES (1, NULL)")
         refuse(ws_path, pcap, [IP_SRC], WorkspaceError, "no cache key")
+
+    def test_key_claiming_an_unregistered_field_refused_on_the_hit_path(
+        self, tmp_path: Path
+    ) -> None:
+        # The subset rule reads meta.cache_keys alone, so a key claiming a
+        # field meta.fields does not register would answer a request for that
+        # field with a *hit* — reporting stored data for a column the
+        # workspace may not hold. The two catalogs are written together and
+        # are checked to agree before any reuse decision is made.
+        pcap = make_pcap(tmp_path)
+        ws_path = tmp_path / "ws.duckdb"
+        run(ws_path, pcap, [IP_SRC, TCP_PORT], lines=ROWS)
+        with Workspace(ws_path, mode="rw") as ws, ws.write() as con:
+            con.execute("DELETE FROM meta.fields WHERE abbrev = 'tcp.port'")
+        refuse(ws_path, pcap, [TCP_PORT], WorkspaceError, r"absent from meta.fields.*tcp.port")
+
+    def test_key_claiming_an_unregistered_field_refused_on_the_backfill_path(
+        self, tmp_path: Path
+    ) -> None:
+        # The same inconsistency reached through a widening request, where it
+        # would otherwise silently recompute the backfill delta from a
+        # registry that disagrees with the key.
+        pcap = make_pcap(tmp_path)
+        ws_path = tmp_path / "ws.duckdb"
+        run(ws_path, pcap, [IP_SRC, TCP_PORT], lines=ROWS)
+        with Workspace(ws_path, mode="rw") as ws, ws.write() as con:
+            con.execute("DELETE FROM meta.fields WHERE abbrev = 'tcp.port'")
+        refuse(
+            ws_path,
+            pcap,
+            [IP_SRC, TCP_PORT, IP_DST],
+            WorkspaceError,
+            r"absent from meta.fields.*tcp.port",
+        )
+
+    def test_registry_row_the_key_does_not_claim_refused(self, tmp_path: Path) -> None:
+        # The other direction: a registered column no key claims means the key
+        # does not describe this workspace either, so the subset rule cannot be
+        # trusted about it.
+        pcap = make_pcap(tmp_path)
+        ws_path = tmp_path / "ws.duckdb"
+        _runner, first = run(ws_path, pcap, [IP_SRC])
+        with Workspace(ws_path, mode="rw") as ws, ws.write() as con:
+            register_fields(
+                con,
+                [
+                    FieldRecord(
+                        abbrev="ip.dst",
+                        column_name="ip_dst",
+                        ftype="FT_IPv4",
+                        multi=False,
+                        column_type="UINTEGER",
+                        materialized_at=first.cache_key.created_at,
+                    )
+                ],
+            )
+        refuse(ws_path, pcap, [IP_SRC], WorkspaceError, r"not claimed by the cache key.*ip.dst")
 
     def test_several_cache_keys_refused(self, tmp_path: Path) -> None:
         # One workspace records exactly one materialization; more than one key

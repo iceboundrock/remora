@@ -559,10 +559,11 @@ class Workspace:
                 spawned or probed, so a read-only workspace has no
                 subprocess side effects.
             WorkspaceError: If the workspace holds packet data no cache key
-                describes, if a requested field claims a ``pkts`` skeleton
-                column name, if a backfill scan does not cover every stored
-                row, or if a :meth:`compact` on this file is in progress in
-                this process.
+                describes, if its cache key and field registry disagree, if a
+                requested field claims a ``pkts`` skeleton column name, if a
+                backfill scan's row keys are not exactly the stored ones, or
+                if a :meth:`compact` on this file is in progress in this
+                process.
             MaterializationMismatchError: If the workspace already
                 materializes a different capture, filter, tshark version or
                 tshark argument vector.

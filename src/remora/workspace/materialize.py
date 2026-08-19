@@ -102,11 +102,31 @@ are encoded exactly as a fresh run encodes them (``NULL`` for a scalar, ``[]``
 for a multi-value column, never ``NULL`` in a list column), which is what makes
 a backfilled workspace indistinguishable from one materialized in a single run:
 the recorded key is recomputed over the *union* field set with the argv that
-single run would have used, so it is the same digest. Because the capture and
-the filter are identical, the scan must produce exactly the rows ``pkts``
-already holds; a differing row count means the capture changed underneath the
-fingerprint's known blind spot, and the whole transaction is refused and rolled
-back rather than leaving rows the ``UPDATE`` never matched.
+single run would have used, so it is the same digest.
+
+Because the capture and the filter are identical, the scan must produce
+exactly the rows ``pkts`` already holds — one row per stored frame number,
+no more and no fewer. That is checked as a **set** comparison, not a count:
+a scan emitting one frame twice and another not at all has the right count
+while updating one row twice and leaving another at the ``NULL`` its
+``ADD COLUMN`` back-filled. Each scanned row key is therefore staged in
+DuckDB (:func:`~remora.workspace.schema.create_backfill_scan`, a session-
+scoped ``TEMP`` table that never reaches the file) and compared against
+``pkts`` in three directions — duplicates, scanned keys ``pkts`` does not
+hold, and stored rows the scan never produced. Staging in the database rather
+than a Python set is what keeps the check exact *and* the memory bounded on a
+capture of any size. Any discrepancy refuses and the caller's transaction
+rolls the whole backfill back.
+
+Consistency of the catalog itself
+---------------------------------
+The subset rule reads ``meta.cache_keys`` alone, so it is only as trustworthy
+as the key's agreement with ``meta.fields``. The two are written together in
+one transaction and must describe the same workspace: every field a key claims
+has a registry row (bar the row-key-backed abbrevs, which get no column), and
+every registry row is claimed. A workspace where they diverge is refused
+before any reuse decision — never repaired, because which of the two states
+the truth is exactly what cannot be determined from here.
 """
 
 from __future__ import annotations
@@ -134,6 +154,7 @@ from remora.workspace.schema import (
     CacheKeyRecord,
     FieldRecord,
     add_field_column,
+    create_backfill_scan,
     delete_cache_key,
     find_covering_cache_key,
     read_cache_keys,
@@ -509,9 +530,10 @@ def materialize_into(
             under a different ftype or multiplicity.
         WorkspaceError: If the workspace holds packet rows or registered
             fields but no cache key describing them, if it holds more than one
-            cache key, if a requested field claims a ``pkts`` skeleton column
-            name, or if a backfill scan does not produce exactly the rows
-            ``pkts`` already holds.
+            cache key, if its stored key and ``meta.fields`` disagree about
+            which fields are materialized, if a requested field claims a
+            ``pkts`` skeleton column name, or if a backfill scan's row keys are
+            not exactly the ones ``pkts`` already holds.
         UnsupportedExprError: If ``filter`` cannot be pushed to tshark.
         TsharkError: If the run exits non-zero — ``TsharkProcess`` raises
             :class:`remora.reader.process.TsharkError` at end of stream, so it
@@ -657,6 +679,39 @@ def _field_records(
     )
 
 
+def _refuse_inconsistent_catalog(
+    stored: CacheKeyRecord, stored_by_abbrev: Mapping[str, FieldRecord]
+) -> None:
+    """Refuse when the stored key and ``meta.fields`` describe different workspaces.
+
+    The two are written together and must agree: every field a key claims has
+    a registry row (bar the row-key-backed abbrevs, which deliberately get no
+    column), and every registry row is claimed by the key. If they diverge the
+    key is describing columns that are not there — and the subset rule, which
+    reads the key alone, would answer a request for a field the workspace does
+    not hold with a cache *hit*. That is silent wrong data, so it is refused
+    loudly and **not** repaired: which of the two is the truth is exactly what
+    cannot be known from here.
+    """
+    claimed = {field for field in stored.fields if field not in _SKELETON_ABBREVS}
+    registered = set(stored_by_abbrev)
+    unregistered = sorted(claimed - registered)
+    unclaimed = sorted(registered - claimed)
+    if not unregistered and not unclaimed:
+        return
+    parts: list[str] = []
+    if unregistered:
+        parts.append(f"claimed by the cache key but absent from meta.fields: {unregistered}")
+    if unclaimed:
+        parts.append(f"registered in meta.fields but not claimed by the cache key: {unclaimed}")
+    raise WorkspaceError(
+        f"workspace catalog is inconsistent — {'; '.join(parts)}. The cache key and the "
+        f"field registry are written together and must agree; reusing this workspace "
+        f"would serve requests for columns it may not hold. Materialize into a fresh "
+        f"workspace file"
+    )
+
+
 def _refuse_redeclared_fields(
     stored_by_abbrev: Mapping[str, FieldRecord], material_refs: Mapping[str, FieldRef[Any]]
 ) -> None:
@@ -701,6 +756,7 @@ def _reuse_or_backfill(
 ) -> MaterializeResult:
     """Decide hit / backfill / refuse against the workspace's stored key."""
     stored_by_abbrev = {record.abbrev: record for record in stored_fields}
+    _refuse_inconsistent_catalog(stored, stored_by_abbrev)
     _refuse_redeclared_fields(stored_by_abbrev, material_refs)
     fingerprint = fingerprint_pcap(pcap)
     rendered = fingerprint.render()
@@ -826,6 +882,13 @@ def _backfill(
     update_sql = "UPDATE main.pkts SET {} WHERE frame_number = ?".format(
         ", ".join(f"{_quote_identifier(spec.column_name)} = ?" for spec in new_specs)
     )
+    # Every scanned row key is staged alongside the UPDATE so the scan's frame
+    # numbers can be compared against pkts' as *sets* once the scan is done —
+    # a count alone admits a scan that repeats one frame and skips another.
+    # Staging lives in DuckDB rather than a Python set, so a multi-million-row
+    # capture costs bounded memory here (see schema.create_backfill_scan).
+    scan_table = create_backfill_scan(con)
+    stage_sql = f"INSERT INTO {scan_table} (frame_number) VALUES (?)"
     row_count = 0
     batch_count = 0
     batch: list[list[Any]] = []
@@ -835,15 +898,15 @@ def _backfill(
             values.append(_FRAME_NUMBER_SPEC.encode_raw(row.get_raw(_FRAME_NUMBER_REF.name)))
             batch.append(values)
             if len(batch) >= batch_size:
-                con.executemany(update_sql, batch)
+                _apply_backfill_batch(con, update_sql, stage_sql, batch)
                 row_count += len(batch)
                 batch_count += 1
                 batch = []
     if batch:
-        con.executemany(update_sql, batch)
+        _apply_backfill_batch(con, update_sql, stage_sql, batch)
         row_count += len(batch)
         batch_count += 1
-    _refuse_row_count_drift(con, row_count)
+    _refuse_scan_drift(con, scan_table)
     new_records = _field_records(new_specs, record.created_at)
     register_fields(con, new_records)
     delete_cache_key(con, stored.key)
@@ -859,21 +922,79 @@ def _backfill(
     )
 
 
-def _refuse_row_count_drift(con: DuckDBPyConnection, scanned: int) -> None:
-    """Refuse a backfill scan that did not cover every stored row.
+def _apply_backfill_batch(
+    con: DuckDBPyConnection, update_sql: str, stage_sql: str, batch: Sequence[Sequence[Any]]
+) -> None:
+    """Apply one batch's updates and stage its row keys for validation."""
+    con.executemany(update_sql, [list(values) for values in batch])
+    con.executemany(stage_sql, [[values[-1]] for values in batch])
+
+
+#: How many offending frame numbers a drift refusal names. Enough to diagnose,
+#: bounded so a wholly mismatched scan cannot build a megabyte-long message.
+_DRIFT_EXAMPLES: Final[int] = 5
+
+
+def _drift_examples(con: DuckDBPyConnection, sql: str) -> list[int]:
+    """Run one bounded diagnostic query and return its frame numbers."""
+    return [int(row[0]) for row in con.execute(sql).fetchall()]
+
+
+def _refuse_scan_drift(con: DuckDBPyConnection, scan_table: str) -> None:
+    """Refuse a backfill scan whose row keys are not exactly ``pkts``'s.
 
     Same capture, same display filter, same tshark: the scan must select
-    exactly the rows the first run did, so every ``UPDATE`` matches. A
-    different count means the capture changed under the fingerprint's
-    documented blind spot (an in-place edit preserving size and mtime), which
-    would otherwise leave rows holding the ``NULL`` ``ADD COLUMN`` back-fills
-    and no sign that anything went wrong.
+    exactly the rows the first run did, one row per frame number, so every
+    ``UPDATE`` matches exactly one stored row and every stored row is matched.
+    Comparing *counts* alone is not enough — a scan that emits one frame twice
+    and another not at all has the right count while updating one row twice
+    and leaving another at the ``NULL`` its ``ADD COLUMN`` back-filled — so
+    the row keys are compared as sets, in SQL, in three directions:
+    duplicates within the scan, scanned keys absent from ``pkts``, and stored
+    rows the scan never produced.
+
+    Any of the three means the capture no longer dissects to the rows this
+    workspace stores, despite an unchanged fingerprint — #27's documented
+    blind spot is an in-place edit preserving size and mtime. The whole
+    transaction is rolled back by the caller rather than committing a
+    half-filled column that nothing would flag.
+
+    Args:
+        con: The connection the backfill is running on.
+        scan_table: Staging table holding one row per scanned frame number.
+
+    Raises:
+        WorkspaceError: If the scan's row keys are not exactly ``pkts``'s,
+            naming each kind of discrepancy with up to
+            :data:`_DRIFT_EXAMPLES` frame numbers.
     """
-    row = con.execute("SELECT count(*) FROM main.pkts").fetchone()
-    stored_rows = 0 if row is None else int(row[0])
-    if scanned != stored_rows:
-        raise WorkspaceError(
-            f"backfill scan produced {scanned} rows but pkts holds {stored_rows}; the "
-            f"capture no longer dissects to the rows this workspace stores even though "
-            f"its fingerprint is unchanged — materialize into a fresh workspace file"
-        )
+    duplicated = _drift_examples(
+        con,
+        f"SELECT frame_number FROM {scan_table} GROUP BY frame_number "
+        f"HAVING count(*) > 1 ORDER BY frame_number LIMIT {_DRIFT_EXAMPLES}",
+    )
+    unmatched = _drift_examples(
+        con,
+        f"SELECT s.frame_number FROM {scan_table} s ANTI JOIN main.pkts p "
+        f"ON s.frame_number = p.frame_number ORDER BY s.frame_number LIMIT {_DRIFT_EXAMPLES}",
+    )
+    missing = _drift_examples(
+        con,
+        f"SELECT p.frame_number FROM main.pkts p ANTI JOIN {scan_table} s "
+        f"ON s.frame_number = p.frame_number ORDER BY p.frame_number LIMIT {_DRIFT_EXAMPLES}",
+    )
+    if not duplicated and not unmatched and not missing:
+        return
+    parts: list[str] = []
+    if duplicated:
+        parts.append(f"frame numbers the scan produced more than once: {duplicated}")
+    if unmatched:
+        parts.append(f"frame numbers the scan produced that pkts does not hold: {unmatched}")
+    if missing:
+        parts.append(f"pkts rows the scan never produced: {missing}")
+    raise WorkspaceError(
+        f"backfill scan does not match the stored rows — {'; '.join(parts)} (up to "
+        f"{_DRIFT_EXAMPLES} shown each). The capture no longer dissects to the rows "
+        f"this workspace stores even though its fingerprint is unchanged; nothing was "
+        f"written — materialize into a fresh workspace file"
+    )

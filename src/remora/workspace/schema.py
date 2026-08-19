@@ -66,15 +66,18 @@ if TYPE_CHECKING:
     from duckdb import DuckDBPyConnection
 
 __all__ = [
+    "BACKFILL_SCAN_TABLE",
     "SCHEMA_VERSION",
     "CacheKeyRecord",
     "FieldRecord",
     "add_field_column",
     "check_compatible",
+    "create_backfill_scan",
     "create_schema",
     "delete_cache_key",
     "find_covering_cache_key",
     "iter_ddl",
+    "iter_scratch_ddl",
     "read_cache_key",
     "read_cache_keys",
     "read_fields",
@@ -149,13 +152,40 @@ _DDL: Final[tuple[str, ...]] = (
 )
 
 
+BACKFILL_SCAN_TABLE: Final[str] = "temp.main.backfill_scan"
+"""Fully qualified name of the staging table :func:`create_backfill_scan` makes."""
+
+_SCRATCH_DDL: Final[tuple[str, ...]] = (
+    """
+    CREATE TEMP TABLE backfill_scan (
+        frame_number BIGINT
+    )
+    """,
+)
+
+
 def iter_ddl() -> tuple[str, ...]:
-    """Return every DDL statement the workspace schema is made of.
+    """Return every DDL statement the workspace *layout* is made of.
 
     The statements are the single source of the layout: :func:`create_schema`
-    executes exactly these, and no CREATE statement exists elsewhere.
+    executes exactly these, and no CREATE statement building a layout name
+    exists elsewhere. Scratch DDL — objects that never reach the file — is
+    declared separately in :func:`iter_scratch_ddl`.
     """
     return _DDL
+
+
+def iter_scratch_ddl() -> tuple[str, ...]:
+    """Return the DDL for objects this module creates but the layout excludes.
+
+    Exactly one today: the backfill staging table (#32). It is ``TEMP``, so it
+    lives in DuckDB's ``temp`` database rather than the workspace file —
+    invisible to every ``current_database()`` catalog probe here, dropped with
+    the connection, and rolled back with the transaction that made it. It is
+    declared as a constant for the same reason the layout is: so no helper can
+    build DDL inline, which is what the schema tests pin.
+    """
+    return _SCRATCH_DDL
 
 
 def create_schema(con: DuckDBPyConnection) -> None:
@@ -179,6 +209,39 @@ def create_schema(con: DuckDBPyConnection) -> None:
         "INSERT INTO meta.info (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING",
         [_SCHEMA_VERSION_KEY, str(SCHEMA_VERSION)],
     )
+
+
+def create_backfill_scan(con: DuckDBPyConnection) -> str:
+    """Create the session-scoped staging table a backfill validates against (#32).
+
+    A backfill has to prove that its second tshark scan produced exactly the
+    rows ``pkts`` already holds — no duplicate frame number, none missing,
+    none extra — and proving that with a Python set would hold every frame
+    number of a multi-million-row capture in memory. Staging the scanned row
+    keys in DuckDB instead keeps the check set-based and the memory bounded
+    (the database spills to disk; the caller still streams in batches).
+
+    Only ``frame_number`` is staged, never the scanned values: a column per
+    projected field would mean DDL built inline from a caller's field set,
+    which is exactly what this module's constants exist to prevent. The values
+    take the pipeline's ordinary bound-parameter path.
+
+    Any previous staging table on this connection is dropped first, so a
+    caller running two materializations on one connection starts clean.
+
+    Args:
+        con: A read-write connection to an open workspace, inside a
+            transaction the caller owns. Rolling that transaction back removes
+            the table with everything else.
+
+    Returns:
+        The fully qualified table name (:data:`BACKFILL_SCAN_TABLE`), so
+        callers do not restate it.
+    """
+    con.execute(f"DROP TABLE IF EXISTS {BACKFILL_SCAN_TABLE}")
+    for statement in _SCRATCH_DDL:
+        con.execute(statement)
+    return BACKFILL_SCAN_TABLE
 
 
 def read_schema_version(con: DuckDBPyConnection) -> int:
