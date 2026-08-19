@@ -309,7 +309,16 @@ def materialize_into(
             :class:`remora.reader.process.TsharkError` at end of stream, so it
             surfaces from inside this call and the caller's transaction rolls
             back every row already appended.
-        OSError: If ``pcap`` cannot be read for its fingerprint.
+        TsharkNotFoundError: If ``runner`` is the default
+            :class:`~remora.reader.process.TsharkProcess` and the binary is
+            missing. It converts ``FileNotFoundError`` alone, so every other
+            spawn ``OSError`` — a path naming a directory arrives as
+            ``IsADirectoryError`` — propagates as itself. This call never
+            probes the binary, so the broader "not found or not runnable"
+            conversion :func:`detect_tshark_version` performs does not apply
+            here; ``Workspace.materialize`` documents both paths.
+        OSError: If ``pcap`` cannot be read for its fingerprint, or from the
+            ``runner``'s own spawn as described above.
     """
     if batch_size < 1:
         raise ValueError(f"batch_size must be at least 1, not {batch_size}")

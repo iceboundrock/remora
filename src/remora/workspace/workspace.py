@@ -556,11 +556,21 @@ class Workspace:
             ColumnNameCollisionError: If two distinct abbrevs map onto one
                 column name.
             UnsupportedExprError: If ``filter`` cannot be pushed to tshark.
-            TsharkNotFoundError: If the tshark binary is missing. Raised by
-                the version probe when ``tshark_version`` is omitted, and by
-                the spawn otherwise; other spawn failures (a path that names
-                a directory, say) surface as their own
-                :class:`OSError` subclass rather than being converted.
+            TsharkNotFoundError: If the tshark binary cannot be run — but
+                which failures reach you as this error depends on the path
+                taken. When ``tshark_version`` is omitted the version probe
+                runs first, and :func:`detect_tshark_version` converts *any*
+                OS-level failure to execute the binary into this error:
+                missing, not executable, or a path naming a directory. When
+                ``tshark_version`` is supplied the probe is skipped, and only
+                a *missing* binary is converted — that conversion happens at
+                spawn time in
+                :class:`~remora.reader.process.TsharkProcess`, which handles
+                ``FileNotFoundError`` alone, so every other ``OSError`` (a
+                directory path, arriving as ``IsADirectoryError``)
+                propagates as itself. That asymmetry lives in the M1 reader
+                and is stated here rather than papered over; unifying it is
+                tracked as a follow-up.
             TsharkError: If the run exits non-zero
                 (:class:`remora.reader.process.TsharkError`, raised at end of
                 stream). The transaction rolls back, so a partial run leaves

@@ -50,15 +50,20 @@ class FakeRunner:
     ``fail_after`` equal to the line count fails at end of stream instead —
     which is where the real ``TsharkProcess`` raises ``TsharkError`` on a
     nonzero exit — and ``fail_with`` picks the exception raised either way.
+
+    ``lines`` is held as given and iterated lazily, never materialized: that
+    is what lets a test drive a large synthetic capture from a generator and
+    watch how much of it is resident at each flush. One runner therefore
+    consumes its iterable once.
     """
 
     def __init__(
         self,
-        lines: Sequence[str],
+        lines: Iterable[str],
         fail_after: int | None = None,
         fail_with: BaseException | None = None,
     ) -> None:
-        self._lines = list(lines)
+        self._lines = lines
         self._fail_after = fail_after
         self._fail_with = fail_with
         self.argv: list[str] | None = None
@@ -79,12 +84,15 @@ class FakeRunner:
         return RuntimeError("mid-stream failure injected by test")
 
     def _iter(self) -> Iterator[str]:
+        produced = 0
         for i, text in enumerate(self._lines):
             if self._fail_after is not None and i >= self._fail_after:
                 raise self._failure()
             self.pulled += 1
+            produced += 1
             yield text
-        if self._fail_after is not None and self._fail_after >= len(self._lines):
+        # Counted rather than len()'d: the input may be a lazy generator.
+        if self._fail_after is not None and self._fail_after >= produced:
             raise self._failure()
 
 
@@ -208,7 +216,7 @@ class TestMaterializeInto:
             assert times[2][0] == datetime(2021, 3, 1, 11, 11, 13)
 
     def test_registry_and_cache_key_written(self, tmp_path: Path) -> None:
-        ws_path, _runner, result = materialized(tmp_path)
+        ws_path, runner, result = materialized(tmp_path)
         assert result.row_count == 3
         assert result.dfilter is None
         with reading(ws_path) as con:
@@ -224,6 +232,16 @@ class TestMaterializeInto:
             assert records == tuple(sorted(result.fields, key=lambda record: record.abbrev))
             stored = read_cache_key(con, result.cache_key.key)
             assert stored == result.cache_key
+            # The key covers the *full effective* argv, verbatim: the exact
+            # command line that ran, separator options included, since a
+            # different -E would dissect the same bytes into different
+            # columns. Asserted against what the runner was handed rather
+            # than rebuilt here, which would only restate fields_argv.
+            assert stored is not None
+            assert runner.argv is not None
+            assert stored.argv == tuple(runner.argv)
+            for option in (f"separator={UNIT_SEP}", f"aggregator={OCC_SEP}", "occurrence=a"):
+                assert option in stored.argv
 
     def test_filter_lands_in_argv_as_dash_y(self, tmp_path: Path) -> None:
         expected = compile_dfilter(TCP_PORT == 443)
@@ -297,6 +315,44 @@ class TestMaterializeInto:
         assert recorded[0][1] == 4
         with reading(ws_path) as con:
             assert count(con, "main.pkts") == 10
+
+    def test_large_input_bounded_by_batch_size(self, tmp_path: Path) -> None:
+        # #31's acceptance criterion: a synthetic large input is written with
+        # at most one batch resident. The lines come from a generator, so the
+        # only way 10_000 of them can be resident is if the pipeline pulls
+        # them all before flushing — which is exactly what the residency
+        # assertion below rules out. fields=[] keeps the row two skeleton
+        # columns wide, so this measures streaming, not DuckDB throughput.
+        total = 10_000
+        batch_size = 1000
+        runner = FakeRunner(line(str(n), f"1614597071.{n % 10}") for n in range(1, total + 1))
+        pcap = make_pcap(tmp_path)
+        ws_path = tmp_path / "ws.duckdb"
+        with Workspace(ws_path, mode="rw") as ws, ws.write() as con:
+            spy = SpyCon(con, runner)
+            result = materialize_into(
+                cast("DuckDBPyConnection", spy),
+                pcap=pcap,
+                fields=[],
+                tshark="tshark",
+                tshark_version="4.6.7",
+                runner=runner,
+                batch_size=batch_size,
+            )
+            recorded = list(spy.batches)
+        assert result.row_count == total
+        assert result.batch_count == total // batch_size
+        flushed = 0
+        for size, pulled in recorded:
+            assert size <= batch_size
+            # pulled counts lines taken from the generator so far; flushed
+            # counts the rows already written. The difference is how much of
+            # the input is still held in memory at this flush.
+            assert pulled - flushed <= batch_size
+            flushed += size
+        assert flushed == total
+        with reading(ws_path) as con:
+            assert count(con, "main.pkts") == total
 
     def test_ipv6_multi_mixed_magnitude_binds(self, tmp_path: Path) -> None:
         lines = [line("1", "1614597071.5", ("::", "ff02::1:2"))]
