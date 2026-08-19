@@ -69,6 +69,13 @@ depends on whether it holds annotations:
   hands out ids that already exist rather than failing on a constraint. The
   refusal itself modifies nothing.
 
+Once written, the mark row is part of the workspace's integrity, not a cache:
+nothing in this API ever deletes it, and removing annotations leaves it exactly
+where it stood. Deleting it by hand over an *empty* ``main.annotations`` is
+catalog corruption remora cannot detect — that state is indistinguishable from
+a fresh workspace, so the next :func:`add_annotation` re-seeds at 1 and the
+never-reused guarantee is void for every id issued before the deletion.
+
 Capture identity
 ----------------
 ``main.pkts`` has no capture column — ``frame_number`` is its row key, unique
