@@ -388,6 +388,12 @@ class Workspace:
         Raises:
             WorkspaceModeError: In ro mode.
             ValueError: If ``scope`` or ``key`` is invalid.
+            WorkspaceError: If the workspace holds annotation rows but no
+                ``next_annotation_id`` mark — the deleted-id history is
+                unrecoverable, so no seed can honour the never-reused
+                guarantee. The message names the manual escape;
+                :mod:`remora.workspace.annotations` documents the policy.
+                Nothing is modified.
             duckdb.Error: If another thread's :meth:`write` transaction is
                 allocating an id at the same moment — ``TransactionException``
                 when both advance an existing mark, ``ConstraintException``

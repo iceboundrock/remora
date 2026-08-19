@@ -22,7 +22,7 @@ from remora.workspace.annotations import (
     remove_annotation,
     remove_annotations,
 )
-from remora.workspace.errors import WorkspaceModeError
+from remora.workspace.errors import WorkspaceError, WorkspaceModeError
 from remora.workspace.schema import add_field_column, create_schema
 from remora.workspace.types import column_spec
 
@@ -187,6 +187,8 @@ class TestRemoval:
 
 READ_MARK = "SELECT value FROM meta.info WHERE key = 'next_annotation_id'"
 DROP_MARK = "DELETE FROM meta.info WHERE key = 'next_annotation_id'"
+# The manual escape the refusal names, verbatim.
+SET_MARK_100 = "INSERT INTO meta.info (key, value) VALUES ('next_annotation_id', '100')"
 
 
 class TestIdAllocation:
@@ -208,20 +210,57 @@ class TestIdAllocation:
         row = con.execute(READ_MARK).fetchone()
         assert row is not None and int(row[0]) == 2
 
-    def test_a_legacy_workspace_without_the_key_is_seeded(self, tmp_path: Path) -> None:
-        # A workspace written before the mark existed has no row; the next
-        # add seeds it from max(annotation_id) + 1 and carries on.
+    def test_an_empty_table_without_the_mark_seeds_silently(self, tmp_path: Path) -> None:
+        # The only state a real upgraded workspace can be in: every v1 file
+        # released remora wrote predates the annotations API, so its table is
+        # empty. It has to keep working with no ceremony at all.
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw") as ws:
+            with ws.read() as con:
+                assert con.execute(READ_MARK).fetchone() is None
+            assert ws.add_annotation("packet", 1, "a", created_at=UTC_NOW) == 1
+            with ws.read() as con:
+                row = con.execute(READ_MARK).fetchone()
+            assert row is not None and int(row[0]) == 2
+
+    def test_rows_without_the_mark_are_refused(self, tmp_path: Path) -> None:
+        # Rows but no mark: the ids already issued and since deleted are
+        # unrecoverable, so no computed seed can honour "never reused" and
+        # remora refuses rather than guessing.
         path = tmp_path / "ws.duckdb"
         with Workspace(path, mode="rw") as ws:
             ws.add_annotation("packet", 1, "a", created_at=UTC_NOW)
             ws.add_annotation("packet", 2, "b", created_at=UTC_NOW)
             with ws.write() as con:
                 con.execute(DROP_MARK)
-            assert ws.add_annotation("packet", 3, "c", created_at=UTC_NOW) == 3
+            with pytest.raises(WorkspaceError, match="deleted-id history is unrecoverable"):
+                ws.add_annotation("packet", 3, "c", created_at=UTC_NOW)
+            # The refusal modified nothing: no annotation, and no mark.
+            assert [r.annotation_id for r in ws.list_annotations()] == [1, 2]
             with ws.read() as con:
-                row = con.execute(READ_MARK).fetchone()
-            assert row is not None and int(row[0]) == 4
-            assert [r.annotation_id for r in ws.list_annotations()] == [1, 2, 3]
+                assert con.execute(READ_MARK).fetchone() is None
+
+    def test_a_lost_mark_never_reissues_a_deleted_id(self, tmp_path: Path) -> None:
+        # The reviewer's reproduction of the max(annotation_id) + 1 seed:
+        # add 1, add 2, delete 2, lose the mark. A max+1 seed would hand out
+        # 2 again and a stale remove_annotation(2) would delete the unrelated
+        # new finding. The refusal is what stops that.
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw") as ws:
+            assert ws.add_annotation("packet", 1, "a", created_at=UTC_NOW) == 1
+            assert ws.add_annotation("packet", 2, "b", created_at=UTC_NOW) == 2
+            assert ws.remove_annotation(2) is True
+            with ws.write() as con:
+                con.execute(DROP_MARK)
+            with pytest.raises(WorkspaceError, match="no next_annotation_id mark"):
+                ws.add_annotation("packet", 1, "c", created_at=UTC_NOW)
+            # The documented escape: a mark the caller knows is safe.
+            with ws.write() as con:
+                con.execute(SET_MARK_100)
+            assert ws.add_annotation("packet", 1, "c", created_at=UTC_NOW) == 100
+            # The stale handle still matches nothing.
+            assert ws.remove_annotation(2) is False
+            assert [r.annotation_id for r in ws.list_annotations()] == [1, 100]
 
     def test_concurrent_adds_never_share_an_id(self, tmp_path: Path) -> None:
         # Workspace.write() permits concurrent same-process transactions, so

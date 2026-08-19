@@ -42,9 +42,28 @@ mark, ``duckdb.ConstraintException`` on ``meta.info``'s primary key when both
 seed a missing one, and both derive from ``duckdb.Error``. The losing add
 rolls back whole, writing no annotation; whether to retry it is the caller's
 decision. Writers in other processes were already serialized by DuckDB's
-exclusive file lock. A workspace written before this key existed simply has no
-mark: the first :func:`add_annotation` seeds it from
-``max(annotation_id) + 1`` and carries on from there.
+exclusive file lock.
+
+A workspace written before this key existed has no mark, and what happens then
+depends on whether it holds annotations:
+
+* **Empty ``main.annotations``** — the only state a real upgraded file can be
+  in, since every ``SCHEMA_VERSION`` 1 file released remora ever wrote predates
+  this API — is seeded silently: the first :func:`add_annotation` writes the
+  mark and returns id 1, with no ceremony asked of the caller.
+* **Rows present but no mark** is refused with
+  :exc:`~remora.workspace.errors.WorkspaceError`. The past high-water mark
+  cannot be reconstructed from the surviving rows: an id that was issued and
+  later deleted leaves no trace, so no computed seed — ``max(annotation_id) +
+  1`` included — can be proven to exceed every id ever issued, and guessing one
+  would silently break the never-reused guarantee above. Remora therefore does
+  not guess. The escape is explicit and the caller's: set the mark by hand to a
+  value known to exceed every id ever issued, e.g. inside
+  ``Workspace.write()``::
+
+      INSERT INTO meta.info (key, value) VALUES ('next_annotation_id', '101')
+
+  The refusal itself modifies nothing.
 
 Capture identity
 ----------------
@@ -93,6 +112,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Final, Literal
 
+from remora.workspace.errors import WorkspaceError
 from remora.workspace.types import from_db_timestamp, to_db_timestamp
 
 if TYPE_CHECKING:
@@ -211,32 +231,47 @@ def _allocate_annotation_id(con: DuckDBPyConnection) -> int:
     allocator rather than a hint: the read, the advance and the annotation
     row all commit together, so a committed id is never handed out twice and
     two racing transactions conflict on the mark row instead of sharing an id
-    (see the module docstring). A workspace with no mark yet — one written
-    before this key existed — is seeded from ``max(annotation_id) + 1``.
+    (see the module docstring).
+
+    A workspace with no mark yet — one written before this key existed — is
+    seeded only when ``main.annotations`` is empty, which is the only state a
+    real upgraded file can be in. Rows without a mark are refused instead of
+    seeded: the ids already handed out and since deleted are unrecoverable, so
+    no computed seed can be proven to exceed them.
 
     Args:
         con: A read-write connection to the workspace, inside a transaction.
 
     Returns:
         The id to write the next annotation under.
+
+    Raises:
+        WorkspaceError: If ``main.annotations`` holds rows but the mark is
+            missing. Nothing is modified; the message names the manual escape.
     """
     row = con.execute("SELECT value FROM meta.info WHERE key = ?", [_NEXT_ID_KEY]).fetchone()
-    if row is None:
-        seed = con.execute(
-            "SELECT coalesce(max(annotation_id), 0) + 1 FROM main.annotations"
-        ).fetchone()
-        next_id = 1 if seed is None else int(seed[0])
-        con.execute(
-            "INSERT INTO meta.info (key, value) VALUES (?, ?)",
-            [_NEXT_ID_KEY, str(next_id + 1)],
-        )
-    else:
+    if row is not None:
         next_id = int(row[0])
         con.execute(
             "UPDATE meta.info SET value = ? WHERE key = ?",
             [str(next_id + 1), _NEXT_ID_KEY],
         )
-    return next_id
+        return next_id
+    if con.execute("SELECT 1 FROM main.annotations LIMIT 1").fetchone() is not None:
+        raise WorkspaceError(
+            "this workspace holds annotation rows but no next_annotation_id mark in "
+            "meta.info, so the deleted-id history is unrecoverable: an id that was "
+            "issued and later deleted leaves no trace, and no seed computed from the "
+            "surviving rows can be proven to exceed every id ever issued, so remora "
+            "will not guess at the cost of the never-reused guarantee. Set the mark "
+            "by hand to a value you know exceeds every id ever issued, e.g. inside "
+            "Workspace.write(): INSERT INTO meta.info (key, value) VALUES "
+            "('next_annotation_id', '<N>'). Nothing has been modified."
+        )
+    # Empty table: seed silently. The INSERT is what makes a concurrent seed
+    # fail loudly on meta.info's primary key rather than share id 1.
+    con.execute("INSERT INTO meta.info (key, value) VALUES (?, ?)", [_NEXT_ID_KEY, "2"])
+    return 1
 
 
 def add_annotation(
@@ -277,6 +312,11 @@ def add_annotation(
 
     Raises:
         ValueError: If ``scope`` is not a legal scope, or ``key`` is empty.
+        WorkspaceError: If the workspace holds annotation rows but no
+            ``next_annotation_id`` mark. The deleted-id history is
+            unrecoverable there, so no seed can honour the never-reused
+            guarantee; the message names the manual escape (see the module
+            docstring). Nothing is modified.
         duckdb.Error: If ``con`` is inside a transaction and another
             transaction in this process is allocating an id at the same time
             — ``TransactionException`` or ``ConstraintException`` on the mark
