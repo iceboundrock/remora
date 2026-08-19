@@ -44,16 +44,26 @@ from __future__ import annotations
 import os
 import stat
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from types import TracebackType
-from typing import TYPE_CHECKING, Final, Literal
+from typing import TYPE_CHECKING, Any, Final, Literal
 
+from remora.capture import _resolve_tshark
+from remora.expr import Expr
+from remora.fields import FieldRef
+from remora.reader.process import TsharkProcess
 from remora.workspace import annotations as _annotations
 from remora.workspace.annotations import AnnotationRecord, AnnotationScope
 from remora.workspace.errors import WorkspaceError, WorkspaceModeError
+from remora.workspace.materialize import (
+    MaterializeResult,
+    TsharkRunner,
+    detect_tshark_version,
+    materialize_into,
+)
 from remora.workspace.schema import check_compatible, create_schema
 
 if TYPE_CHECKING:
@@ -479,6 +489,96 @@ class Workspace:
         """
         with self.read() as con:
             return _annotations.list_annotations(con, scope=scope, target_id=target_id, key=key)
+
+    def materialize(
+        self,
+        pcap: str | os.PathLike[str],
+        fields: Sequence[FieldRef[Any]] = (),
+        # `filter` shadows the builtin deliberately, mirroring Capture.filter.
+        filter: Expr | None = None,
+        *,
+        tshark: str | None = None,
+        tshark_version: str | None = None,
+        batch_size: int = 1024,
+        runner: TsharkRunner | None = None,
+    ) -> MaterializeResult:
+        """Stream a capture's projected fields into ``pkts`` in one transaction.
+
+        Writes are rw-only, and the whole run — spawning tshark, reading its
+        output, appending every batch — happens inside a single
+        :meth:`write` transaction. So the exclusive write lock is held for
+        as long as tshark takes on this capture, and is released when this
+        method returns *or* raises: a failure rolls back every appended row
+        and every column the projection added, leaving the workspace exactly
+        as it was.
+
+        ``filter`` must be fully pushable to a tshark display filter. There
+        is no Python-side residual here, unlike :class:`remora.Capture`, and
+        that is a correctness requirement: the cache key records the
+        dfilter, so rows produced by a half-pushed filter would be stored as
+        if the ``-Y`` alone had selected them, and a later query with a
+        different residual would silently reuse them.
+
+        A workspace that already holds a materialization is refused —
+        deciding that stored rows already cover a request, and backfilling
+        the columns they lack, is issue #32's job.
+
+        Args:
+            pcap: Capture file to read.
+            fields: Field refs to project. Duplicates of one abbrev
+                collapse; ``frame.number`` / ``frame.time`` need no column
+                of their own, since the ``pkts`` row key already holds them.
+            filter: Display-filter expression pushed to tshark as ``-Y``.
+            tshark: tshark executable to run; defaults to ``$TSHARK`` and
+                then to ``tshark`` on ``PATH``.
+            tshark_version: Version of that binary, recorded as a cache-key
+                component. Probed with :func:`detect_tshark_version` when
+                omitted, which spawns ``tshark --version``; pass it to skip
+                that.
+            batch_size: Rows per ``executemany``, bounding memory on a
+                capture of any size.
+            runner: Builds the tshark run from the argv — the injection
+                seam. Defaults to
+                :class:`~remora.reader.process.TsharkProcess`.
+
+        Returns:
+            What was written: row and batch counts, the cache key, the
+            pushed filter and the field registry entries.
+
+        Raises:
+            WorkspaceModeError: In ro mode. Raised before anything is
+                spawned or probed, so a read-only workspace has no
+                subprocess side effects.
+            WorkspaceError: If the workspace already holds a
+                materialization, if a requested field claims a ``pkts``
+                skeleton column name, or if a :meth:`compact` on this file
+                is in progress in this process.
+            ColumnNameCollisionError: If two distinct abbrevs map onto one
+                column name.
+            UnsupportedExprError: If ``filter`` cannot be pushed to tshark.
+            TsharkNotFoundError: If the tshark binary cannot be run.
+            ValueError: If ``batch_size`` is below 1, if a capture path or
+                argv element cannot be stored, or if a field declared
+                scalar occurs more than once in one packet.
+            OSError: If ``pcap`` cannot be read for its fingerprint.
+        """
+        # write() first, so ro mode is refused before a subprocess is spawned.
+        with self.write() as con:
+            resolved = _resolve_tshark(tshark)
+            version = (
+                tshark_version if tshark_version is not None else detect_tshark_version(resolved)
+            )
+            run: TsharkRunner = TsharkProcess if runner is None else runner
+            return materialize_into(
+                con,
+                pcap=pcap,
+                fields=fields,
+                filter=filter,
+                tshark=resolved,
+                tshark_version=version,
+                runner=run,
+                batch_size=batch_size,
+            )
 
     def compact(self) -> None:
         """Rewrite the workspace file to reclaim space.

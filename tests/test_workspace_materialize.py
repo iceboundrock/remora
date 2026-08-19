@@ -20,11 +20,14 @@ from datetime import datetime, timezone  # noqa: E402
 from remora.compile.dfilter import UnsupportedExprError, compile_dfilter  # noqa: E402
 from remora.fields import FieldRef  # noqa: E402
 from remora.reader.fields_reader import OCC_SEP, UNIT_SEP  # noqa: E402
+from remora.reader.process import TsharkNotFoundError  # noqa: E402
 from remora.workspace import (  # noqa: E402
     ColumnNameCollisionError,
     MaterializeResult,
     Workspace,
     WorkspaceError,
+    WorkspaceModeError,
+    detect_tshark_version,
     materialize_into,
 )
 from remora.workspace.schema import read_cache_key, read_fields  # noqa: E402
@@ -348,3 +351,109 @@ class TestMaterializeInto:
         with pytest.raises(ValueError, match="batch_size must be at least 1"):
             materialized(tmp_path, batch_size=0)
         assert_untouched(tmp_path / "ws.duckdb")
+
+
+class TestDetectTsharkVersion:
+    """Version probing, which the Workspace method falls back to."""
+
+    def test_missing_binary_raises(self, tmp_path: Path) -> None:
+        with pytest.raises(TsharkNotFoundError, match="not found or not runnable"):
+            detect_tshark_version(str(tmp_path / "no-such-tshark"))
+
+    def test_unrunnable_binary_raises_too(self, tmp_path: Path) -> None:
+        # A directory is an OSError other than FileNotFoundError; "pointed at
+        # something that is not a runnable tshark" is one problem either way.
+        with pytest.raises(TsharkNotFoundError, match="not found or not runnable"):
+            detect_tshark_version(str(tmp_path))
+
+
+class TestWorkspaceMethod:
+    """``Workspace.materialize``: one transaction, one lock, promptly released."""
+
+    def test_workspace_method_end_to_end(self, tmp_path: Path) -> None:
+        pcap = make_pcap(tmp_path)
+        runner = FakeRunner(ROWS)
+        with Workspace(tmp_path / "ws.duckdb", mode="rw") as ws:
+            result = ws.materialize(pcap, [IP_SRC, TCP_PORT], tshark_version="4.6.7", runner=runner)
+            assert isinstance(result, MaterializeResult)
+            assert result.row_count == 3
+            assert result.dfilter is None
+            with ws.read() as con:
+                assert count(con, "main.pkts") == 3
+                rows = con.execute(
+                    "SELECT ip_src, tcp_port FROM main.pkts ORDER BY frame_number"
+                ).fetchall()
+                assert rows == [
+                    (int(IPv4Address("10.0.0.1")), [51234, 443]),
+                    (int(IPv4Address("10.0.0.2")), [443, 51234]),
+                    (None, []),
+                ]
+        argv = runner.argv
+        assert argv is not None
+        assert argv[argv.index("-r") + 1] == str(pcap)
+
+    def test_ro_mode_raises_before_spawning(self, tmp_path: Path) -> None:
+        pcap = make_pcap(tmp_path)
+        ws_path = tmp_path / "ws.duckdb"
+        with Workspace(ws_path, mode="rw"):
+            pass
+        runner = FakeRunner(ROWS)
+        # No tshark_version: detection would spawn a subprocess, so reaching
+        # the mode refusal with argv still None pins the ordering too.
+        with Workspace(ws_path) as ws, pytest.raises(WorkspaceModeError, match="read-only"):
+            ws.materialize(pcap, [IP_SRC], runner=runner)
+        assert runner.argv is None
+        assert_untouched(ws_path)
+
+    def test_rw_lock_released_after_materialize(self, tmp_path: Path) -> None:
+        pcap = make_pcap(tmp_path)
+        ws_path = tmp_path / "ws.duckdb"
+        runner = FakeRunner(ROWS)
+        with Workspace(ws_path, mode="rw") as ws:
+            ws.materialize(pcap, [IP_SRC, TCP_PORT], tshark_version="4.6.7", runner=runner)
+            # DuckDB refuses a same-process connection whose configuration
+            # differs from a live one, so a read-only connect succeeding here
+            # proves the write connection was closed.
+            probe = duckdb.connect(str(ws_path), read_only=True)
+            probe.close()
+        with reading(ws_path) as con:
+            assert count(con, "main.pkts") == 3
+
+    def test_failed_materialize_releases_lock_too(self, tmp_path: Path) -> None:
+        pcap = make_pcap(tmp_path)
+        ws_path = tmp_path / "ws.duckdb"
+        runner = FakeRunner(ROWS, fail_after=1)
+        with Workspace(ws_path, mode="rw") as ws:
+            with pytest.raises(RuntimeError, match="mid-stream failure"):
+                ws.materialize(
+                    pcap,
+                    [IP_SRC, TCP_PORT],
+                    tshark_version="4.6.7",
+                    runner=runner,
+                    batch_size=1,
+                )
+            probe = duckdb.connect(str(ws_path), read_only=True)
+            probe.close()
+        assert_untouched(ws_path)
+
+    def test_explicit_version_skips_detection(self, tmp_path: Path) -> None:
+        pcap = make_pcap(tmp_path)
+        ws_path = tmp_path / "ws.duckdb"
+        runner = FakeRunner(ROWS)
+        # A binary that does not exist: detection would raise, so the call
+        # succeeding proves the explicit version short-circuited it.
+        missing = str(tmp_path / "no-such-tshark")
+        with Workspace(ws_path, mode="rw") as ws:
+            result = ws.materialize(
+                pcap,
+                [IP_SRC, TCP_PORT],
+                tshark=missing,
+                tshark_version="9.9.9",
+                runner=runner,
+            )
+        assert result.cache_key.tshark_version == "9.9.9"
+        with reading(ws_path) as con:
+            stored = read_cache_key(con, result.cache_key.key)
+            assert stored is not None
+            assert stored.tshark_version == "9.9.9"
+            assert stored.argv[0] == missing

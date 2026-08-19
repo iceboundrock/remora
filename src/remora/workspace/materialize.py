@@ -125,10 +125,14 @@ _FRAME_NUMBER_SPEC: Final[ColumnSpec] = ColumnSpec(
     column_name="frame_number",
     ftype="FT_FRAMENUM",
     multi=False,
+    # Deliberately not column_sql_type("FT_FRAMENUM") (UINTEGER): frame_number
+    # is part of the pkts skeleton, so this must match what schema.py's layout
+    # declares, not what the ftype map would pick for a projected column.
     sql_type="BIGINT",
 )
 # frame.time renders human-readable; frame.time_epoch is the epoch-seconds
-# form values._parse_absolute_time expects, landing in the frame_time column.
+# form remora.values.convert parses for FT_ABSOLUTE_TIME, landing in the
+# frame_time column.
 _FRAME_TIME_SPEC: Final[ColumnSpec] = ColumnSpec(
     abbrev="frame.time_epoch",
     column_name="frame_time",
@@ -152,7 +156,11 @@ def detect_tshark_version(tshark: str) -> str:
         The ``X.Y.Z`` version string.
 
     Raises:
-        TsharkNotFoundError: If the binary does not exist.
+        TsharkNotFoundError: If the binary cannot be executed at all —
+            missing, a directory, or not executable. All of those are the
+            same problem for a caller (Remora was pointed at something that
+            is not a runnable tshark), so all of them get the message that
+            says how to fix it.
         subprocess.CalledProcessError: If tshark runs but exits non-zero.
         ValueError: If its output carries no recognizable version.
     """
@@ -160,10 +168,11 @@ def detect_tshark_version(tshark: str) -> str:
         output = subprocess.run(
             [tshark, "--version"], check=True, capture_output=True, text=True
         ).stdout
-    except FileNotFoundError as exc:
+    except OSError as exc:
         raise TsharkNotFoundError(
-            f"tshark binary not found: {tshark!r}. Install Wireshark (which "
-            "provides tshark) or point Remora at an explicit tshark executable path."
+            f"tshark binary not found or not runnable: {tshark!r} ({exc}). Install "
+            "Wireshark (which provides tshark) or point Remora at an explicit "
+            "tshark executable path."
         ) from exc
     return parse_tshark_version(output)
 
