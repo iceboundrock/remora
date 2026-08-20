@@ -7,8 +7,9 @@ type map (:mod:`remora.workspace.types`), the cache-key computation
 (:mod:`remora.workspace.cachekey`), the streaming materialize pipeline
 (:mod:`remora.workspace.materialize`), stream sessionization
 (:mod:`remora.workspace.streams`), the analyst-annotation API
-(:mod:`remora.workspace.annotations`), and the cache-side query surface
-(:mod:`remora.workspace.query`); connection and lock ownership lives in
+(:mod:`remora.workspace.annotations`), the cache-side query surface
+(:mod:`remora.workspace.query`), and the Parquet export
+(:mod:`remora.workspace.export`); connection and lock ownership lives in
 :mod:`remora.workspace.workspace`'s ``Workspace`` class (#28).
 
 DuckDB is an optional dependency — install it with ``pip install
@@ -48,6 +49,7 @@ from remora.workspace.errors import (
     WorkspaceError,
     WorkspaceModeError,
 )
+from remora.workspace.export import EXPORTABLE_TABLES, TEXT_EXPORTED_TYPES, export_parquet
 from remora.workspace.materialize import (
     MaterializeOutcome,
     MaterializeResult,
@@ -101,6 +103,7 @@ __all__ = [
     "ANNOTATION_SCOPES",
     "CACHE_KEY_VERSION",
     "COLUMN_TYPES",
+    "EXPORTABLE_TABLES",
     "FINGERPRINT_VERSION",
     "PROBE_BYTES",
     "REQUIRED_FIELDS",
@@ -108,6 +111,7 @@ __all__ = [
     "SKELETON_ABBREVS",
     "SKELETON_COLUMNS",
     "STREAM_PROTOCOLS",
+    "TEXT_EXPORTED_TYPES",
     "AnnotationRecord",
     "AnnotationScope",
     "CacheKeyRecord",
@@ -141,6 +145,7 @@ __all__ = [
     "delete_cache_key",
     "delete_orphan_annotations",
     "detect_tshark_version",
+    "export_parquet",
     "find_collisions",
     "find_covering_cache_key",
     "fingerprint_pcap",

@@ -135,4 +135,5 @@ testpaths = ["tests"]
 addopts = "-q"
 markers = [
     "integration: requires a real tshark binary (deselect with '-m \"not integration\"')",
+    "slow: builds a large table to exercise a streaming path (deselect with '-m \"not slow\"')",
 ]

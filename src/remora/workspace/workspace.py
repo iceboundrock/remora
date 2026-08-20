@@ -58,6 +58,7 @@ from remora.reader.process import TsharkProcess
 from remora.workspace import annotations as _annotations
 from remora.workspace.annotations import AnnotationRecord, AnnotationScope
 from remora.workspace.errors import WorkspaceError, WorkspaceModeError
+from remora.workspace.export import export_parquet as _export_parquet
 from remora.workspace.materialize import (
     MaterializeResult,
     TsharkRunner,
@@ -512,6 +513,79 @@ class Workspace:
             return _annotations.list_annotations(
                 con, scope=scope, target_id=target_id, key=key, protocol=protocol
             )
+
+    def export_parquet(self, table: str, path: str | os.PathLike[str]) -> Path:
+        """Write one workspace table to a Parquet file. Works in ro mode.
+
+        Parquet is remora's *export* format, not its storage format: the live
+        workspace stays DuckDB-native because it is mutable (annotations),
+        and this is how a table leaves for delivery, archival or a downstream
+        Spark/Athena load. The whole export is a single DuckDB ``COPY``
+        statement, so a table of any size streams to disk without a row
+        passing through Python.
+
+        This is a read, so it runs through :meth:`read` and works in ro mode;
+        it never opens a write connection.
+
+        **The export is a derivative, not a replacement for the capture.** It
+        holds the table's columns and nothing else: no packet payloads, no
+        fields that were never projected into a column, and no ``meta``
+        catalog. The pcap remains the source of truth, and a question about a
+        field nobody materialized has to go back to it.
+
+        The exported schema mirrors the stored one with **exactly two
+        deliberate exceptions**, listed here because they are the whole of the
+        divergence for any schema remora wrote: DuckDB's Parquet writer cannot
+        represent these two types exactly, and shipping a silent corruption is
+        worse than shipping a documented type change.
+
+        * ``UHUGEINT`` (``FT_IPv6``) would be written as a ``double`` — 53
+          bits of mantissa for a 128-bit address, so
+          ``7fff:ffff:ffff:ffff:ffff:ffff:ffff:ffff`` and ``8000::`` collide on
+          one value. It is exported as **exact decimal text** instead, the same
+          form :mod:`remora.workspace.types` already binds IPv6 with; read it
+          back with ``IPv6Address(int(text))`` or ``CAST(col AS UHUGEINT)``.
+        * ``INTERVAL`` (``FT_RELATIVE_TIME``) would be written at Parquet's
+          millisecond interval resolution, truncating microseconds. It is
+          exported as text (``'00:00:00.001234'``), which casts straight back
+          with ``CAST(col AS INTERVAL)``.
+
+        Both rewrites apply at list depth too, so ``UHUGEINT[]`` exports as
+        ``list<string>``. Every other column type passes through unchanged —
+        ``UINTEGER`` IPv4 columns stay unsigned ``uint32``, narrow ints keep
+        their width, and a multi-value ``T[]`` column stays ``list<T>``.
+        :mod:`remora.workspace.export` holds the full mapping.
+
+        Args:
+            table: ``"pkts"``, ``"streams"`` or ``"annotations"``. A table name
+                cannot be a bound parameter, so the set is closed and anything
+                else is refused.
+            path: Destination file, replaced if it exists. It must not be this
+                workspace's own file or its ``.wal`` sidecar — under any
+                spelling, symlink or hard link — since that would destroy the
+                workspace. The export is written inside a private ``0700``
+                directory beside the destination and renamed into place, so the
+                replacement is atomic and a failed export leaves the previous
+                file untouched. What that leaves: the destination's directory
+                is trusted, and another process moving the database itself onto
+                this path mid-export is not defended against — neither is
+                something a writer can guard.
+                :mod:`remora.workspace.export` states both boundaries.
+
+        Returns:
+            The path written.
+
+        Raises:
+            ValueError: If ``table`` is not one of the three exportable tables.
+            WorkspaceError: If ``path`` is this workspace's database file or its
+                write-ahead log (refused before anything is written), if the
+                workspace is not open, or — in rw mode — if a :meth:`compact` on
+                this file is in progress in this process.
+            OSError: If the destination's directory cannot hold the temporary
+                directory, or the rename into place fails.
+        """
+        with self.read() as con:
+            return _export_parquet(con, table, path)
 
     def materialize(
         self,
