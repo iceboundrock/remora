@@ -43,12 +43,17 @@ Enforced by `tests/test_semantics_table.py` (`NULL_TRUTH_CASES` — every operat
 above × scalar/multi × polarity, each carrying a packet with no such field) run
 through the display-filter and predicate backends, and by
 `tests/test_sql_duckdb.py`, which runs the same cases against a real DuckDB
-seeded through the real `column_spec` codecs. The Wireshark column is not an
-independent measurement of tshark's booleans: it rests on `predicate.py`'s
-documented job of mirroring Wireshark's semantics exactly, plus
-`tests/test_dfilter_validation.py` feeding every golden display-filter string to
-a real tshark for **syntax acceptance**. `tests/test_semantics_docs.py` checks
-this table against the operator list the suite enumerates.
+seeded through the real `column_spec` codecs. For most of the table the
+Wireshark column is not an independent measurement of tshark's booleans: it
+rests on `predicate.py`'s documented job of mirroring Wireshark's semantics
+exactly, plus `tests/test_dfilter_validation.py` feeding every golden
+display-filter string to a real tshark for **syntax acceptance**. Two rows do
+better than that: the same file's semantics half runs `!(x == v)` and a negated
+`matches` through a real tshark on fixture pcaps containing a frame with no such
+field (an ARP frame) and compares the *row sets* against the predicate backend,
+so the negated cells of the `==` and `matches` rows are confirmed against
+Wireshark itself. `tests/test_semantics_docs.py` checks this table against the
+operator list the suite enumerates.
 
 ### How SQL gets there
 
@@ -85,8 +90,16 @@ applied at **SQL compile time** by `compile_sql`.
 | any non-ASCII character in the **pattern** | ✅ | ✅ | ✅ (but disagrees) | accepted by `Expr`; **`UnsupportedSqlExprError`** in `compile_sql` |
 | backreferences `\1` | ✅ | ✅ | ❌ | **`ValueError`** at `Expr` construction |
 | possessive `a++`, atomic `(?>…)` | ❌ | ✅ | ❌ | **`ValueError`** at `Expr` construction |
-| inline flags, named groups, conditionals, branch reset | ✅/❌ | ✅ | ❌ | **`ValueError`** at `Expr` construction |
-| POSIX classes `[[:alpha:]]`, `\p{…}`, `\x{…}`, `\A`, `\h`, `\v` | ❌/✅ | ✅ | ❌ | **`ValueError`** at `Expr` construction |
+| inline flags, named groups, conditionals, branch reset | ✅/❌ | ✅ | ✅/❌ | **`ValueError`** at `Expr` construction |
+| POSIX classes `[[:alpha:]]`, `\p{…}`, `\x{…}`, `\A`, `\h`, `\v` | ❌/✅ | ✅ | ✅/❌ | **`ValueError`** at `Expr` construction |
+
+The last two rows are grab-bags of dialect-specific constructs that never reach
+any backend — `Expr` refuses them at construction — so their RE2 column is
+informational, and mixed: RE2 in fact runs several of them. Measured on duckdb
+1.5.5, `(?i)abc`, `(?P<x>a)b`, `[[:alpha:]]+`, `\p{Greek}`, `\x{263A}`, `\Aabc`
+and `\v` all compile, while `(?<name>…)`, `(?(1)…)`, `(?|…)` and `\h` are
+refused. In every other row a ❌ in the RE2 column means "RE2 cannot run it",
+which is the criterion `compile_sql` refuses on.
 
 RE2's repeat ceiling is 1000, and it applies both to each individual bounded
 count and to the **product of the factors along a nesting path**: `(?:a{31}){31}`

@@ -12,9 +12,15 @@ import re
 from pathlib import Path
 
 from remora.compile.re2 import LOOKAROUND_PREFIXES, MAX_REPEAT
+
+# Deliberately a private helper: the point of this guard is that the SQL the doc
+# quotes is the SQL the backend emits, so the expected fragment is built by the
+# real builder rather than copied out of it.
+from remora.compile.sql import _guarded_match
 from test_semantics_table import TRUTH_OPERATORS
 
-DOC = Path(__file__).resolve().parent.parent / "docs" / "semantics.md"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DOC = REPO_ROOT / "docs" / "semantics.md"
 
 TRUTH_START = "<!-- truth-table:start -->"
 TRUTH_END = "<!-- truth-table:end -->"
@@ -71,7 +77,10 @@ def test_the_portable_text_guard_section_states_both_halves() -> None:
     text = read_doc()
     assert "U+212A" in text
     assert "U+017F" in text
-    assert "strlen(v) <> length(v) OR contains(v, chr(10))" in text
+    # The value-side test the doc quotes, taken from the compiler that emits it:
+    # "strlen(v) <> length(v) OR contains(v, chr(10))".
+    condition = _guarded_match("v", '"col"').split("CASE WHEN ", 1)[1].split(" THEN ", 1)[0]
+    assert condition in text
 
 
 def test_the_doc_names_where_each_rule_is_enforced() -> None:
@@ -83,6 +92,8 @@ def test_the_doc_names_where_each_rule_is_enforced() -> None:
         "src/remora/compile/re2.py",
     ):
         assert path in text
+        # Substring-only would leave the doc pointing at a renamed file.
+        assert (REPO_ROOT / path).is_file(), path
 
 
 def test_no_python_fence_is_mistagged_as_pyi() -> None:
