@@ -403,9 +403,63 @@ class TestNullHarmonization:
 
 
 class TestMatches:
-    def test_matches_is_refused(self) -> None:
+    """matches compiles to RE2 under a portable-text guard (issue #36)."""
+
+    def test_scalar_matches_is_guarded_regexp_matches(self) -> None:
+        result = compile_sql(HOST.matches("^ex.*com$"))
+        assert result.sql == (
+            'CASE WHEN strlen("http_host") <> length("http_host") '
+            'OR contains("http_host", chr(10)) '
+            'THEN error(\'remora: matches on "http_host" needs pure-ASCII, '
+            "newline-free text — DuckDB RE2 and Wireshark PCRE2 disagree on "
+            "anything else; run this filter on the pcap path (remora.Capture)') "
+            "ELSE regexp_matches(\"http_host\", ?, 'i') END"
+        )
+        assert result.params == ("^ex.*com$",)
+
+    def test_negated_scalar_matches_is_null_safe(self) -> None:
+        # Under a Not the leaf is coalesced like every other NULL-able leaf, so
+        # a row missing the field is selected (the #36 harmonization).
+        result = compile_sql(~HOST.matches("x"))
+        assert result.sql == (
+            'NOT (coalesce(CASE WHEN strlen("http_host") <> length("http_host") '
+            'OR contains("http_host", chr(10)) '
+            'THEN error(\'remora: matches on "http_host" needs pure-ASCII, '
+            "newline-free text — DuckDB RE2 and Wireshark PCRE2 disagree on "
+            "anything else; run this filter on the pcap path (remora.Capture)') "
+            "ELSE regexp_matches(\"http_host\", ?, 'i') END, FALSE))"
+        )
+        assert result.params == ("x",)
+
+    def test_multi_matches_is_an_any_occurrence_filter(self) -> None:
+        result = compile_sql(QNAME.matches("^alpha"))
+        assert result.sql.startswith('len(list_filter("dns_qry_name", x -> CASE WHEN strlen(x)')
+        assert result.sql.endswith("regexp_matches(x, ?, 'i') END)) > 0")
+        assert result.params == ("^alpha",)
+
+    def test_pattern_is_bound_never_interpolated(self) -> None:
+        hostile = "a'\\); DROP TABLE pkts; --"
+        # A hostile pattern is still a valid common-subset regex; it must bind.
+        result = compile_sql(HOST.matches(hostile))
+        assert hostile not in result.sql
+        assert result.params == (hostile,)
+
+    def test_case_insensitive_flag_is_always_i(self) -> None:
+        assert "'i'" in compile_sql(HOST.matches("x")).sql
+
+    @pytest.mark.parametrize("pattern", ["a(?=b)", "(?<!x)y", "a{1001}", "(?:a{32}){32}"])
+    def test_non_portable_pattern_is_refused_naming_re2(self, pattern: str) -> None:
         with pytest.raises(UnsupportedSqlExprError, match="RE2"):
-            compile_sql(HOST.matches("^ex.*com$"))
+            compile_sql(HOST.matches(pattern))
+
+    def test_refusal_names_the_pcap_path(self) -> None:
+        with pytest.raises(UnsupportedSqlExprError, match="Capture"):
+            compile_sql(HOST.matches("a(?=b)"))
+
+    def test_matches_on_a_non_string_field_is_a_user_error(self) -> None:
+        # Mirrors dfilter.py and predicate.py exactly: TypeError, not Unsupported.
+        with pytest.raises(TypeError, match="string fields"):
+            compile_sql(PAYLOAD.matches("ab"))
 
 
 HOSTILE_LITERALS = (

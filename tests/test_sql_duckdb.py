@@ -14,6 +14,7 @@ runs in core-only environments).
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator
 from ipaddress import IPv4Address, IPv6Address
 from typing import TYPE_CHECKING, Any
@@ -40,6 +41,7 @@ V6ADDR = FieldRef[IPv6Address]("ipv6.addr", "FT_IPv6", True)
 DVAL = FieldRef[float]("x.value", "FT_DOUBLE", False)
 DVALS = FieldRef[float]("x.values", "FT_DOUBLE", True)
 PORTS = FieldRef[int]("tcp.port", "FT_UINT16", True)
+QNAME = FieldRef[str]("dns.qry.name", "FT_STRING", True)
 
 NAN = float("nan")
 
@@ -227,6 +229,87 @@ class TestBackfilledNullMultiColumn:
         assert select(con, ~(PORTS == 443)) == {0}
         assert select(con, PORTS.present()) == {1}
         assert select(con, ~PORTS.present()) == {0}
+
+
+class TestMatchesAgainstRealDuckDB:
+    """matches executes as RE2, guarded (issue #36)."""
+
+    def test_case_insensitive_like_the_other_backends(self, con: DuckDBPyConnection) -> None:
+        materialize(
+            con,
+            (HOST,),
+            ({"http.host": ("example.com",)}, {"http.host": ("EXAMPLE.COM",)}, {}),
+        )
+        assert select(con, HOST.matches("^ex.*com$")) == {0, 1}
+
+    def test_absent_scalar_does_not_match(self, con: DuckDBPyConnection) -> None:
+        materialize(con, (HOST,), ({"http.host": ("example.com",)}, {}))
+        assert select(con, HOST.matches("com")) == {0}
+
+    def test_negated_matches_includes_the_absent_row(self, con: DuckDBPyConnection) -> None:
+        # The issue's named regression: `matches` on an absent field used to be
+        # refused outright, and negation over a NULL column used to drop the row.
+        materialize(con, (HOST,), ({"http.host": ("example.com",)}, {}))
+        assert select(con, ~HOST.matches("com")) == {1}
+
+    def test_multi_value_any_occurrence(self, con: DuckDBPyConnection) -> None:
+        materialize(
+            con,
+            (QNAME,),
+            (
+                {"dns.qry.name": ("beta.io", "alpha.example")},
+                {"dns.qry.name": ("beta.io", "gamma.net")},
+                {},
+            ),
+        )
+        assert select(con, QNAME.matches("^alpha")) == {0}
+
+    def test_pattern_binds_and_destroys_nothing(self, con: DuckDBPyConnection) -> None:
+        materialize(con, (HOST,), ({"http.host": ("a');x",)}, {"http.host": ("b",)}))
+        assert select(con, HOST.matches("a'\\);x")) == {0}
+        remaining = con.execute("SELECT count(*) FROM main.pkts").fetchone()
+        assert remaining is not None
+        assert remaining[0] == 2
+
+
+class TestPortableTextGuard:
+    """Text the three engines disagree on fails loudly instead of forking."""
+
+    def test_non_ascii_value_raises(self, con: DuckDBPyConnection) -> None:
+        materialize(con, (HOST,), ({"http.host": ("café",)},))
+        with pytest.raises(duckdb.Error, match="pure-ASCII"):
+            select(con, HOST.matches("^.{5}$"))
+
+    def test_newline_value_raises(self, con: DuckDBPyConnection) -> None:
+        materialize(con, (HOST,), ({"http.host": ("abc\n",)},))
+        with pytest.raises(duckdb.Error, match="pure-ASCII"):
+            select(con, HOST.matches("^abc$"))
+
+    def test_error_message_names_the_column_and_the_pcap_path(
+        self, con: DuckDBPyConnection
+    ) -> None:
+        materialize(con, (HOST,), ({"http.host": ("café",)},))
+        with pytest.raises(duckdb.Error, match="http_host"):
+            select(con, HOST.matches("x"))
+        with pytest.raises(duckdb.Error, match="Capture"):
+            select(con, HOST.matches("x"))
+
+    def test_ascii_rows_beside_a_null_row_are_fine(self, con: DuckDBPyConnection) -> None:
+        materialize(con, (HOST,), ({"http.host": ("abc",)}, {}))
+        assert select(con, HOST.matches("^abc$")) == {0}
+
+    def test_multi_value_guard_fires_per_occurrence(self, con: DuckDBPyConnection) -> None:
+        materialize(con, (QNAME,), ({"dns.qry.name": ("ok", "café")},))
+        with pytest.raises(duckdb.Error, match="pure-ASCII"):
+            select(con, QNAME.matches("ok"))
+
+    def test_the_divergence_the_guard_exists_for_is_real(self, con: DuckDBPyConnection) -> None:
+        # Documented, not fixed: RE2 counts runes. Proven directly, so the guard
+        # is visibly load-bearing rather than defensive noise.
+        row = con.execute("SELECT regexp_matches('café', '^.{5}$')").fetchone()
+        assert row is not None
+        assert row[0] is False
+        assert re.search(b"^.{5}$", "café".encode()) is not None
 
 
 def seed_case(connection: DuckDBPyConnection, case: Case) -> None:

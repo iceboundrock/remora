@@ -331,13 +331,12 @@ CASES: tuple[Case, ...] = (
             (FakePacket({"http.host": ("other.org",)}), False),
             (EMPTY, False),
         ),
-        sql_refusal="RE2",
     ),
     Case(
         # PCRE2 without UTF mode counts bytes, not characters; the predicate
         # backend mirrors that ("café" is 5 UTF-8 bytes). DuckDB's RE2 counts
-        # runes, which is exactly what the portable-text guard refuses rather
-        # than silently answering differently (issue #36).
+        # runes, so the portable-text guard refuses row 0 outright rather than
+        # silently answering differently (issue #36).
         id="matches-byte-oriented",
         expr=HOST.matches("^.{5}$"),
         dfilter='http.host matches "^.{5}$"',
@@ -347,7 +346,7 @@ CASES: tuple[Case, ...] = (
             (FakePacket({"http.host": ("abcd",)}), False),
             (EMPTY, False),
         ),
-        sql_refusal="RE2",
+        sql_guard_rows=frozenset({0}),
     ),
     Case(
         # Any-occurrence under matches, like every operator (PR #73 review).
@@ -359,7 +358,6 @@ CASES: tuple[Case, ...] = (
             (FakePacket({"dns.qry.name": ("beta.io", "gamma.net")}), False),
             (EMPTY, False),
         ),
-        sql_refusal="RE2",
     ),
     Case(
         id="not-matches-absent-is-true",
@@ -369,7 +367,6 @@ CASES: tuple[Case, ...] = (
             (FakePacket({"http.host": ("example.com",)}), False),
             (EMPTY, True),
         ),
-        sql_refusal="RE2",
     ),
 )
 

@@ -49,6 +49,10 @@ Rendering rules
   zone maps can skip row groups on.
 - ``Contains(field, needle)`` -> ``contains("col", ?)`` on ``VARCHAR`` columns
   (multi: ``len(list_filter("col", x -> contains(x, ?))) > 0``).
+- ``Matches(field, pattern)`` -> ``regexp_matches("col", ?, 'i')`` wrapped in the
+  portable-text guard below (multi: the same guarded test inside the
+  any-occurrence ``list_filter``). String fields only; a non-string field is a
+  ``TypeError``, exactly as in the sibling backends.
 - ``Not(x)`` -> ``NOT (x)`` — **always** this form, with each NULL-able leaf
   inside ``x`` wrapped as ``coalesce(<leaf>, FALSE)`` (see the NULL section).
   The DSL's ``!=`` arrives as ``Not(Comparison(EQ, ...))``, so it renders
@@ -141,16 +145,49 @@ The guard is ``NOT isnan(col)``, which is ``NULL`` on a ``NULL`` column value �
 so an absent scalar stays excluded under a guarded comparison, the same as under
 an unguarded one. The NULL behavior above is unchanged by this section.
 
+Regex portability (the portable-text guard, issue #36)
+------------------------------------------------------
+``matches`` runs on three engines. :class:`remora.expr.Matches` already limits a
+pattern to the Python-re/PCRE2 intersection, and :mod:`remora.compile.re2` names
+the further constructs DuckDB's RE2 cannot compile at all (lookarounds, repeats
+above 1000) -- those raise :class:`UnsupportedSqlExprError` here.
+
+What no construct check can catch is that RE2 matches UTF-8 *runes* and folds
+case by Unicode, while Wireshark's PCRE2 (``PCRE2_CASELESS``, no UTF/UCP) and
+the predicate backend (Python ``re`` over UTF-8 bytes) match bytes and fold
+ASCII -- and that RE2's ``$`` matches end-of-text only, where the other two also
+match before a single trailing newline. ``'café' matches '^.{5}$'`` is true on
+two engines and false on the third; the difference is in the *value*, not the
+pattern.
+
+Every such difference needs a non-ASCII byte or a newline in the value, so the
+compiled predicate refuses exactly those: ``strlen(v) <> length(v)`` (byte count
+differs from character count, i.e. not pure ASCII) or a ``chr(10)`` anywhere
+raises DuckDB ``error()`` naming the column and pointing at the pcap path. On
+the text that survives the guard the three engines are provably identical -- an
+ASCII byte never occurs inside a multi-byte UTF-8 sequence, so ``.``, ``[^...]``
+and counted quantifiers consume one byte = one rune; ASCII text cannot contain
+U+212A or U+017F, so Unicode folding is unreachable; and no newline means ``$``
+cannot differ.
+
+Two residuals, stated rather than implied: the guard is a property of the
+*column's data*, not of the answer, so a query can fail on a row another conjunct
+would have excluded; and whether that row is examined at all can depend on
+zone-map skipping from other pushed-down filters. Making it deterministic would
+need a precondition scan in :class:`remora.workspace.Query`, which is future work.
+
 Error policy
 ------------
 :class:`UnsupportedSqlExprError` means "this backend legitimately cannot render
-the expression" — an unknown ``Expr`` node, ``Matches`` (DuckDB's regex engine is
-RE2, whose dialect and case folding differ from Wireshark's PCRE2 and the
-predicate backend's Python ``re``), and ``Contains`` on a ``BLOB`` column
+the expression" — an unknown ``Expr`` node, a ``Matches`` *pattern* DuckDB's RE2
+engine cannot compile (what :func:`remora.compile.re2.unportable_reason` names:
+lookarounds and repeats above 1000 — ``Matches`` itself is no longer refused
+categorically), and ``Contains`` on a ``BLOB`` column
 (DuckDB's ``contains`` takes ``VARCHAR`` or ``LIST``, not ``BLOB``). User errors
-— a malformed literal such as ``IP.src == "not-an-ip"``, or a ``contains`` needle
-whose type does not match the field — surface as the ``ValueError``/``TypeError``
-the sibling backends raise and are deliberately not converted.
+— a malformed literal such as ``IP.src == "not-an-ip"``, a ``contains`` needle
+whose type does not match the field, or ``matches`` on a non-string field —
+surface as the ``ValueError``/``TypeError`` the sibling backends raise and are
+deliberately not converted.
 """
 
 from __future__ import annotations
@@ -160,6 +197,7 @@ from dataclasses import dataclass
 from typing import Any, Final
 
 from remora import values
+from remora.compile.re2 import unportable_reason
 from remora.expr import (
     And,
     CompareOp,
@@ -288,11 +326,7 @@ def _render(expr: Expr, params: list[Any], *, negated: bool = False) -> str:
     if isinstance(expr, Contains):
         return _render_contains(expr, params, negated=negated)
     if isinstance(expr, Matches):
-        raise UnsupportedSqlExprError(
-            "matches is not compiled to SQL: DuckDB's regexp engine is RE2, whose "
-            "dialect and case folding differ from Wireshark's PCRE2 and the "
-            "predicate backend's Python re"
-        )
+        return _render_matches(expr, params, negated=negated)
     if isinstance(expr, Not):
         return f"NOT ({_render(expr.operand, params, negated=True)})"
     if isinstance(expr, And):
@@ -401,6 +435,80 @@ def _render_contains(expr: Contains, params: list[Any], *, negated: bool) -> str
     if field.multi:
         return _null_safe(_any_occurrence(column, f"contains({_LAMBDA_VAR}, ?)"), negated)
     return _null_safe(f"contains({column}, ?)", negated)
+
+
+def _render_matches(expr: Matches, params: list[Any], *, negated: bool) -> str:
+    """Render ``field matches pattern`` as guarded RE2, on VARCHAR columns only.
+
+    Args:
+        expr: The ``Matches`` node to render.
+        params: Accumulator the pattern is appended to, in placeholder order.
+        negated: True when an enclosing ``Not`` will invert this leaf.
+
+    Returns:
+        The guarded regex test, wrapped in ``coalesce(..., FALSE)`` when negated.
+
+    Raises:
+        UnsupportedSqlExprError: If DuckDB's RE2 engine cannot compile the
+            pattern (see :func:`remora.compile.re2.unportable_reason`).
+        TypeError: If the field is not a string field.
+    """
+    field = expr.field
+    if values.get_info(field.ftype).py_type is not str:
+        raise TypeError(f"matches is only supported on string fields, not {field.ftype}")
+    reason = unportable_reason(expr.pattern)
+    if reason is not None:
+        raise UnsupportedSqlExprError(
+            f"matches pattern {expr.pattern!r} is not compiled to SQL: {reason}. "
+            "Wireshark's PCRE2 and the Python predicate backend both accept it, "
+            "so run this filter on the pcap path (remora.Capture) instead."
+        )
+    column = _column(field)
+    params.append(expr.pattern)
+    if field.multi:
+        return _null_safe(_any_occurrence(column, _guarded_match(_LAMBDA_VAR, column)), negated)
+    return _null_safe(_guarded_match(column, column), negated)
+
+
+def _guarded_match(subject: str, column: str) -> str:
+    """A regex test over ``subject``, refusing text the three engines disagree on.
+
+    Args:
+        subject: The value being matched — the column for a scalar field, and
+            the ``list_filter`` lambda variable for a multi-value one.
+        column: The quoted column name, used only to name the column in the
+            error message.
+
+    Returns:
+        A ``CASE`` expression raising DuckDB ``error()`` on unportable text and
+        running ``regexp_matches`` otherwise. See the module docstring's
+        portable-text section.
+    """
+    message = _sql_text_literal(
+        f"remora: matches on {column} needs pure-ASCII, newline-free text — "
+        "DuckDB RE2 and Wireshark PCRE2 disagree on anything else; run this "
+        "filter on the pcap path (remora.Capture)"
+    )
+    return (
+        f"CASE WHEN strlen({subject}) <> length({subject}) "
+        f"OR contains({subject}, chr(10)) "
+        f"THEN error({message}) "
+        f"ELSE regexp_matches({subject}, ?, 'i') END"
+    )
+
+
+def _sql_text_literal(text: str) -> str:
+    """Single-quote compiler-chosen text for SQL. Never used for user literals.
+
+    Args:
+        text: Text the compiler itself chose — an error message, never anything
+            a caller supplied.
+
+    Returns:
+        The text as a single-quoted SQL literal, with embedded quotes doubled.
+    """
+    escaped = text.replace("'", "''")
+    return f"'{escaped}'"
 
 
 def _quote(name: str) -> str:
