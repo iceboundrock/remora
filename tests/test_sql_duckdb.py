@@ -285,6 +285,28 @@ class TestPortableTextGuard:
         with pytest.raises(duckdb.Error, match="pure-ASCII"):
             select(con, HOST.matches("^abc$"))
 
+    def test_vertical_tab_value_raises(self, con: DuckDBPyConnection) -> None:
+        # The fourth divergence mechanism, and the only residual the reviewer's
+        # exhaustive sweep found: RE2's \s is [\t\n\f\r ], while Python re and
+        # PCRE2 also count U+000B. VT is pure ASCII and is not a newline, so it
+        # passes the other two disjuncts — without chr(11) this query silently
+        # returns the wrong row set instead of refusing.
+        materialize(con, (HOST,), ({"http.host": ("a\x0bb",)},))
+        with pytest.raises(duckdb.Error, match="pure-ASCII"):
+            select(con, HOST.matches(r"a\sb"))
+
+    def test_the_vertical_tab_divergence_the_guard_exists_for_is_real(
+        self, con: DuckDBPyConnection
+    ) -> None:
+        # Proven directly against the two engines this file can run, so the
+        # chr(11) disjunct is visibly load-bearing rather than defensive noise.
+        # Wireshark's PCRE2 sides with Python (reproduced on tshark 4.6.7 with
+        # -Y 'http.host matches "a\\sb"'), which is why RE2 is the odd one out.
+        row = con.execute("SELECT regexp_matches(?, ?, 'i')", ["a\x0bb", r"a\sb"]).fetchone()
+        assert row is not None
+        assert row[0] is False
+        assert re.search(rb"a\sb", b"a\x0bb") is not None
+
     def test_error_message_names_the_column_and_the_pcap_path(
         self, con: DuckDBPyConnection
     ) -> None:

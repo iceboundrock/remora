@@ -368,6 +368,22 @@ CASES: tuple[Case, ...] = (
             (EMPTY, True),
         ),
     ),
+    Case(
+        # Double negation is the ONE shape where the SQL backend's leaf-level
+        # coalesce and a subtree-level one part company on row sets rather than
+        # only on emitted text: over an absent (NULL) scalar, coalescing at each
+        # Not gives NOT(coalesce(NOT(NULL), FALSE)) = TRUE, where Python's
+        # `not not False` — and Wireshark's `!(!(...))` — is False. Without this
+        # case that claim rested entirely on tests/test_sql.py's golden strings.
+        id="not-not-eq-scalar",
+        expr=~~(TTL == 64),
+        dfilter="!(!(ip.ttl == 64))",
+        rows=(
+            (FakePacket({"ip.ttl": ("64",)}), True),
+            (FakePacket({"ip.ttl": ("65",)}), False),
+            (EMPTY, False),
+        ),
+    ),
 )
 
 

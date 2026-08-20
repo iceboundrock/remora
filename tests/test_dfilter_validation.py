@@ -36,6 +36,7 @@ from remora import DNS, IP, TCP, UDP
 from remora.compile.dfilter import compile_dfilter
 from remora.compile.predicate import compile_predicate
 from remora.expr import Expr
+from remora.proto.http import HTTP
 from remora.reader.ek_reader import EkReader
 from test_semantics_table import CASES
 
@@ -160,10 +161,10 @@ class TestSemanticsTableGoldensValidate:
     def test_every_semantics_golden_is_accepted_by_tshark(self) -> None:
         dfilters = [case.dfilter for case in CASES if case.dfilter is not None]
         # Exact count: a case losing its golden string must fail loudly here.
-        # Update deliberately when the table grows. 25 base cases plus the 36
+        # Update deliberately when the table grows. 26 base cases plus the 36
         # absent-field truth-table cases (nine operators x scalar/multi x
         # positive/negated), every one of which carries a golden.
-        assert len(dfilters) == 61
+        assert len(dfilters) == 62
         _assert_all_valid(
             [
                 (f"semantics[{case.id}]: {case.expr!r}", case.dfilter)
@@ -297,6 +298,12 @@ class TestMatchesSemanticsParity:
             ),
             pytest.param(DNS_MULTI, DNS.qry_name.matches(r"\bexample\b"), id="word-boundary"),
             pytest.param(TCP_MIXED, ~DNS.qry_name.matches("alpha"), id="negation-absent-field"),
+            # The scalar half of the same cell: DNS.qry_name is multi, so
+            # without this the negated-absent-SCALAR matches cell rested on
+            # predicate.py's reading of Wireshark rather than on Wireshark.
+            # http.host occurs in no fixture frame, so both sides must select
+            # every frame — the absent-field negation contract exactly.
+            pytest.param(TCP_MIXED, ~HTTP.host.matches("com"), id="negation-absent-scalar"),
         ],
     )
     def test_matches_row_set_matches_predicate_backend(self, pcap: Path, expr: Expr) -> None:

@@ -409,10 +409,11 @@ class TestMatches:
         result = compile_sql(HOST.matches("^ex.*com$"))
         assert result.sql == (
             'CASE WHEN strlen("http_host") <> length("http_host") '
-            'OR contains("http_host", chr(10)) '
-            'THEN error(\'remora: matches on "http_host" needs pure-ASCII, '
-            "newline-free text — DuckDB RE2 and Wireshark PCRE2 disagree on "
-            "anything else; run this filter on the pcap path (remora.Capture)') "
+            'OR contains("http_host", chr(10)) OR contains("http_host", chr(11)) '
+            'THEN error(\'remora: matches on "http_host" needs pure-ASCII text '
+            "free of newline (chr(10)) and vertical tab (chr(11)) — DuckDB RE2 "
+            "and Wireshark PCRE2 disagree on anything else; run this filter on "
+            "the pcap path (remora.Capture)') "
             "ELSE regexp_matches(\"http_host\", ?, 'i') END"
         )
         assert result.params == ("^ex.*com$",)
@@ -423,10 +424,11 @@ class TestMatches:
         result = compile_sql(~HOST.matches("x"))
         assert result.sql == (
             'NOT (coalesce(CASE WHEN strlen("http_host") <> length("http_host") '
-            'OR contains("http_host", chr(10)) '
-            'THEN error(\'remora: matches on "http_host" needs pure-ASCII, '
-            "newline-free text — DuckDB RE2 and Wireshark PCRE2 disagree on "
-            "anything else; run this filter on the pcap path (remora.Capture)') "
+            'OR contains("http_host", chr(10)) OR contains("http_host", chr(11)) '
+            'THEN error(\'remora: matches on "http_host" needs pure-ASCII text '
+            "free of newline (chr(10)) and vertical tab (chr(11)) — DuckDB RE2 "
+            "and Wireshark PCRE2 disagree on anything else; run this filter on "
+            "the pcap path (remora.Capture)') "
             "ELSE regexp_matches(\"http_host\", ?, 'i') END, FALSE))"
         )
         assert result.params == ("x",)

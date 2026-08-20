@@ -51,9 +51,11 @@ display-filter string to a real tshark for **syntax acceptance**. Two rows do
 better than that: the same file's semantics half runs `!(x == v)` and a negated
 `matches` through a real tshark on fixture pcaps containing a frame with no such
 field (an ARP frame) and compares the *row sets* against the predicate backend,
-so the negated cells of the `==` and `matches` rows are confirmed against
-Wireshark itself. `tests/test_semantics_docs.py` checks this table against the
-operator list the suite enumerates.
+so the negated cells of the `==` and `matches` rows — scalar and multi-value
+alike, since a multi-value parity case alone would leave the scalar cell
+unmeasured — are confirmed against Wireshark itself.
+`tests/test_semantics_docs.py` checks this table against the operator list the
+suite enumerates.
 
 ### How SQL gets there
 
@@ -84,7 +86,7 @@ applied at **SQL compile time** by `compile_sql`.
 | literals, `.`, `^`, `$`, `\|`, groups, `(?:…)` | ✅ | ✅ | ✅ | accepted |
 | `*` `+` `?` `{m}` `{m,}` `{m,n}`, lazy `?` | ✅ | ✅ | ✅ | accepted |
 | classes `[a-z]`, `[^0-9]` | ✅ | ✅ | ✅ | accepted |
-| `\d \D \w \W \s \S \b \B \n \r \t \f \xHH` | ✅ | ✅ | ✅ | accepted |
+| `\d \D \w \W \s \S \b \B \n \r \t \f \xHH` | ✅ | ✅ | ✅ (but `\s \S` differ) | accepted; see the guard below |
 | lookarounds `(?=` `(?!` `(?<=` `(?<!` | ✅ | ✅ | ❌ | accepted by `Expr`; **`UnsupportedSqlExprError`** in `compile_sql` |
 | brace repeat above 1000 (see the rule below) | ✅ | ✅ (≤65535) | ❌ | accepted by `Expr` up to 65535; **`UnsupportedSqlExprError`** in `compile_sql` |
 | any non-ASCII character in the **pattern** | ✅ | ✅ | ✅ (but disagrees) | accepted by `Expr`; **`UnsupportedSqlExprError`** in `compile_sql` |
@@ -100,6 +102,14 @@ informational, and mixed: RE2 in fact runs several of them. Measured on duckdb
 and `\v` all compile, while `(?<name>…)`, `(?(1)…)`, `(?|…)` and `\h` are
 refused. In every other row a ❌ in the RE2 column means "RE2 cannot run it",
 which is the criterion `compile_sql` refuses on.
+
+The Perl-class row carries a caveat: all three engines *run* `\s` and `\S`, but
+they do not agree on what the class contains. RE2's `\s` is exactly
+`[\t\n\f\r ]`, while Python `re` (over bytes) and PCRE2 also count U+000B
+VERTICAL TAB — so `a\x0bb matches "a\sb"` is true on the pcap path and false on
+RE2. That difference lives in the *value*, not the pattern, so it is not
+refusable at compile time: the portable-text guard below closes it instead, by
+refusing any value containing a vertical tab.
 
 RE2's repeat ceiling is 1000, and it applies both to each individual bounded
 count and to the **product of the factors along a nesting path**: `(?:a{31}){31}`
@@ -128,14 +138,24 @@ No construct check can catch the differences that live in the *data*:
 | `é` | `^[^x]$` | False (2 bytes) | True (1 rune) |
 | `K` (U+212A) | `k`, case-insensitive | False | True (Unicode folding) |
 | `abc\n` | `^abc$` | True | False (`$` is end-of-text) |
+| `a\x0bb` | `a\sb` | True (VT is in `\s`) | False (RE2's `\s` is `[\t\n\f\r ]`) |
 
-Every one of those needs a non-ASCII byte or a newline **in the value**, so the
-SQL backend refuses exactly those values: a compiled `matches` tests
-`strlen(v) <> length(v) OR contains(v, chr(10))` and raises DuckDB `error()`
-naming the column and pointing at the pcap path.
+Four mechanisms, then: rune-vs-byte counting, Unicode case folding, `$`
+anchoring — and the last row, which is a mismatch in the *definitions* of the
+Perl classes rather than in how the engines run them. Every one of them needs a
+non-ASCII byte, a newline or a vertical tab **in the value**, so the SQL backend
+refuses values carrying one: a compiled `matches` tests
+`strlen(v) <> length(v) OR contains(v, chr(10)) OR contains(v, chr(11))` and
+raises DuckDB `error()` naming the column and pointing at the pcap path.
 
-That is only half of a sound guard, because RE2's case folding is a *relation*
-and runs in both directions. A non-ASCII **pattern** character can fold onto an
+The guard refuses a *superset*, deliberately. It tests the value alone, so
+`a\x0bb` is refused even under a pattern such as `x` that could not observe the
+difference. A pattern-aware test would refuse less and would have to be right
+about every construct; a cheap value-shaped test that never lets a divergence
+through is the trade this backend takes.
+
+The value side is only half of a sound guard, because RE2's case folding is a
+*relation* and runs in both directions. A non-ASCII **pattern** character can fold onto an
 ASCII value: U+212A KELVIN SIGN folds onto `k` and U+017F LATIN SMALL LETTER
 LONG S onto `s`, so a pattern that is the single character U+212A matches the
 ASCII value `kelvin` on RE2 and on neither of the other two engines — and that
@@ -147,8 +167,9 @@ With **both** halves in place the three engines are provably identical on what
 survives: pattern and value are ASCII, an ASCII byte never occurs inside a
 multi-byte UTF-8 sequence, so `.`, `[^…]` and counted quantifiers consume one
 byte = one rune; no character on either side has a simple-fold orbit that leaves
-ASCII, so Unicode folding degenerates to ASCII folding; and no newline means `$`
-cannot differ.
+ASCII, so Unicode folding degenerates to ASCII folding; no newline means `$`
+cannot differ; and no vertical tab means the one Perl-class definition the
+engines disagree about (`\s`/`\S`) cannot differ either.
 
 Two residuals, stated rather than implied: the guard is a property of the
 column's data, not of the answer, so a query can fail on a row another conjunct

@@ -1,4 +1,4 @@
-"""Compile :class:`~remora.expr.Expr` trees to DuckDB SQL predicates.
+r"""Compile :class:`~remora.expr.Expr` trees to DuckDB SQL predicates.
 
 The third backend for one IR: :mod:`remora.compile.dfilter` renders Wireshark
 display filters, :mod:`remora.compile.predicate` evaluates Python predicates
@@ -156,10 +156,13 @@ does not agree about. Both raise :class:`UnsupportedSqlExprError` here.
 What no construct check can catch is that RE2 matches UTF-8 *runes* and folds
 case by Unicode, while Wireshark's PCRE2 (``PCRE2_CASELESS``, no UTF/UCP) and
 the predicate backend (Python ``re`` over UTF-8 bytes) match bytes and fold
-ASCII -- and that RE2's ``$`` matches end-of-text only, where the other two also
-match before a single trailing newline. ``'café' matches '^.{5}$'`` is true on
-two engines and false on the third; the difference is in the *value*, not the
-pattern.
+ASCII -- that RE2's ``$`` matches end-of-text only, where the other two also
+match before a single trailing newline -- and that the engines do not agree on
+what the Perl *classes* contain: RE2's ``\s`` is ``[\t\n\f\r ]``, while
+Python ``re`` and PCRE2 also count U+000B VERTICAL TAB. ``'café' matches
+'^.{5}$'`` is true on two engines and false on the third, and ``'a\x0bb'
+matches 'a\sb'`` is true on two and false on the third; the difference is in
+the *value*, not the pattern.
 
 **Both sides need closing, because the fold relation runs both ways.** The
 pattern side belongs to :mod:`remora.compile.re2` and is why a pattern must be
@@ -169,15 +172,22 @@ so a non-ASCII *pattern* selects ASCII *values* the other two engines reject,
 which no value-side test can see.
 
 The value side is this module's guard. Every remaining difference needs a
-non-ASCII byte or a newline in the value, so the compiled predicate refuses
-exactly those: ``strlen(v) <> length(v)`` (byte count differs from character
-count, i.e. not pure ASCII) or a ``chr(10)`` anywhere raises DuckDB ``error()``
-naming the column and pointing at the pcap path. With **both** halves in place
-the three engines are provably identical on what survives: pattern and value are
-ASCII, an ASCII byte never occurs inside a multi-byte UTF-8 sequence, so ``.``,
-``[^...]`` and counted quantifiers consume one byte = one rune; no character on
-either side has a simple-fold orbit leaving ASCII, so Unicode folding degenerates
-to ASCII folding; and no newline means ``$`` cannot differ.
+non-ASCII byte, a newline or a vertical tab in the value, so the compiled
+predicate refuses those: ``strlen(v) <> length(v)`` (byte count differs from
+character count, i.e. not pure ASCII) or a ``chr(10)`` or ``chr(11)`` anywhere
+raises DuckDB ``error()`` naming the column and pointing at the pcap path. It
+refuses a *superset*, deliberately — a value carrying one of those characters is
+refused even under a pattern that could not observe the difference (``'a\x0bb'
+matches 'x'``) — because the guard tests the value alone, and a cheap
+value-shaped test that never lets a divergence through beats a pattern-aware one
+that might. With **both** halves in place the three engines are provably
+identical on what survives: pattern and value are ASCII, an ASCII byte never
+occurs inside a multi-byte UTF-8 sequence, so ``.``, ``[^...]`` and counted
+quantifiers consume one byte = one rune; no character on either side has a
+simple-fold orbit leaving ASCII, so Unicode folding degenerates to ASCII folding;
+no newline means ``$`` cannot differ; and no vertical tab means the one
+Perl-class definition the engines disagree about (``\s``/``\S``) cannot differ
+either.
 
 Two residuals, stated rather than implied: the guard is a property of the
 *column's data*, not of the answer, so a query can fail on a row another conjunct
@@ -495,13 +505,14 @@ def _guarded_match(subject: str, column: str) -> str:
         portable-text section.
     """
     message = _sql_text_literal(
-        f"remora: matches on {column} needs pure-ASCII, newline-free text — "
-        "DuckDB RE2 and Wireshark PCRE2 disagree on anything else; run this "
-        "filter on the pcap path (remora.Capture)"
+        f"remora: matches on {column} needs pure-ASCII text free of newline "
+        "(chr(10)) and vertical tab (chr(11)) — DuckDB RE2 and Wireshark PCRE2 "
+        "disagree on anything else; run this filter on the pcap path "
+        "(remora.Capture)"
     )
     return (
         f"CASE WHEN strlen({subject}) <> length({subject}) "
-        f"OR contains({subject}, chr(10)) "
+        f"OR contains({subject}, chr(10)) OR contains({subject}, chr(11)) "
         f"THEN error({message}) "
         f"ELSE regexp_matches({subject}, ?, 'i') END"
     )
