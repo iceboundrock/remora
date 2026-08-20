@@ -5,7 +5,7 @@ No tshark anywhere here: rows are inserted through the real #25/#26 path
 ``register_fields`` for the catalog row), so the columns and the ``meta.fields``
 registry are exactly what a materialization would have left behind. The
 tshark-driven half — the Capture/Query parity check — lives in
-``tests/integration/test_query_parity.py``.
+``tests/integration/workspace/``.
 
 Gated on duckdb like the other workspace suites; the import-purity assertions
 live in ``tests/test_workspace_import_purity.py``, which deliberately carries no

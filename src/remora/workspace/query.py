@@ -73,7 +73,9 @@ They are statements about the backend, not about the workspace.
 Where this does *not* match the pcap path
 -----------------------------------------
 The two surfaces answer the same question for the operators #29 harmonizes, and
-``tests/integration/test_query_parity.py`` compares them filter by filter. The
+``tests/integration/workspace/test_query_parity.py`` compares them filter by
+filter, and ``test_parity_matrix.py`` beside it runs the whole operator table
+through both paths (#38). The
 one inherited exception — a **negated comparison on a scalar column**,
 ``~(IP.src == v)``, which is how the DSL spells ``!=`` — is **gone since #36**:
 SQL is three-valued, so ``NOT ("ip_src" = ?)`` used to be ``NULL`` and therefore

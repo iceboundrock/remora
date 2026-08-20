@@ -22,6 +22,10 @@ dns_multi.pcap (3 packets) — multi-occurrence dns.qry.name:
 Regenerate with::
 
     uv run python tests/fixtures/make_fixtures.py
+
+``build_bulk_tcp(n)`` (issue #38) is the odd one out: it builds a large
+synthetic capture for the workspace break-even benchmark, is never written to
+this directory, and ``main()`` does not call it.
 """
 
 from __future__ import annotations
@@ -202,6 +206,45 @@ def build_dns_multi() -> bytes:
         MAC_B, MAC_A, 0x0800, ipv4(ip_a, ip_srv, 6, tcp(ip_a, ip_srv, 40000, 80, 3000, 0, 0x02))
     )
     return pcap_file([two_questions, one_question, plain_tcp], base_ts=1700000200)
+
+
+# Destination ports and source hosts build_bulk_tcp cycles through, in order.
+# Ten hosts and four ports, so a host selects a tenth of the capture, a port a
+# quarter, and a (host, port) conjunction a twentieth — known fractions the
+# benchmark asserts against rather than trusting.
+BULK_DEST_PORTS = (443, 80, 8080, 9000)
+BULK_SRC_LAST_OCTETS = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
+
+
+def build_bulk_tcp(packet_count: int, base_ts: int = 1700001000) -> bytes:
+    """A large synthetic TCP-over-IPv4 capture for the workspace benchmark.
+
+    Deliberately NOT one of the committed fixtures: the break-even benchmark
+    (tests/integration/workspace/test_benchmark.py) builds ~20k packets into
+    tmp_path, which has no business in the repository. It lives here so the
+    packing helpers above are written once, and it touches neither committed
+    builder (tests/test_fixture_repro.py pins their bytes).
+
+    Packet ``i`` is a TCP SYN ``10.0.0.<BULK_SRC_LAST_OCTETS[i % 10]>:<40000 +
+    i % 1000>`` -> ``10.0.0.200:<BULK_DEST_PORTS[i % 4]>``. Timestamps advance
+    a millisecond per packet (the microsecond field must stay below 1e6, which
+    is why this does not go through ``pcap_file``).
+    """
+    # Same classic pcap global header pcap_file writes.
+    chunks = [struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, 1)]
+    dst_ip = bytes([10, 0, 0, 200])
+    for index in range(packet_count):
+        src_ip = bytes([10, 0, 0, BULK_SRC_LAST_OCTETS[index % len(BULK_SRC_LAST_OCTETS)]])
+        sport = 40000 + index % 1000
+        dport = BULK_DEST_PORTS[index % len(BULK_DEST_PORTS)]
+        frame = ether(
+            MAC_B,
+            MAC_A,
+            0x0800,
+            ipv4(src_ip, dst_ip, 6, tcp(src_ip, dst_ip, sport, dport, 1000 + index, 0, 0x02)),
+        )
+        chunks.append(pcap_record(base_ts + index // 1000, (index % 1000) * 1000, frame))
+    return b"".join(chunks)
 
 
 def main() -> None:

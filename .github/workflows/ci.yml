@@ -33,7 +33,12 @@ jobs:
       - name: Test
         run: uv run pytest
         env:
+          # Both guards turn "dependency missing" from a clean local skip into a
+          # hard failure here, so a broken install can never silently skip the
+          # integration suites. duckdb needs no install step of its own — it is
+          # in the dev dependency group, so the `uv sync` above already has it.
           REMORA_REQUIRE_TSHARK: "1"
+          REMORA_REQUIRE_DUCKDB: "1"
 
   codegen-drift:
     runs-on: ubuntu-latest
