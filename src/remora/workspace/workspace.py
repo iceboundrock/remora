@@ -64,6 +64,7 @@ from remora.workspace.materialize import (
     detect_tshark_version,
     materialize_into,
 )
+from remora.workspace.query import Query
 from remora.workspace.schema import check_compatible, create_schema
 
 if TYPE_CHECKING:
@@ -633,6 +634,29 @@ class Workspace:
                 runner=run,
                 batch_size=batch_size,
             )
+
+    def query(self) -> Query:
+        """Start a query over this workspace's materialized rows.
+
+        The cache-side counterpart of :class:`remora.Capture`: the same ``Expr``
+        trees, compiled to a DuckDB predicate instead of a display filter, over
+        columns that were dissected once. The returned query is immutable and
+        chainable (``ws.query().filter(TCP.port == 443).select(IP.src)``) and
+        touches the database only when it is iterated, exported or rendered.
+
+        Every execution goes through :meth:`read`, so this works in ro mode: a
+        ``Query`` never enters the write API and never writes — no :meth:`write`
+        call, no DDL, no DML. (In rw mode :meth:`read` still opens a
+        read-write-*configured* connection, for the same-process reason
+        documented there; what the query issues on it is ``SELECT`` either way.)
+        A field the workspace holds no column for, or one whose declaration
+        disagrees with the stored catalog, is refused by name before any
+        generated SQL reaches DuckDB; see :mod:`remora.workspace.query`.
+
+        Returns:
+            A new :class:`~remora.workspace.query.Query` over this workspace.
+        """
+        return Query(self)
 
     def compact(self) -> None:
         """Rewrite the workspace file to reclaim space.

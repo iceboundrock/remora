@@ -27,7 +27,7 @@ class TestNoModuleLevelConnection:
             "fds_before = None\n"
             "if sys.platform == 'linux':\n"
             "    fds_before = set(os.listdir('/proc/self/fd'))\n"
-            "import remora.workspace, remora.workspace.workspace\n"
+            "import remora.workspace, remora.workspace.workspace, remora.workspace.query\n"
             "assert 'duckdb' not in sys.modules, 'duckdb imported at module level'\n"
             "if fds_before is not None:\n"
             "    new = set(os.listdir('/proc/self/fd')) - fds_before\n"

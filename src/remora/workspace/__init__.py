@@ -5,8 +5,9 @@ package owns the storage layout (:mod:`remora.workspace.schema`), the
 column-name policy (:mod:`remora.workspace.naming`), the ftype -> column
 type map (:mod:`remora.workspace.types`), the cache-key computation
 (:mod:`remora.workspace.cachekey`), the streaming materialize pipeline
-(:mod:`remora.workspace.materialize`), and the analyst-annotation API
-(:mod:`remora.workspace.annotations`); connection and lock ownership lives in
+(:mod:`remora.workspace.materialize`), the analyst-annotation API
+(:mod:`remora.workspace.annotations`), and the cache-side query surface
+(:mod:`remora.workspace.query`); connection and lock ownership lives in
 :mod:`remora.workspace.workspace`'s ``Workspace`` class (#28).
 
 DuckDB is an optional dependency — install it with ``pip install
@@ -38,6 +39,8 @@ from remora.workspace.cachekey import (
 )
 from remora.workspace.errors import (
     ColumnNameCollisionError,
+    FieldDeclarationMismatchError,
+    FieldNotMaterializedError,
     MaterializationMismatchError,
     SchemaVersionError,
     WorkspaceError,
@@ -50,7 +53,13 @@ from remora.workspace.materialize import (
     detect_tshark_version,
     materialize_into,
 )
-from remora.workspace.naming import SKELETON_COLUMNS, column_name, find_collisions
+from remora.workspace.naming import (
+    SKELETON_ABBREVS,
+    SKELETON_COLUMNS,
+    column_name,
+    find_collisions,
+)
+from remora.workspace.query import Query, Row
 from remora.workspace.schema import (
     SCHEMA_VERSION,
     CacheKeyRecord,
@@ -87,6 +96,7 @@ __all__ = [
     "FINGERPRINT_VERSION",
     "PROBE_BYTES",
     "SCHEMA_VERSION",
+    "SKELETON_ABBREVS",
     "SKELETON_COLUMNS",
     "AnnotationRecord",
     "AnnotationScope",
@@ -94,11 +104,15 @@ __all__ = [
     "ColumnNameCollisionError",
     "ColumnSpec",
     "ColumnType",
+    "FieldDeclarationMismatchError",
+    "FieldNotMaterializedError",
     "FieldRecord",
     "MaterializationMismatchError",
     "MaterializeOutcome",
     "MaterializeResult",
     "PcapFingerprint",
+    "Query",
+    "Row",
     "SchemaVersionError",
     "TsharkRunner",
     "Workspace",

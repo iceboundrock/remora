@@ -83,17 +83,18 @@ jobs:
               raise SystemExit('expected an ImportError for WLAN')
           "
       - name: remora[all] resolves every extra
-        # find-links (not --no-index) because "all" now includes the workspace
-        # extra, whose duckdb dependency lives on PyPI, not in dist/. The
-        # unpublished remora-* dists still resolve from dist/ — no index carries
-        # them — so this keeps testing the locally built wheels.
+        # find-links (not --no-index) because "all" includes the third-party
+        # extras — workspace's duckdb and arrow's pyarrow — which live on PyPI,
+        # not in dist/. The unpublished remora-* dists still resolve from dist/
+        # — no index carries them — so this keeps testing the locally built
+        # wheels.
         run: |
           uv venv --python 3.12 all-env
           uv pip install --python all-env/bin/python --find-links dist "remora[all]"
           all-env/bin/python -c "
-          import duckdb
+          import duckdb, pyarrow
           from remora.proto import WLAN, RADIOTAP, MODBUS, MBTCP, DNP3, GTP, DIAMETER
-          print('extras resolve OK; duckdb', duckdb.__version__)
+          print('extras resolve OK; duckdb', duckdb.__version__, 'pyarrow', pyarrow.__version__)
           "
       - name: Extras stubs resolve for mypy
         run: |
