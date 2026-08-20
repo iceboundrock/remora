@@ -100,10 +100,23 @@ def test_quickstart_materializes_queries_and_exports(
     assert exported.read_bytes()[:4] == b"PAR1"
 
 
-def test_the_doc_names_every_exportable_table() -> None:
+def _section(heading: str) -> str:
+    """One ``## heading`` section's body, up to the next ``## `` heading."""
     text = DOC.read_text(encoding="utf-8")
+    rest = text.split(f"\n## {heading}\n", 1)[1]
+    return rest.split("\n## ", 1)[0]
+
+
+def test_the_doc_names_every_exportable_table_where_it_documents_them() -> None:
+    """Scoped to the export section on purpose.
+
+    Searching the whole document would let a table drop out of the documented
+    list while an unrelated code example elsewhere kept the test green — the
+    list is the claim, so the list is what is checked.
+    """
+    section = _section("Parquet export")
     for table in EXPORTABLE_TABLES:
-        assert f'"{table}"' in text, table
+        assert f"`{table}`" in section or f'"{table}"' in section, table
 
 
 def test_the_stream_prerequisite_fence_lists_exactly_the_required_fields() -> None:
@@ -190,7 +203,7 @@ def test_the_doc_names_where_each_rule_is_enforced() -> None:
         "tests/test_workspace_lifecycle.py",
         "tests/test_workspace_export.py",
         "tests/test_workspace_query.py",
-        "tests/integration/test_query_parity.py",
+        "tests/integration/workspace/test_parity_matrix.py",
         "tests/test_workspace_docs.py",
     ):
         assert path in text, path

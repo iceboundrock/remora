@@ -10,8 +10,11 @@ produced it.
 
 This document is about that honesty: what the file holds and what it does not,
 what invalidates it, how it locks, how a table leaves it, and where the cache
-path's semantics are identical to the pcap path's (almost everywhere) and where
-they are deliberately loud (regex, and nowhere else).
+path's semantics are identical to the pcap path's and where it instead refuses
+out loud. Row sets never fork silently: the one place the cache path answers a
+question differently from the pcap path is regex, and there it raises rather
+than answering. Two constructs are refused outright for the same reason —
+a `matches` pattern RE2 cannot run, and `contains` on a `BLOB` column.
 
 Install it with the `workspace` extra — `pip install 'remora[workspace]'`, which
 adds duckdb. `remora.workspace` is import-pure: importing it never imports
@@ -367,8 +370,16 @@ the DuckDB-native iteration path decodes straight to `IPv6Address`.
 ## Semantics: NULL and regex
 
 **[`docs/semantics.md`](semantics.md) is the single source for both**, and it is
-enforced: `tests/test_semantics_docs.py` parses its truth table and regex matrix
-out of the markdown and checks them against the code and the shared test table.
+enforced — unevenly, so it is worth being exact about how. Its absent-field truth
+table is *parsed out of the markdown* by `tests/test_semantics_docs.py` and
+compared against the operator set the shared semantics table
+(`tests/test_semantics_table.py`) actually runs through all three backends. Its
+regex matrix is not parsed: what is checked there is that the doc names the real
+RE2 repeat limit and the real lookaround prefixes from
+`remora.compile.re2`, and quotes the portable-text guard condition
+`remora.compile.sql` emits, each read from the code rather than copied. So the
+table cannot drift; the matrix's prose around those constants can.
+
 This section says only what a cache-path user has to carry in their head; it does
 not restate the table.
 
@@ -424,8 +435,8 @@ lookahead = HTTP.request_uri.matches("^/api/(?!internal)")
 Everything else must select the same rows on all three backends, and it is
 measured rather than asserted: `tests/test_sql_duckdb.py` runs the shared
 semantics table against a real DuckDB seeded through the real codecs, and
-`tests/integration/test_query_parity.py` compares a `Capture` and a `Query`
-filter by filter over the same capture.
+`tests/integration/workspace/test_parity_matrix.py` compares a `Capture` and a
+`Query` operator by operator over the same capture.
 
 ### Rows are not packets
 
@@ -475,11 +486,22 @@ zero, so a bare id names two rows). `add_annotation` therefore *requires*
 `protocol` for `scope="stream"` and *refuses* it for `scope="packet"`, where the
 frame number is unique on its own.
 
-The orphan policy is **kept-but-flagged**: annotations are analyst findings, so a
-re-materialization under a narrower filter never deletes them.
-`list_annotations()` derives `AnnotationRecord.orphaned` at read time, a wider
-re-materialization un-orphans them again, and `delete_orphan_annotations()` is
-the one explicit call that removes them. `remove_annotations()` refuses a call
+The orphan policy is **kept-but-flagged**: annotations are analyst findings, so
+nothing in the materialization path ever deletes one. An annotation can name a
+row this workspace does not hold — a frame the materialization's filter never
+admitted, or a stream that `build_streams()` has not built yet or dropped on a
+rebuild — and `list_annotations()` derives `AnnotationRecord.orphaned` at read
+time from an `EXISTS` against `pkts`/`streams` rather than storing it, so the
+flag follows the current contents and `delete_orphan_annotations()` is the one
+explicit call that removes anything.
+
+Note what that does **not** mean: you cannot re-materialize this workspace under
+a different filter to widen or narrow what the annotations point at.
+`materialize()` compares the requested dfilter against the stored cache key and
+raises `MaterializationMismatchError` on any change, pointing at a fresh
+workspace file — rematerializing in place would drop rows a caller may already
+have annotated, which is the same reasoning as this orphan policy seen from the
+other side. Widening means a new workspace, and the annotations do not follow it. `remove_annotations()` refuses a call
 with no filters at all — wiping every finding is too destructive to be what zero
 arguments means. Ids come from a monotonic high-water mark and are **never
 reused**, so a stale id matches nothing rather than naming a different finding.
@@ -586,5 +608,5 @@ operations the peer opens read-write fine.
 | Modes, locking, `compact()` coordination | `tests/test_workspace_lifecycle.py` |
 | Export destination safety and the two type rewrites | `tests/test_workspace_export.py` |
 | The three query-time refusals, at both the moments they fire | `tests/test_workspace_query.py` |
-| Pcap-path / cache-path parity | `tests/integration/test_query_parity.py` |
+| Pcap-path / cache-path parity | `tests/integration/workspace/test_parity_matrix.py` |
 | This document's fences | `tests/test_workspace_docs.py` |
