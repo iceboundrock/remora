@@ -86,6 +86,11 @@ def capture_frames(pcap: Path, expr: Expr) -> set[int]:
     return {int(pkt.get_raw("frame.number")[0]) for pkt in Capture(pcap).filter(expr)}
 
 
+def all_frames(pcap: Path) -> frozenset[int]:
+    """Every frame number in *pcap*, read from the capture itself."""
+    return frozenset(int(pkt.get_raw("frame.number")[0]) for pkt in Capture(pcap))
+
+
 def query_frames(query: Query) -> set[int]:
     """Frame numbers the cache path selects — DuckDB scanning the workspace."""
     numbers: set[int] = set()
@@ -104,14 +109,14 @@ TCP_MIXED_MATRIX: list[Case] = [
     # Frame 5 is ARP and carries no ip.src at all: Wireshark evaluates the
     # comparison false and negates it to true, and #36's coalesce-under-Not
     # makes DuckDB's three-valued NULL agree.
-    case("scalar != (absent field included)", ~(IP.src == "10.0.0.1"), {2, 3, 5}),
+    case("scalar != (absent field included)", IP.src != "10.0.0.1", {2, 3, 5}),
     case("multi ==", TCP.port == 443, {1, 2}),
     # Frames 4 (UDP) and 5 (ARP) have no tcp.port; an absent multi column is
     # stored as [] rather than NULL, so any-occurrence equality is false and
     # the negation is true — same answer, a different mechanism.
-    case("multi != (absent field included)", ~(TCP.port == 443), {3, 4, 5}),
+    case("multi != (absent field included)", TCP.port != 443, {3, 4, 5}),
     case("second multi-value field ==", UDP.port == 53, {4}),
-    case("second multi-value field !=", ~(UDP.port == 53), {1, 2, 3, 5}),
+    case("second multi-value field !=", UDP.port != 53, {1, 2, 3, 5}),
     # -- ordering comparisons, scalar --------------------------------------
     case("scalar <", TCP.srcport < 1024, {2}),
     case("scalar <=", TCP.srcport <= 443, {2}),
@@ -167,7 +172,7 @@ TCP_MIXED_MATRIX: list[Case] = [
 # --------------------------------------------------------------------------
 DNS_MULTI_MATRIX: list[Case] = [
     case("multi text ==", DNS.qry_name == "beta.example", {1}),
-    case("multi text != (absent field included)", ~(DNS.qry_name == "beta.example"), {2, 3}),
+    case("multi text != (absent field included)", DNS.qry_name != "beta.example", {2, 3}),
     case("multi text <", DNS.qry_name < "beta.example", {1}),
     case("multi text >=", DNS.qry_name >= "beta.example", {1, 2}),
     case("multi text membership", DNS.qry_name.in_(["gamma.example", "zzz.example"]), {2}),
@@ -239,10 +244,37 @@ def test_dns_multi_row_parity(dns_multi_workspace: Path, item: Case) -> None:
 def test_the_matrix_covers_every_frame() -> None:
     # A fixture change that gutted the matrix would leave rows matching nothing
     # and every row-parity assertion still passing (two empty sets are equal).
+    # The target is read out of each pcap rather than trusted from the constant,
+    # so the coverage claim is proved against the capture instead of against a
+    # second hand-maintained list of what the capture is supposed to hold.
+    assert all_frames(TCP_MIXED) == TCP_MIXED_FRAMES
+    assert all_frames(DNS_MULTI) == DNS_MULTI_FRAMES
     tcp_covered = frozenset[int]().union(*(c.expected for c in TCP_MIXED_MATRIX))
     dns_covered = frozenset[int]().union(*(c.expected for c in DNS_MULTI_MATRIX))
     assert tcp_covered == TCP_MIXED_FRAMES
     assert dns_covered == DNS_MULTI_FRAMES
+
+
+def test_the_dsl_ne_operator_is_the_explicit_negation_on_both_paths() -> None:
+    """``f != v`` and ``~(f == v)`` are one expression, and the rows use the operator.
+
+    The matrix's ``!=`` rows go through ``FieldExprOps.__ne__`` — the spelling a
+    user writes — rather than through a hand-built ``Not``, so a regression in
+    the overload cannot hide behind an equivalent construction. This pins the
+    equivalence itself, on a scalar and on a multi-value field: Wireshark's own
+    ``!=`` means "some occurrence differs", which is the pitfall the DSL exists
+    to make unrepresentable, and the two spellings staying one expression is
+    what makes that guarantee reach the workspace too.
+    """
+    for operator_form, negated_form in (
+        (IP.src != "10.0.0.1", ~(IP.src == "10.0.0.1")),
+        (TCP.port != 443, ~(TCP.port == 443)),
+    ):
+        # Compared by repr, not by ==: FieldRef.__eq__ builds an Expr rather
+        # than answering a question, so structural equality on a tree holding
+        # one raises from Expr.__bool__ instead of comparing.
+        assert repr(operator_form) == repr(negated_form)
+        assert capture_frames(TCP_MIXED, operator_form) == capture_frames(TCP_MIXED, negated_form)
 
 
 def test_only_the_declared_rows_are_empty() -> None:

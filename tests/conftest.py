@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import importlib.util
+import importlib
 import os
 
 import pytest
@@ -17,12 +17,23 @@ def pytest_configure(config: pytest.Config) -> None:
     failing. ``REMORA_REQUIRE_DUCKDB`` (set in .github/workflows/ci.yml, beside
     ``REMORA_REQUIRE_TSHARK``) turns that skip into a hard stop here, once, for
     every workspace test rather than only the ones that remember to check.
+
+    The check is a real ``import``, not ``find_spec``: a spec proves the module
+    can be *found*, and every suite this guards skips on ``importorskip``, which
+    fires when the module cannot be *imported*. A duckdb whose wheel is present
+    but whose native library will not load therefore satisfies ``find_spec`` and
+    skips every workspace suite — precisely the silent-skip this exists to
+    refuse. Importing it here is also what the run is about to do anyway.
     """
-    if os.environ.get("REMORA_REQUIRE_DUCKDB") and importlib.util.find_spec("duckdb") is None:
+    if not os.environ.get("REMORA_REQUIRE_DUCKDB"):
+        return
+    try:
+        importlib.import_module("duckdb")
+    except ImportError as error:
         raise pytest.UsageError(
-            "REMORA_REQUIRE_DUCKDB is set but duckdb is not importable; "
+            f"REMORA_REQUIRE_DUCKDB is set but duckdb is not importable ({error}); "
             "install it with: pip install 'remora[workspace]'"
-        )
+        ) from error
 
 
 class FakePacket:
