@@ -102,13 +102,13 @@ class TestNegationAndConnectives:
     def test_ne_on_a_multi_field_is_not_list_contains(self) -> None:
         # Acceptance criterion 2: never SQL <> on a list column.
         result = compile_sql(PORT != 443)
-        assert result == SqlPredicate('NOT (list_contains("tcp_port", ?))', (443,))
+        assert result == SqlPredicate('NOT (coalesce(list_contains("tcp_port", ?), FALSE))', (443,))
         assert "<>" not in result.sql
         assert "!=" not in result.sql
 
     def test_ne_on_a_scalar_field_is_not_eq(self) -> None:
         result = compile_sql(SRC != "10.0.0.1")
-        assert result.sql == 'NOT ("ip_src" = ?)'
+        assert result.sql == 'NOT (coalesce("ip_src" = ?, FALSE))'
         assert "<>" not in result.sql
 
     def test_and_or_nest_with_parentheses_and_ordered_params(self) -> None:
@@ -145,13 +145,13 @@ class TestPresence:
         assert compile_sql(QNAME.present()).sql == 'len(coalesce("dns_qry_name", [])) > 0'
 
     def test_negated_presence_is_null_safe(self) -> None:
-        # IS NOT NULL never yields NULL, so NOT of it selects the absent rows —
-        # the one place the SQL backend matches the predicate backend on absence.
+        # IS NOT NULL never yields NULL, so NOT of it selects the absent rows
+        # unaided — no #36 coalesce is added, and none is needed.
         assert compile_sql(~SRC.present()).sql == 'NOT ("ip_src" IS NOT NULL)'
 
     def test_negated_multi_presence_is_null_safe(self) -> None:
         # coalesce(..., []) treats a back-filled NULL column as absent, so
-        # NOT of that is false (not NULL) — the other exception to the three-valued logic.
+        # NOT of that is false (not NULL) — already two-valued before #36.
         assert compile_sql(~PORT.present()).sql == 'NOT (len(coalesce("tcp_port", [])) > 0)'
 
 
@@ -181,7 +181,7 @@ class TestMembership:
     def test_not_in_is_not_of_the_whole_set(self) -> None:
         result = compile_sql(~PORT.in_([80, 443]))
         assert result.sql == (
-            'NOT ((list_contains("tcp_port", ?) OR list_contains("tcp_port", ?)))'
+            'NOT (coalesce((list_contains("tcp_port", ?) OR list_contains("tcp_port", ?)), FALSE))'
         )
         assert result.params == (80, 443)
 
@@ -240,7 +240,7 @@ class TestContains:
 
     def test_contains_composes_with_interleaved_params(self) -> None:
         result = compile_sql((TTL < 64) & ~HOST.contains("evil"))
-        assert result.sql == '("ip_ttl" < ? AND NOT (contains("http_host", ?)))'
+        assert result.sql == '("ip_ttl" < ? AND NOT (coalesce(contains("http_host", ?), FALSE)))'
         assert result.params == (64, "evil")
 
 
@@ -337,10 +337,140 @@ class TestNaN:
         assert result.params == (INF,)
 
 
+class TestNullHarmonization:
+    """Issue #36: negation over an absent field matches the other backends.
+
+    A leaf beneath a Not is made two-valued with coalesce(..., FALSE), which is
+    what collapses SQL's Kleene logic onto the predicate backend's booleans. A
+    leaf that is NOT beneath a Not keeps its bare form, so DuckDB can still push
+    it into the scan as a zone-map filter.
+    """
+
+    def test_positive_leaf_keeps_its_pushdownable_form(self) -> None:
+        assert compile_sql(SRC == "10.0.0.1").sql == '"ip_src" = ?'
+        assert compile_sql(TTL < 64).sql == '"ip_ttl" < ?'
+
+    def test_positive_leaf_inside_and_or_is_not_wrapped(self) -> None:
+        assert compile_sql((SRC == "10.0.0.1") & (TTL < 64)).sql == (
+            '("ip_src" = ? AND "ip_ttl" < ?)'
+        )
+
+    def test_wrapping_reaches_every_leaf_under_a_not(self) -> None:
+        result = compile_sql(~((SRC == "10.0.0.1") | (PORT == 443)))
+        assert result.sql == (
+            'NOT ((coalesce("ip_src" = ?, FALSE) OR coalesce(list_contains("tcp_port", ?), FALSE)))'
+        )
+
+    def test_and_below_a_not_wraps_both_sides(self) -> None:
+        result = compile_sql(~((SRC == "10.0.0.1") & (TTL < 64)))
+        assert result.sql == (
+            'NOT ((coalesce("ip_src" = ?, FALSE) AND coalesce("ip_ttl" < ?, FALSE)))'
+        )
+
+    def test_double_negation_wraps_at_the_leaf_not_the_subtree(self) -> None:
+        # Subtree-level coalescing is WRONG here: NOT(coalesce(NOT(NULL), FALSE))
+        # is TRUE where Python's `not not False` is False.
+        assert compile_sql(~~(SRC == "10.0.0.1")).sql == (
+            'NOT (NOT (coalesce("ip_src" = ?, FALSE)))'
+        )
+
+    def test_a_not_only_wraps_its_own_subtree(self) -> None:
+        result = compile_sql((~(SRC == "10.0.0.1")) & (TTL < 64))
+        assert result.sql == '(NOT (coalesce("ip_src" = ?, FALSE)) AND "ip_ttl" < ?)'
+
+    def test_presence_is_never_wrapped(self) -> None:
+        # IS NOT NULL / len(coalesce(..., [])) never yield NULL.
+        assert compile_sql(~SRC.present()).sql == 'NOT ("ip_src" IS NOT NULL)'
+        assert compile_sql(~PORT.present()).sql == 'NOT (len(coalesce("tcp_port", [])) > 0)'
+
+    def test_the_nan_false_constant_is_never_wrapped(self) -> None:
+        assert compile_sql(~(DVAL == NAN)).sql == "NOT (FALSE)"
+
+    def test_contains_under_a_not_is_wrapped(self) -> None:
+        assert compile_sql(~HOST.contains("evil")).sql == (
+            'NOT (coalesce(contains("http_host", ?), FALSE))'
+        )
+
+    def test_guarded_comparison_under_a_not_is_wrapped_whole(self) -> None:
+        assert compile_sql(~(DVAL > 1.0)).sql == (
+            'NOT (coalesce(("x_value" > ? AND NOT isnan("x_value")), FALSE))'
+        )
+
+    def test_range_under_a_not_is_wrapped(self) -> None:
+        assert compile_sql(~TTL.in_([(1, 64)])).sql == (
+            'NOT (coalesce("ip_ttl" BETWEEN ? AND ?, FALSE))'
+        )
+
+
 class TestMatches:
-    def test_matches_is_refused(self) -> None:
+    """matches compiles to RE2 under a portable-text guard (issue #36)."""
+
+    def test_scalar_matches_is_guarded_regexp_matches(self) -> None:
+        result = compile_sql(HOST.matches("^ex.*com$"))
+        assert result.sql == (
+            'CASE WHEN strlen("http_host") <> length("http_host") '
+            'OR contains("http_host", chr(10)) OR contains("http_host", chr(11)) '
+            'THEN error(\'remora: matches on "http_host" needs pure-ASCII text '
+            "free of newline (chr(10)) and vertical tab (chr(11)) — DuckDB RE2 "
+            "and Wireshark PCRE2 disagree on anything else; run this filter on "
+            "the pcap path (remora.Capture)') "
+            "ELSE regexp_matches(\"http_host\", ?, 'i') END"
+        )
+        assert result.params == ("^ex.*com$",)
+
+    def test_negated_scalar_matches_is_null_safe(self) -> None:
+        # Under a Not the leaf is coalesced like every other NULL-able leaf, so
+        # a row missing the field is selected (the #36 harmonization).
+        result = compile_sql(~HOST.matches("x"))
+        assert result.sql == (
+            'NOT (coalesce(CASE WHEN strlen("http_host") <> length("http_host") '
+            'OR contains("http_host", chr(10)) OR contains("http_host", chr(11)) '
+            'THEN error(\'remora: matches on "http_host" needs pure-ASCII text '
+            "free of newline (chr(10)) and vertical tab (chr(11)) — DuckDB RE2 "
+            "and Wireshark PCRE2 disagree on anything else; run this filter on "
+            "the pcap path (remora.Capture)') "
+            "ELSE regexp_matches(\"http_host\", ?, 'i') END, FALSE))"
+        )
+        assert result.params == ("x",)
+
+    def test_multi_matches_is_an_any_occurrence_filter(self) -> None:
+        result = compile_sql(QNAME.matches("^alpha"))
+        assert result.sql.startswith('len(list_filter("dns_qry_name", x -> CASE WHEN strlen(x)')
+        assert result.sql.endswith("regexp_matches(x, ?, 'i') END)) > 0")
+        assert result.params == ("^alpha",)
+
+    def test_pattern_is_bound_never_interpolated(self) -> None:
+        hostile = "a'\\); DROP TABLE pkts; --"
+        # A hostile pattern is still a valid common-subset regex; it must bind.
+        result = compile_sql(HOST.matches(hostile))
+        assert hostile not in result.sql
+        assert result.params == (hostile,)
+
+    def test_case_insensitive_flag_is_always_i(self) -> None:
+        assert "'i'" in compile_sql(HOST.matches("x")).sql
+
+    @pytest.mark.parametrize("pattern", ["a(?=b)", "(?<!x)y", "a{1001}", "(?:a{32}){32}"])
+    def test_non_portable_pattern_is_refused_naming_re2(self, pattern: str) -> None:
         with pytest.raises(UnsupportedSqlExprError, match="RE2"):
-            compile_sql(HOST.matches("^ex.*com$"))
+            compile_sql(HOST.matches(pattern))
+
+    @pytest.mark.parametrize("pattern", ["\u212a", "\u017f", "caf\u00e9"])
+    def test_non_ascii_pattern_is_refused(self, pattern: str) -> None:
+        # The reviewer's reproduction: RE2 folds U+212A onto "k" by Unicode, so
+        # `HOST.matches("K")` selected the ASCII value "kelvin" that both other
+        # backends reject. The value is ASCII, so the portable-text guard never
+        # fires — the pattern side has to be refused instead.
+        with pytest.raises(UnsupportedSqlExprError, match="RE2"):
+            compile_sql(HOST.matches(pattern))
+
+    def test_refusal_names_the_pcap_path(self) -> None:
+        with pytest.raises(UnsupportedSqlExprError, match="Capture"):
+            compile_sql(HOST.matches("a(?=b)"))
+
+    def test_matches_on_a_non_string_field_is_a_user_error(self) -> None:
+        # Mirrors dfilter.py and predicate.py exactly: TypeError, not Unsupported.
+        with pytest.raises(TypeError, match="string fields"):
+            compile_sql(PAYLOAD.matches("ab"))
 
 
 HOSTILE_LITERALS = (

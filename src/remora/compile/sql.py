@@ -1,4 +1,4 @@
-"""Compile :class:`~remora.expr.Expr` trees to DuckDB SQL predicates.
+r"""Compile :class:`~remora.expr.Expr` trees to DuckDB SQL predicates.
 
 The third backend for one IR: :mod:`remora.compile.dfilter` renders Wireshark
 display filters, :mod:`remora.compile.predicate` evaluates Python predicates
@@ -49,11 +49,17 @@ Rendering rules
   zone maps can skip row groups on.
 - ``Contains(field, needle)`` -> ``contains("col", ?)`` on ``VARCHAR`` columns
   (multi: ``len(list_filter("col", x -> contains(x, ?))) > 0``).
-- ``Not(x)`` -> ``NOT (x)`` — **always** this form. The DSL's ``!=`` arrives as
-  ``Not(Comparison(EQ, ...))``, so it renders ``NOT ("col" = ?)`` /
-  ``NOT (list_contains("col", ?))`` and never SQL ``<>``: on a ``LIST`` column
-  ``<>`` would compare the whole list, which is not what "no occurrence equals"
-  means.
+- ``Matches(field, pattern)`` -> ``regexp_matches("col", ?, 'i')`` wrapped in the
+  portable-text guard below (multi: the same guarded test inside the
+  any-occurrence ``list_filter``). String fields only; a non-string field is a
+  ``TypeError``, exactly as in the sibling backends.
+- ``Not(x)`` -> ``NOT (x)`` — **always** this form, with each NULL-able leaf
+  inside ``x`` wrapped as ``coalesce(<leaf>, FALSE)`` (see the NULL section).
+  The DSL's ``!=`` arrives as ``Not(Comparison(EQ, ...))``, so it renders
+  ``NOT (coalesce("col" = ?, FALSE))`` /
+  ``NOT (coalesce(list_contains("col", ?), FALSE))`` and never SQL ``<>``: on a
+  ``LIST`` column ``<>`` would compare the whole list, which is not what "no
+  occurrence equals" means.
 - ``And(l, r)`` -> ``(l AND r)``; ``Or(l, r)`` -> ``(l OR r)``. Compound nodes
   parenthesize themselves; leaves are already self-delimiting (``=``, ``BETWEEN``
   and ``>`` all bind tighter than ``AND``/``OR``), so the emitted string can be
@@ -74,29 +80,35 @@ as ``CAST(? AS UHUGEINT)``: explicit in scalar position, and required for
 ``list_contains`` to bind against a ``UHUGEINT[]`` element type. No other ftype
 needs it — do not broaden it.
 
-NULL and absence (stated, deliberately not harmonized — see issue #29)
----------------------------------------------------------------------
+NULL and absence (harmonized, issue #36)
+----------------------------------------
 Materialization (#26) writes an absent scalar as ``NULL`` and an absent
-multi-value field as ``[]``, and SQL is three-valued, so:
+multi-value field as ``[]``, and SQL is three-valued, so a bare
+``NOT ("col" = ?)`` is ``NULL`` for a row missing the field and excludes it —
+where Wireshark and the predicate backend include it, because their ``!=`` is
+``not (any occurrence equals)`` and ``any()`` over nothing is False. Issue #29
+stated that divergence; #36 removes it.
 
-- **Absent multi column** (``[]``): ``list_contains([], v)`` is ``false`` and
-  ``len(list_filter([], ...)) > 0`` is ``false``, so a positive test excludes the
-  row and ``NOT (...)`` includes it — identical to the predicate backend, whose
-  ``any()`` over no occurrences is ``False``.
-- **Absent scalar column** (``NULL``): ``"col" = ?`` is ``NULL``, so the row is
-  excluded — same row set as the predicate backend. Under negation the two
-  **diverge**: ``NOT (NULL)`` is ``NULL``, so SQL excludes the row while the
-  predicate backend's ``not False`` includes it. ``x != v`` on a scalar field
-  therefore does not select packets missing the field, where the Wireshark and
-  Python backends do.
-- **Presence is exempt**: ``IS NOT NULL`` and ``len(coalesce(..., [])) > 0`` never yield
-  ``NULL``, so ``~field.present()`` matches the other backends exactly.
-- **A multi column back-filled with ``NULL``** (a column added after older rows
-  were written) behaves like the absent-scalar case for comparisons (``list_contains(NULL, v)``
-  is ``NULL``), but presence treats it as absent via ``coalesce(..., [])``.
+The fix is to make a leaf two-valued exactly where a ``Not`` will invert it:
+``coalesce(<leaf>, FALSE)``. Two details are load-bearing.
 
-Reconciling that divergence across backends is explicitly out of scope for issue
-#29; it is stated here so callers can rely on it rather than discover it.
+- **At the leaf, not at the subtree.** Kleene logic over leaves that all mean
+  "False in Python when NULL" collapses correctly only if every leaf is
+  substituted. ``NOT (NOT (x))`` with x NULL is ``NOT (coalesce(NULL, FALSE))``
+  = TRUE if the subtree is coalesced, where Python's ``not not False`` is False.
+- **Only under a ``Not``.** ``coalesce`` blocks DuckDB's scan-level filter
+  pushdown: ``WHERE "col" = ?`` becomes a zone-map filter, ``WHERE coalesce("col"
+  = ?, FALSE)`` does not. A positive leaf has no divergence to fix — a NULL
+  reaching the ``WHERE`` clause is filtered out, which is what the other backends
+  do — so the hot subnet-``BETWEEN`` and equality scans #26 stores integer
+  addresses for keep exactly the plan they had.
+
+Presence is untouched: ``IS NOT NULL`` and ``len(coalesce(..., [])) > 0`` never
+yield ``NULL``, so they were already harmonized. A NaN literal's ``FALSE``
+constant is untouched for the same reason. A multi column back-filled with
+``NULL`` by a later ``add_field_column`` is covered by the same rule: its
+comparisons are ``NULL``, so a negated one is coalesced and matches the
+predicate backend's reading of "no occurrences".
 
 IEEE-754 specials (harmonized, unlike NULL)
 -------------------------------------------
@@ -133,16 +145,69 @@ The guard is ``NOT isnan(col)``, which is ``NULL`` on a ``NULL`` column value �
 so an absent scalar stays excluded under a guarded comparison, the same as under
 an unguarded one. The NULL behavior above is unchanged by this section.
 
+Regex portability (the portable-text guard, issue #36)
+------------------------------------------------------
+``matches`` runs on three engines. :class:`remora.expr.Matches` already limits a
+pattern to the Python-re/PCRE2 intersection, and :mod:`remora.compile.re2` names
+what remains: the constructs DuckDB's RE2 cannot compile at all (lookarounds,
+repeats above 1000) *and* a non-ASCII pattern character, which RE2 compiles but
+does not agree about. Both raise :class:`UnsupportedSqlExprError` here.
+
+What no construct check can catch is that RE2 matches UTF-8 *runes* and folds
+case by Unicode, while Wireshark's PCRE2 (``PCRE2_CASELESS``, no UTF/UCP) and
+the predicate backend (Python ``re`` over UTF-8 bytes) match bytes and fold
+ASCII -- that RE2's ``$`` matches end-of-text only, where the other two also
+match before a single trailing newline -- and that the engines do not agree on
+what the Perl *classes* contain: RE2's ``\s`` is ``[\t\n\f\r ]``, while
+Python ``re`` and PCRE2 also count U+000B VERTICAL TAB. ``'café' matches
+'^.{5}$'`` is true on two engines and false on the third, and ``'a\x0bb'
+matches 'a\sb'`` is true on two and false on the third; the difference is in
+the *value*, not the pattern.
+
+**Both sides need closing, because the fold relation runs both ways.** The
+pattern side belongs to :mod:`remora.compile.re2` and is why a pattern must be
+pure ASCII: RE2 folds U+212A KELVIN SIGN onto ``k`` and U+017F LATIN SMALL
+LETTER LONG S onto ``s``,
+so a non-ASCII *pattern* selects ASCII *values* the other two engines reject,
+which no value-side test can see.
+
+The value side is this module's guard. Every remaining difference needs a
+non-ASCII byte, a newline or a vertical tab in the value, so the compiled
+predicate refuses those: ``strlen(v) <> length(v)`` (byte count differs from
+character count, i.e. not pure ASCII) or a ``chr(10)`` or ``chr(11)`` anywhere
+raises DuckDB ``error()`` naming the column and pointing at the pcap path. It
+refuses a *superset*, deliberately — a value carrying one of those characters is
+refused even under a pattern that could not observe the difference (``'a\x0bb'
+matches 'x'``) — because the guard tests the value alone, and a cheap
+value-shaped test that never lets a divergence through beats a pattern-aware one
+that might. With **both** halves in place the three engines are provably
+identical on what survives: pattern and value are ASCII, an ASCII byte never
+occurs inside a multi-byte UTF-8 sequence, so ``.``, ``[^...]`` and counted
+quantifiers consume one byte = one rune; no character on either side has a
+simple-fold orbit leaving ASCII, so Unicode folding degenerates to ASCII folding;
+no newline means ``$`` cannot differ; and no vertical tab means the one
+Perl-class definition the engines disagree about (``\s``/``\S``) cannot differ
+either.
+
+Two residuals, stated rather than implied: the guard is a property of the
+*column's data*, not of the answer, so a query can fail on a row another conjunct
+would have excluded; and whether that row is examined at all can depend on
+zone-map skipping from other pushed-down filters. Making it deterministic would
+need a precondition scan in :class:`remora.workspace.Query`, which is future work.
+
 Error policy
 ------------
 :class:`UnsupportedSqlExprError` means "this backend legitimately cannot render
-the expression" — an unknown ``Expr`` node, ``Matches`` (DuckDB's regex engine is
-RE2, whose dialect and case folding differ from Wireshark's PCRE2 and the
-predicate backend's Python ``re``), and ``Contains`` on a ``BLOB`` column
+the expression" — an unknown ``Expr`` node, a ``Matches`` *pattern* DuckDB's RE2
+engine cannot run *or* cannot agree about (what
+:func:`remora.compile.re2.unportable_reason` names: lookarounds, repeats above
+1000, and any non-ASCII character — ``Matches`` itself is no longer refused
+categorically), and ``Contains`` on a ``BLOB`` column
 (DuckDB's ``contains`` takes ``VARCHAR`` or ``LIST``, not ``BLOB``). User errors
-— a malformed literal such as ``IP.src == "not-an-ip"``, or a ``contains`` needle
-whose type does not match the field — surface as the ``ValueError``/``TypeError``
-the sibling backends raise and are deliberately not converted.
+— a malformed literal such as ``IP.src == "not-an-ip"``, a ``contains`` needle
+whose type does not match the field, or ``matches`` on a non-string field —
+surface as the ``ValueError``/``TypeError`` the sibling backends raise and are
+deliberately not converted.
 """
 
 from __future__ import annotations
@@ -152,6 +217,7 @@ from dataclasses import dataclass
 from typing import Any, Final
 
 from remora import values
+from remora.compile.re2 import unportable_reason
 from remora.expr import (
     And,
     CompareOp,
@@ -250,41 +316,63 @@ def compile_sql(expr: Expr) -> SqlPredicate:
     return SqlPredicate(sql, tuple(params))
 
 
-def _render(expr: Expr, params: list[Any]) -> str:
-    """Render one node, appending its parameters to ``params`` in order."""
+def _render(expr: Expr, params: list[Any], *, negated: bool = False) -> str:
+    """Render one node, appending its parameters to ``params`` in order.
+
+    Args:
+        expr: The node to render.
+        params: Accumulator the node's bound values are appended to, in
+            placeholder order.
+        negated: True when at least one enclosing ``Not`` will invert this
+            node's value; NULL-able leaves are then made two-valued with
+            ``coalesce(..., FALSE)`` so SQL's Kleene logic collapses onto the
+            predicate backend's booleans (see the module docstring's NULL
+            section).
+
+    Returns:
+        The SQL text for this node, self-delimiting.
+
+    Raises:
+        UnsupportedSqlExprError: If the node's type is one this backend refuses,
+            or a leaf renderer refuses its own contents (an unrunnable
+            ``matches`` pattern, ``contains`` on a BLOB column).
+        ValueError: If a leaf's literal is malformed for the field's ftype, or a
+            membership range is inverted.
+        TypeError: If a leaf's literal has the wrong type for the field's ftype
+            (``matches`` on a non-string field included).
+    """
     if isinstance(expr, Comparison):
-        return _render_comparison(expr, params)
+        return _render_comparison(expr, params, negated=negated)
     if isinstance(expr, Presence):
-        # Presence is exempt from the NULL divergence: coalesce guards against back-filled NULL
-        # on multi columns. Harmonizing comparisons would require wrapping every scanned column
-        # in coalesce, which would defeat zone-map skipping (see module docstring, issue #29).
+        # Presence never yields NULL, so it needs no coalesce even under a Not.
         column = _column(expr.field)
         return f"len(coalesce({column}, [])) > 0" if expr.field.multi else f"{column} IS NOT NULL"
     if isinstance(expr, Membership):
-        return _render_membership(expr, params)
+        return _render_membership(expr, params, negated=negated)
     if isinstance(expr, Contains):
-        return _render_contains(expr, params)
+        return _render_contains(expr, params, negated=negated)
     if isinstance(expr, Matches):
-        raise UnsupportedSqlExprError(
-            "matches is not compiled to SQL: DuckDB's regexp engine is RE2, whose "
-            "dialect and case folding differ from Wireshark's PCRE2 and the "
-            "predicate backend's Python re"
-        )
+        return _render_matches(expr, params, negated=negated)
     if isinstance(expr, Not):
-        return f"NOT ({_render(expr.operand, params)})"
+        return f"NOT ({_render(expr.operand, params, negated=True)})"
     if isinstance(expr, And):
-        return f"({_render(expr.left, params)} AND {_render(expr.right, params)})"
+        left = _render(expr.left, params, negated=negated)
+        right = _render(expr.right, params, negated=negated)
+        return f"({left} AND {right})"
     if isinstance(expr, Or):
-        return f"({_render(expr.left, params)} OR {_render(expr.right, params)})"
+        left = _render(expr.left, params, negated=negated)
+        right = _render(expr.right, params, negated=negated)
+        return f"({left} OR {right})"
     raise UnsupportedSqlExprError(
         f"sql backend cannot render Expr node of type {type(expr).__name__}"
     )
 
 
-def _render_comparison(expr: Comparison, params: list[Any]) -> str:
+def _render_comparison(expr: Comparison, params: list[Any], *, negated: bool) -> str:
     """Render ``field <op> literal`` against a scalar or a LIST column."""
     field = expr.field
     if _is_nan(values.coerce_literal(field.ftype, expr.value)):
+        # A constant, never NULL, so it is never coalesced.
         return _FALSE
     column = _column(field)
     placeholder = _placeholder(field.ftype)
@@ -292,23 +380,29 @@ def _render_comparison(expr: Comparison, params: list[Any]) -> str:
     guard = _needs_nan_guard(field.ftype, expr.op)
     if not field.multi:
         condition = f"{column} {_SQL_OPS[expr.op]} {placeholder}"
-        # Now a compound, so it parenthesizes itself like And/Or do.
-        return f"({condition} AND NOT isnan({column}))" if guard else condition
+        if guard:
+            # Now a compound, so it parenthesizes itself like And/Or do.
+            condition = f"({condition} AND NOT isnan({column}))"
+        return _null_safe(condition, negated)
     if expr.op is CompareOp.EQ:
-        return f"list_contains({column}, {placeholder})"
+        return _null_safe(f"list_contains({column}, {placeholder})", negated)
     condition = f"{_LAMBDA_VAR} {_SQL_OPS[expr.op]} {placeholder}"
     if guard:
         condition = f"{condition} AND NOT isnan({_LAMBDA_VAR})"
-    return _any_occurrence(column, condition)
+    return _null_safe(_any_occurrence(column, condition), negated)
 
 
-def _render_membership(expr: Membership, params: list[Any]) -> str:
-    """Render ``field in {...}`` as the OR of one term per set element."""
+def _render_membership(expr: Membership, params: list[Any], *, negated: bool) -> str:
+    """Render ``field in {...}`` as the OR of one term per set element.
+
+    The assembled ``OR`` is coalesced once rather than term by term: every term
+    reads the same column, so they are all NULL together and one wrap is
+    equivalent to wrapping each.
+    """
     column = _column(expr.field)
     terms = [_render_member(expr.field, column, item, params) for item in expr.values]
-    if len(terms) == 1:
-        return terms[0]
-    return "(" + " OR ".join(terms) + ")"
+    assembled = terms[0] if len(terms) == 1 else "(" + " OR ".join(terms) + ")"
+    return _null_safe(assembled, negated)
 
 
 def _render_member(field: FieldLike, column: str, item: MembershipItem, params: list[Any]) -> str:
@@ -343,7 +437,7 @@ def _render_member(field: FieldLike, column: str, item: MembershipItem, params: 
     return f"{column} = {placeholder}"
 
 
-def _render_contains(expr: Contains, params: list[Any]) -> str:
+def _render_contains(expr: Contains, params: list[Any], *, negated: bool) -> str:
     """Render ``field contains needle`` over a VARCHAR (or VARCHAR LIST) column."""
     field = expr.field
     needle = expr.needle
@@ -365,8 +459,83 @@ def _render_contains(expr: Contains, params: list[Any]) -> str:
     column = _column(field)
     params.append(needle)
     if field.multi:
-        return _any_occurrence(column, f"contains({_LAMBDA_VAR}, ?)")
-    return f"contains({column}, ?)"
+        return _null_safe(_any_occurrence(column, f"contains({_LAMBDA_VAR}, ?)"), negated)
+    return _null_safe(f"contains({column}, ?)", negated)
+
+
+def _render_matches(expr: Matches, params: list[Any], *, negated: bool) -> str:
+    """Render ``field matches pattern`` as guarded RE2, on VARCHAR columns only.
+
+    Args:
+        expr: The ``Matches`` node to render.
+        params: Accumulator the pattern is appended to, in placeholder order.
+        negated: True when an enclosing ``Not`` will invert this leaf.
+
+    Returns:
+        The guarded regex test, wrapped in ``coalesce(..., FALSE)`` when negated.
+
+    Raises:
+        UnsupportedSqlExprError: If DuckDB's RE2 engine cannot compile the
+            pattern (see :func:`remora.compile.re2.unportable_reason`).
+        TypeError: If the field is not a string field.
+    """
+    field = expr.field
+    if values.get_info(field.ftype).py_type is not str:
+        raise TypeError(f"matches is only supported on string fields, not {field.ftype}")
+    reason = unportable_reason(expr.pattern)
+    if reason is not None:
+        raise UnsupportedSqlExprError(
+            f"matches pattern {expr.pattern!r} is not compiled to SQL: {reason}. "
+            "Wireshark's PCRE2 and the Python predicate backend both accept it, "
+            "so run this filter on the pcap path (remora.Capture) instead."
+        )
+    column = _column(field)
+    params.append(expr.pattern)
+    if field.multi:
+        return _null_safe(_any_occurrence(column, _guarded_match(_LAMBDA_VAR, column)), negated)
+    return _null_safe(_guarded_match(column, column), negated)
+
+
+def _guarded_match(subject: str, column: str) -> str:
+    """A regex test over ``subject``, refusing text the three engines disagree on.
+
+    Args:
+        subject: The value being matched — the column for a scalar field, and
+            the ``list_filter`` lambda variable for a multi-value one.
+        column: The quoted column name, used only to name the column in the
+            error message.
+
+    Returns:
+        A ``CASE`` expression raising DuckDB ``error()`` on unportable text and
+        running ``regexp_matches`` otherwise. See the module docstring's
+        portable-text section.
+    """
+    message = _sql_text_literal(
+        f"remora: matches on {column} needs pure-ASCII text free of newline "
+        "(chr(10)) and vertical tab (chr(11)) — DuckDB RE2 and Wireshark PCRE2 "
+        "disagree on anything else; run this filter on the pcap path "
+        "(remora.Capture)"
+    )
+    return (
+        f"CASE WHEN strlen({subject}) <> length({subject}) "
+        f"OR contains({subject}, chr(10)) OR contains({subject}, chr(11)) "
+        f"THEN error({message}) "
+        f"ELSE regexp_matches({subject}, ?, 'i') END"
+    )
+
+
+def _sql_text_literal(text: str) -> str:
+    """Single-quote compiler-chosen text for SQL. Never used for user literals.
+
+    Args:
+        text: Text the compiler itself chose — an error message, never anything
+            a caller supplied.
+
+    Returns:
+        The text as a single-quoted SQL literal, with embedded quotes doubled.
+    """
+    escaped = text.replace("'", "''")
+    return f"'{escaped}'"
 
 
 def _quote(name: str) -> str:
@@ -410,3 +579,21 @@ def _needs_nan_guard(ftype: str, op: CompareOp) -> bool:
 def _any_occurrence(column: str, condition: str) -> str:
     """Wrap a per-element condition as an any-occurrence test over a LIST column."""
     return f"len(list_filter({column}, {_LAMBDA_VAR} -> {condition})) > 0"
+
+
+def _null_safe(sql: str, negated: bool) -> str:
+    """Make a NULL-able leaf two-valued when a ``Not`` will invert it.
+
+    Applied at the *leaf*, never at a subtree: ``NOT (NOT (x))`` with a NULL x
+    must be FALSE, and coalescing the inner ``NOT`` would make it TRUE. Applied
+    only under a ``Not``, because ``coalesce`` blocks DuckDB's scan-level filter
+    pushdown and a positive predicate has no NULL divergence to fix.
+
+    Args:
+        sql: The rendered leaf, self-delimiting.
+        negated: True when an enclosing ``Not`` will invert it.
+
+    Returns:
+        The leaf, wrapped in ``coalesce(..., FALSE)`` only when ``negated``.
+    """
+    return f"coalesce({sql}, FALSE)" if negated else sql

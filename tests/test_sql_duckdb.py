@@ -14,6 +14,7 @@ runs in core-only environments).
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator
 from ipaddress import IPv4Address, IPv6Address
 from typing import TYPE_CHECKING, Any
@@ -39,6 +40,8 @@ V6SRC = FieldRef[IPv6Address]("ipv6.src", "FT_IPv6", False)
 V6ADDR = FieldRef[IPv6Address]("ipv6.addr", "FT_IPv6", True)
 DVAL = FieldRef[float]("x.value", "FT_DOUBLE", False)
 DVALS = FieldRef[float]("x.values", "FT_DOUBLE", True)
+PORTS = FieldRef[int]("tcp.port", "FT_UINT16", True)
+QNAME = FieldRef[str]("dns.qry.name", "FT_STRING", True)
 
 NAN = float("nan")
 
@@ -191,9 +194,9 @@ class TestNaNAgainstRealDuckDB:
 
     def test_negated_nan_literal_selects_every_row(self, seeded: DuckDBPyConnection) -> None:
         # NOT (FALSE) — the NaN row and the absent row included. Pinned
-        # deliberately: this is the predicate backend's `not False`, and it is
-        # the one negation that does *not* hit the absent-scalar NULL divergence,
-        # because no column is referenced at all.
+        # deliberately: this is the predicate backend's `not False`, and the
+        # FALSE constant is never coalesced (#36) because a constant is never
+        # NULL; no column is referenced at all.
         assert select(seeded, ~(DVAL == NAN)) == {0, 1, 2}
 
     def test_multi_ordered_comparison_guards_each_element(self, con: DuckDBPyConnection) -> None:
@@ -206,25 +209,129 @@ class TestNaNAgainstRealDuckDB:
         assert select(con, DVALS > 1.0) == {1}
 
 
-#: Cases the SQL backend refuses outright, with the reason it refuses them.
-#: Values are regex-safe fragments for pytest.raises(match=...) assertions.
-SQL_UNSUPPORTED_CASES: dict[str, str] = {
-    "matches-case-insensitive": "RE2",
-    "matches-byte-oriented": "RE2",
-    "matches-multi-value-any-occurrence": "RE2",
-    "not-matches-absent-is-true": "RE2",
-    "contains-bytes": "BLOB",
-}
+class TestBackfilledNullMultiColumn:
+    """A multi column added after older rows back-fills NULL, not [].
 
-#: Cases that compile but select a different row set, because SQL is
-#: three-valued and an absent scalar column is NULL. Issue #29 states this
-#: behavior and explicitly does not harmonize it; each entry names the rows the
-#: SQL backend drops so the divergence is asserted, not waved through.
-SQL_NULL_DIVERGENT_CASES: dict[str, set[int]] = {
-    # Row 2 has no ip.src, so ("ip_src" = ?) is NULL, NOT (NULL) is NULL and the
-    # row is excluded; the predicate backend's `not False` includes it.
-    "nested-not-over-or-conjoined": {0},
-}
+    #26 encodes an absent multi field as [], but ALTER TABLE ... ADD COLUMN
+    back-fills NULL on rows that predate the column. Negation over such a row
+    must still match the predicate backend's "no occurrences".
+    """
+
+    def test_negated_comparison_includes_the_backfilled_row(self, con: DuckDBPyConnection) -> None:
+        spec = column_spec(PORTS.name, PORTS.ftype, PORTS.multi)
+        con.execute('INSERT INTO main.pkts ("frame_number") VALUES (0)')
+        add_field_column(con, spec.column_name, spec.sql_type)
+        con.execute(
+            f'INSERT INTO main.pkts ("frame_number", "{spec.column_name}") VALUES (?, ?)',
+            [1, spec.encode_raw(("443",))],
+        )
+        assert select(con, PORTS == 443) == {1}
+        assert select(con, ~(PORTS == 443)) == {0}
+        assert select(con, PORTS.present()) == {1}
+        assert select(con, ~PORTS.present()) == {0}
+
+
+class TestMatchesAgainstRealDuckDB:
+    """matches executes as RE2, guarded (issue #36)."""
+
+    def test_case_insensitive_like_the_other_backends(self, con: DuckDBPyConnection) -> None:
+        materialize(
+            con,
+            (HOST,),
+            ({"http.host": ("example.com",)}, {"http.host": ("EXAMPLE.COM",)}, {}),
+        )
+        assert select(con, HOST.matches("^ex.*com$")) == {0, 1}
+
+    def test_absent_scalar_does_not_match(self, con: DuckDBPyConnection) -> None:
+        materialize(con, (HOST,), ({"http.host": ("example.com",)}, {}))
+        assert select(con, HOST.matches("com")) == {0}
+
+    def test_negated_matches_includes_the_absent_row(self, con: DuckDBPyConnection) -> None:
+        # The issue's named regression: `matches` on an absent field used to be
+        # refused outright, and negation over a NULL column used to drop the row.
+        materialize(con, (HOST,), ({"http.host": ("example.com",)}, {}))
+        assert select(con, ~HOST.matches("com")) == {1}
+
+    def test_multi_value_any_occurrence(self, con: DuckDBPyConnection) -> None:
+        materialize(
+            con,
+            (QNAME,),
+            (
+                {"dns.qry.name": ("beta.io", "alpha.example")},
+                {"dns.qry.name": ("beta.io", "gamma.net")},
+                {},
+            ),
+        )
+        assert select(con, QNAME.matches("^alpha")) == {0}
+
+    def test_pattern_binds_and_destroys_nothing(self, con: DuckDBPyConnection) -> None:
+        materialize(con, (HOST,), ({"http.host": ("a');x",)}, {"http.host": ("b",)}))
+        assert select(con, HOST.matches("a'\\);x")) == {0}
+        remaining = con.execute("SELECT count(*) FROM main.pkts").fetchone()
+        assert remaining is not None
+        assert remaining[0] == 2
+
+
+class TestPortableTextGuard:
+    """Text the three engines disagree on fails loudly instead of forking."""
+
+    def test_non_ascii_value_raises(self, con: DuckDBPyConnection) -> None:
+        materialize(con, (HOST,), ({"http.host": ("café",)},))
+        with pytest.raises(duckdb.Error, match="pure-ASCII"):
+            select(con, HOST.matches("^.{5}$"))
+
+    def test_newline_value_raises(self, con: DuckDBPyConnection) -> None:
+        materialize(con, (HOST,), ({"http.host": ("abc\n",)},))
+        with pytest.raises(duckdb.Error, match="pure-ASCII"):
+            select(con, HOST.matches("^abc$"))
+
+    def test_vertical_tab_value_raises(self, con: DuckDBPyConnection) -> None:
+        # The fourth divergence mechanism, and the only residual the reviewer's
+        # exhaustive sweep found: RE2's \s is [\t\n\f\r ], while Python re and
+        # PCRE2 also count U+000B. VT is pure ASCII and is not a newline, so it
+        # passes the other two disjuncts — without chr(11) this query silently
+        # returns the wrong row set instead of refusing.
+        materialize(con, (HOST,), ({"http.host": ("a\x0bb",)},))
+        with pytest.raises(duckdb.Error, match="pure-ASCII"):
+            select(con, HOST.matches(r"a\sb"))
+
+    def test_the_vertical_tab_divergence_the_guard_exists_for_is_real(
+        self, con: DuckDBPyConnection
+    ) -> None:
+        # Proven directly against the two engines this file can run, so the
+        # chr(11) disjunct is visibly load-bearing rather than defensive noise.
+        # Wireshark's PCRE2 sides with Python (reproduced on tshark 4.6.7 with
+        # -Y 'http.host matches "a\\sb"'), which is why RE2 is the odd one out.
+        row = con.execute("SELECT regexp_matches(?, ?, 'i')", ["a\x0bb", r"a\sb"]).fetchone()
+        assert row is not None
+        assert row[0] is False
+        assert re.search(rb"a\sb", b"a\x0bb") is not None
+
+    def test_error_message_names_the_column_and_the_pcap_path(
+        self, con: DuckDBPyConnection
+    ) -> None:
+        materialize(con, (HOST,), ({"http.host": ("café",)},))
+        with pytest.raises(duckdb.Error, match="http_host"):
+            select(con, HOST.matches("x"))
+        with pytest.raises(duckdb.Error, match="Capture"):
+            select(con, HOST.matches("x"))
+
+    def test_ascii_rows_beside_a_null_row_are_fine(self, con: DuckDBPyConnection) -> None:
+        materialize(con, (HOST,), ({"http.host": ("abc",)}, {}))
+        assert select(con, HOST.matches("^abc$")) == {0}
+
+    def test_multi_value_guard_fires_per_occurrence(self, con: DuckDBPyConnection) -> None:
+        materialize(con, (QNAME,), ({"dns.qry.name": ("ok", "café")},))
+        with pytest.raises(duckdb.Error, match="pure-ASCII"):
+            select(con, QNAME.matches("ok"))
+
+    def test_the_divergence_the_guard_exists_for_is_real(self, con: DuckDBPyConnection) -> None:
+        # Documented, not fixed: RE2 counts runes. Proven directly, so the guard
+        # is visibly load-bearing rather than defensive noise.
+        row = con.execute("SELECT regexp_matches('café', '^.{5}$')").fetchone()
+        assert row is not None
+        assert row[0] is False
+        assert re.search(b"^.{5}$", "café".encode()) is not None
 
 
 def seed_case(connection: DuckDBPyConnection, case: Case) -> None:
@@ -257,40 +364,40 @@ def _case_id(case: Case) -> str:
 
 
 @pytest.mark.parametrize("case", CASES, ids=_case_id)
-def test_sql_backend_matches_the_predicate_backend(con: DuckDBPyConnection, case: Case) -> None:
-    """Acceptance criterion 5: identical row sets for every covered operator.
+def test_sql_backend_matches_the_other_two(con: DuckDBPyConnection, case: Case) -> None:
+    """One table, three backends, one row set (issue #36).
 
-    ONE table, three backends. The rows are seeded through the real
-    materialization codecs, so an absent scalar lands as NULL and an absent
-    multi-value field as [] — the shapes the SQL backend's semantics are stated
-    against.
+    Rows are seeded through the real materialization codecs, so an absent scalar
+    lands as NULL and an absent multi-value field as []. A backend is allowed to
+    differ from the shared expectation only by refusing to compile
+    (``sql_refusal``) or by raising the portable-text guard
+    (``sql_guard_rows``) — never by returning a different row set.
     """
-    reason = SQL_UNSUPPORTED_CASES.get(case.id)
-    if reason is not None:
-        with pytest.raises(UnsupportedSqlExprError, match=reason):
+    if case.sql_refusal is not None:
+        with pytest.raises(UnsupportedSqlExprError, match=case.sql_refusal):
             compile_sql(case.expr)
         return
     seed_case(con, case)
+    if case.sql_guard_rows:
+        with pytest.raises(duckdb.Error, match="pure-ASCII"):
+            select(con, case.expr)
+        return
     expected = {index for index, (_packet, hit) in enumerate(case.rows) if hit}
-    divergent = SQL_NULL_DIVERGENT_CASES.get(case.id)
-    assert select(con, case.expr) == (expected if divergent is None else divergent)
+    assert select(con, case.expr) == expected
 
 
-def test_coverage_maps_name_real_cases() -> None:
-    """Neither coverage map may carry an id the shared table no longer has."""
-    ids = {case.id for case in CASES}
-    assert set(SQL_UNSUPPORTED_CASES) <= ids
-    assert set(SQL_NULL_DIVERGENT_CASES) <= ids
-    assert not (set(SQL_UNSUPPORTED_CASES) & set(SQL_NULL_DIVERGENT_CASES))
+def test_no_case_carries_both_escape_hatches() -> None:
+    """A case is refused, or guarded, or compared — never two of the three."""
+    for case in CASES:
+        assert not (case.sql_refusal is not None and case.sql_guard_rows), case.id
 
 
-def test_divergent_cases_really_do_diverge() -> None:
-    """A divergent entry that has stopped diverging must be deleted, not kept.
+def test_escape_hatches_are_still_needed() -> None:
+    """A hatch that has stopped being needed must be deleted, not kept.
 
-    Otherwise the map would quietly assert a wrong row set forever.
+    Otherwise the table would quietly exempt a case that now agrees.
     """
-    by_id = {case.id: case for case in CASES}
-    for case_id, rows in SQL_NULL_DIVERGENT_CASES.items():
-        case = by_id[case_id]
-        expected = {index for index, (_packet, hit) in enumerate(case.rows) if hit}
-        assert rows != expected, f"{case_id} no longer diverges; drop it from the map"
+    for case in CASES:
+        if case.sql_refusal is not None:
+            with pytest.raises(UnsupportedSqlExprError):
+                compile_sql(case.expr)

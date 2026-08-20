@@ -8,11 +8,12 @@ numbers. It is a spot check by design: the exhaustive operator matrix is the M4
 integration-test issue's job, and the operator-level semantics are already
 pinned backend-to-backend in ``tests/test_sql_duckdb.py``.
 
-One divergence is asserted rather than papered over: SQL is three-valued, so a
-negated comparison on a scalar column excludes rows where the field is absent,
-which Wireshark and the Python predicate backend include. Issue #29 states that
-and explicitly does not harmonize it; the test below pins it so it stays a known
-trade-off.
+One divergence used to be asserted rather than papered over: SQL is three-valued,
+so a negated comparison on a scalar column excluded rows where the field is
+absent, which Wireshark and the Python predicate backend include. Issue #29
+stated that and explicitly did not harmonize it; issue #36 removed it by making
+every NULL-able leaf beneath a ``Not`` two-valued with ``coalesce(..., FALSE)``,
+so this suite now asserts equality there too.
 """
 
 from __future__ import annotations
@@ -76,6 +77,7 @@ TCP_MIXED_CASES: list[tuple[str, Expr]] = [
     ("membership", TCP.port.in_([443, 8080])),
     ("ordered comparison", TCP.port < 1024),
     ("no match", IP.src == "192.168.99.99"),
+    ("negated scalar equality", ~(IP.src == "10.0.0.1")),
 ]
 
 
@@ -142,16 +144,17 @@ def test_multi_occurrence_field_parity(tmp_path: Path) -> None:
         assert row.get_all(DNS.qry_name) == ("alpha.example", "beta.example")
 
 
-def test_negation_over_an_absent_scalar_diverges_as_documented(
+def test_negation_over_an_absent_scalar_matches_the_pcap_path(
     tcp_mixed_workspace: Path,
 ) -> None:
     # Frame 5 is ARP: no ip.src at all. Wireshark evaluates `ip.src == x` as
-    # false and negates it to true; SQL evaluates `"ip_src" = ?` as NULL and
-    # `NOT (NULL)` as NULL, so the row is excluded. Stated in #29, not fixed.
+    # false and negates it to true. SQL used to evaluate `"ip_src" = ?` as NULL
+    # and drop the row (#29 stated that); #36 harmonizes it with a coalesce on
+    # leaves beneath a Not, so the two paths now agree. This is the issue's
+    # named regression test.
     expr = ~(IP.src == "10.0.0.1")
     from_pcap = capture_frames(TCP_MIXED, expr)
     with Workspace(tcp_mixed_workspace) as ws:
         from_cache = query_frames(ws.query().filter(expr))
     assert 5 in from_pcap
-    assert 5 not in from_cache
-    assert from_pcap - from_cache == {5}
+    assert from_cache == from_pcap

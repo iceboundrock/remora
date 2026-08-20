@@ -268,10 +268,26 @@ class TestFilterExecution:
             assert frames(workspace.query().filter(HOST == "'; DROP TABLE pkts; --")) == [1]
             assert frames(workspace.query()) == [1, 2]
 
-    def test_unsupported_expression_propagates_unchanged(self, ws: Workspace) -> None:
-        # Documented refusal of the SQL backend (#29), not a Query concern.
-        with pytest.raises(UnsupportedSqlExprError, match="RE2"):
-            list(ws.query().filter(IP.src.matches("^10")))
+    def test_unsupported_expression_propagates_unchanged(self, tmp_path: Path) -> None:
+        # Documented refusal of the SQL backend (#29/#36), not a Query concern:
+        # `matches` itself compiles now, but a lookaround is a pattern DuckDB's
+        # RE2 engine has no operator for.
+        with Workspace(tmp_path / "re2.duckdb", mode="rw") as workspace:
+            seed(workspace, (HOST,), ({"http.host": ("example.com",)},))
+            with pytest.raises(UnsupportedSqlExprError, match="RE2"):
+                list(workspace.query().filter(HOST.matches("a(?=b)")))
+
+    def test_matches_runs_through_the_query_path(self, tmp_path: Path) -> None:
+        # The other half of #36: a portable pattern on ASCII text compiles and
+        # executes, so a workspace query answers `matches` at all.
+        with Workspace(tmp_path / "matches.duckdb", mode="rw") as workspace:
+            seed(
+                workspace,
+                (HOST,),
+                ({"http.host": ("EXAMPLE.COM",)}, {"http.host": ("other.org",)}, {}),
+            )
+            assert frames(workspace.query().filter(HOST.matches("^ex.*com$"))) == [1]
+            assert frames(workspace.query().filter(~HOST.matches("com"))) == [2, 3]
 
 
 class TestSql:
