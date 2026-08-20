@@ -39,6 +39,7 @@ V6SRC = FieldRef[IPv6Address]("ipv6.src", "FT_IPv6", False)
 V6ADDR = FieldRef[IPv6Address]("ipv6.addr", "FT_IPv6", True)
 DVAL = FieldRef[float]("x.value", "FT_DOUBLE", False)
 DVALS = FieldRef[float]("x.values", "FT_DOUBLE", True)
+PORTS = FieldRef[int]("tcp.port", "FT_UINT16", True)
 
 NAN = float("nan")
 
@@ -191,9 +192,9 @@ class TestNaNAgainstRealDuckDB:
 
     def test_negated_nan_literal_selects_every_row(self, seeded: DuckDBPyConnection) -> None:
         # NOT (FALSE) — the NaN row and the absent row included. Pinned
-        # deliberately: this is the predicate backend's `not False`, and it is
-        # the one negation that does *not* hit the absent-scalar NULL divergence,
-        # because no column is referenced at all.
+        # deliberately: this is the predicate backend's `not False`, and the
+        # FALSE constant is never coalesced (#36) because a constant is never
+        # NULL; no column is referenced at all.
         assert select(seeded, ~(DVAL == NAN)) == {0, 1, 2}
 
     def test_multi_ordered_comparison_guards_each_element(self, con: DuckDBPyConnection) -> None:
@@ -206,6 +207,28 @@ class TestNaNAgainstRealDuckDB:
         assert select(con, DVALS > 1.0) == {1}
 
 
+class TestBackfilledNullMultiColumn:
+    """A multi column added after older rows back-fills NULL, not [].
+
+    #26 encodes an absent multi field as [], but ALTER TABLE ... ADD COLUMN
+    back-fills NULL on rows that predate the column. Negation over such a row
+    must still match the predicate backend's "no occurrences".
+    """
+
+    def test_negated_comparison_includes_the_backfilled_row(self, con: DuckDBPyConnection) -> None:
+        spec = column_spec(PORTS.name, PORTS.ftype, PORTS.multi)
+        con.execute('INSERT INTO main.pkts ("frame_number") VALUES (0)')
+        add_field_column(con, spec.column_name, spec.sql_type)
+        con.execute(
+            f'INSERT INTO main.pkts ("frame_number", "{spec.column_name}") VALUES (?, ?)',
+            [1, spec.encode_raw(("443",))],
+        )
+        assert select(con, PORTS == 443) == {1}
+        assert select(con, ~(PORTS == 443)) == {0}
+        assert select(con, PORTS.present()) == {1}
+        assert select(con, ~PORTS.present()) == {0}
+
+
 #: Cases the SQL backend refuses outright, with the reason it refuses them.
 #: Values are regex-safe fragments for pytest.raises(match=...) assertions.
 SQL_UNSUPPORTED_CASES: dict[str, str] = {
@@ -214,16 +237,6 @@ SQL_UNSUPPORTED_CASES: dict[str, str] = {
     "matches-multi-value-any-occurrence": "RE2",
     "not-matches-absent-is-true": "RE2",
     "contains-bytes": "BLOB",
-}
-
-#: Cases that compile but select a different row set, because SQL is
-#: three-valued and an absent scalar column is NULL. Issue #29 states this
-#: behavior and explicitly does not harmonize it; each entry names the rows the
-#: SQL backend drops so the divergence is asserted, not waved through.
-SQL_NULL_DIVERGENT_CASES: dict[str, set[int]] = {
-    # Row 2 has no ip.src, so ("ip_src" = ?) is NULL, NOT (NULL) is NULL and the
-    # row is excluded; the predicate backend's `not False` includes it.
-    "nested-not-over-or-conjoined": {0},
 }
 
 
@@ -272,25 +285,10 @@ def test_sql_backend_matches_the_predicate_backend(con: DuckDBPyConnection, case
         return
     seed_case(con, case)
     expected = {index for index, (_packet, hit) in enumerate(case.rows) if hit}
-    divergent = SQL_NULL_DIVERGENT_CASES.get(case.id)
-    assert select(con, case.expr) == (expected if divergent is None else divergent)
+    assert select(con, case.expr) == expected
 
 
 def test_coverage_maps_name_real_cases() -> None:
-    """Neither coverage map may carry an id the shared table no longer has."""
+    """The coverage map may not carry an id the shared table no longer has."""
     ids = {case.id for case in CASES}
     assert set(SQL_UNSUPPORTED_CASES) <= ids
-    assert set(SQL_NULL_DIVERGENT_CASES) <= ids
-    assert not (set(SQL_UNSUPPORTED_CASES) & set(SQL_NULL_DIVERGENT_CASES))
-
-
-def test_divergent_cases_really_do_diverge() -> None:
-    """A divergent entry that has stopped diverging must be deleted, not kept.
-
-    Otherwise the map would quietly assert a wrong row set forever.
-    """
-    by_id = {case.id: case for case in CASES}
-    for case_id, rows in SQL_NULL_DIVERGENT_CASES.items():
-        case = by_id[case_id]
-        expected = {index for index, (_packet, hit) in enumerate(case.rows) if hit}
-        assert rows != expected, f"{case_id} no longer diverges; drop it from the map"

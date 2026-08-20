@@ -102,13 +102,13 @@ class TestNegationAndConnectives:
     def test_ne_on_a_multi_field_is_not_list_contains(self) -> None:
         # Acceptance criterion 2: never SQL <> on a list column.
         result = compile_sql(PORT != 443)
-        assert result == SqlPredicate('NOT (list_contains("tcp_port", ?))', (443,))
+        assert result == SqlPredicate('NOT (coalesce(list_contains("tcp_port", ?), FALSE))', (443,))
         assert "<>" not in result.sql
         assert "!=" not in result.sql
 
     def test_ne_on_a_scalar_field_is_not_eq(self) -> None:
         result = compile_sql(SRC != "10.0.0.1")
-        assert result.sql == 'NOT ("ip_src" = ?)'
+        assert result.sql == 'NOT (coalesce("ip_src" = ?, FALSE))'
         assert "<>" not in result.sql
 
     def test_and_or_nest_with_parentheses_and_ordered_params(self) -> None:
@@ -145,13 +145,13 @@ class TestPresence:
         assert compile_sql(QNAME.present()).sql == 'len(coalesce("dns_qry_name", [])) > 0'
 
     def test_negated_presence_is_null_safe(self) -> None:
-        # IS NOT NULL never yields NULL, so NOT of it selects the absent rows —
-        # the one place the SQL backend matches the predicate backend on absence.
+        # IS NOT NULL never yields NULL, so NOT of it selects the absent rows
+        # unaided — no #36 coalesce is added, and none is needed.
         assert compile_sql(~SRC.present()).sql == 'NOT ("ip_src" IS NOT NULL)'
 
     def test_negated_multi_presence_is_null_safe(self) -> None:
         # coalesce(..., []) treats a back-filled NULL column as absent, so
-        # NOT of that is false (not NULL) — the other exception to the three-valued logic.
+        # NOT of that is false (not NULL) — already two-valued before #36.
         assert compile_sql(~PORT.present()).sql == 'NOT (len(coalesce("tcp_port", [])) > 0)'
 
 
@@ -181,7 +181,7 @@ class TestMembership:
     def test_not_in_is_not_of_the_whole_set(self) -> None:
         result = compile_sql(~PORT.in_([80, 443]))
         assert result.sql == (
-            'NOT ((list_contains("tcp_port", ?) OR list_contains("tcp_port", ?)))'
+            'NOT (coalesce((list_contains("tcp_port", ?) OR list_contains("tcp_port", ?)), FALSE))'
         )
         assert result.params == (80, 443)
 
@@ -240,7 +240,7 @@ class TestContains:
 
     def test_contains_composes_with_interleaved_params(self) -> None:
         result = compile_sql((TTL < 64) & ~HOST.contains("evil"))
-        assert result.sql == '("ip_ttl" < ? AND NOT (contains("http_host", ?)))'
+        assert result.sql == '("ip_ttl" < ? AND NOT (coalesce(contains("http_host", ?), FALSE)))'
         assert result.params == (64, "evil")
 
 
@@ -335,6 +335,71 @@ class TestNaN:
         result = compile_sql(DVAL > INF)
         assert result.sql == '("x_value" > ? AND NOT isnan("x_value"))'
         assert result.params == (INF,)
+
+
+class TestNullHarmonization:
+    """Issue #36: negation over an absent field matches the other backends.
+
+    A leaf beneath a Not is made two-valued with coalesce(..., FALSE), which is
+    what collapses SQL's Kleene logic onto the predicate backend's booleans. A
+    leaf that is NOT beneath a Not keeps its bare form, so DuckDB can still push
+    it into the scan as a zone-map filter.
+    """
+
+    def test_positive_leaf_keeps_its_pushdownable_form(self) -> None:
+        assert compile_sql(SRC == "10.0.0.1").sql == '"ip_src" = ?'
+        assert compile_sql(TTL < 64).sql == '"ip_ttl" < ?'
+
+    def test_positive_leaf_inside_and_or_is_not_wrapped(self) -> None:
+        assert compile_sql((SRC == "10.0.0.1") & (TTL < 64)).sql == (
+            '("ip_src" = ? AND "ip_ttl" < ?)'
+        )
+
+    def test_wrapping_reaches_every_leaf_under_a_not(self) -> None:
+        result = compile_sql(~((SRC == "10.0.0.1") | (PORT == 443)))
+        assert result.sql == (
+            'NOT ((coalesce("ip_src" = ?, FALSE) OR coalesce(list_contains("tcp_port", ?), FALSE)))'
+        )
+
+    def test_and_below_a_not_wraps_both_sides(self) -> None:
+        result = compile_sql(~((SRC == "10.0.0.1") & (TTL < 64)))
+        assert result.sql == (
+            'NOT ((coalesce("ip_src" = ?, FALSE) AND coalesce("ip_ttl" < ?, FALSE)))'
+        )
+
+    def test_double_negation_wraps_at_the_leaf_not_the_subtree(self) -> None:
+        # Subtree-level coalescing is WRONG here: NOT(coalesce(NOT(NULL), FALSE))
+        # is TRUE where Python's `not not False` is False.
+        assert compile_sql(~~(SRC == "10.0.0.1")).sql == (
+            'NOT (NOT (coalesce("ip_src" = ?, FALSE)))'
+        )
+
+    def test_a_not_only_wraps_its_own_subtree(self) -> None:
+        result = compile_sql((~(SRC == "10.0.0.1")) & (TTL < 64))
+        assert result.sql == '(NOT (coalesce("ip_src" = ?, FALSE)) AND "ip_ttl" < ?)'
+
+    def test_presence_is_never_wrapped(self) -> None:
+        # IS NOT NULL / len(coalesce(..., [])) never yield NULL.
+        assert compile_sql(~SRC.present()).sql == 'NOT ("ip_src" IS NOT NULL)'
+        assert compile_sql(~PORT.present()).sql == 'NOT (len(coalesce("tcp_port", [])) > 0)'
+
+    def test_the_nan_false_constant_is_never_wrapped(self) -> None:
+        assert compile_sql(~(DVAL == NAN)).sql == "NOT (FALSE)"
+
+    def test_contains_under_a_not_is_wrapped(self) -> None:
+        assert compile_sql(~HOST.contains("evil")).sql == (
+            'NOT (coalesce(contains("http_host", ?), FALSE))'
+        )
+
+    def test_guarded_comparison_under_a_not_is_wrapped_whole(self) -> None:
+        assert compile_sql(~(DVAL > 1.0)).sql == (
+            'NOT (coalesce(("x_value" > ? AND NOT isnan("x_value")), FALSE))'
+        )
+
+    def test_range_under_a_not_is_wrapped(self) -> None:
+        assert compile_sql(~TTL.in_([(1, 64)])).sql == (
+            'NOT (coalesce("ip_ttl" BETWEEN ? AND ?, FALSE))'
+        )
 
 
 class TestMatches:

@@ -73,16 +73,16 @@ They are statements about the backend, not about the workspace.
 Where this does *not* match the pcap path
 -----------------------------------------
 The two surfaces answer the same question for the operators #29 harmonizes, and
-``tests/integration/test_query_parity.py`` compares them filter by filter. One
-exception is deliberate and inherited, not introduced here: SQL is three-valued,
-so a **negated comparison on a scalar column** — ``~(IP.src == v)``, which is
-how the DSL spells ``!=`` — compiles to ``NOT ("ip_src" = ?)``, which is
-``NULL`` and therefore *false* for a packet that has no ``ip.src`` at all, where
-Wireshark and the Python predicate backend both include that packet. Multi-value
-columns do **not** diverge: an absent one is stored as ``[]``, not ``NULL``, so
-``NOT (list_contains(...))`` is a real boolean. Issue #29 states this policy and
-explicitly does not harmonize it; the parity suite pins the divergent case so it
-stays visible.
+``tests/integration/test_query_parity.py`` compares them filter by filter. The
+one inherited exception — a **negated comparison on a scalar column**,
+``~(IP.src == v)``, which is how the DSL spells ``!=`` — is **gone since #36**:
+SQL is three-valued, so ``NOT ("ip_src" = ?)`` used to be ``NULL`` and therefore
+*false* for a packet with no ``ip.src`` at all, where Wireshark and the Python
+predicate backend both include that packet. The SQL backend now makes every
+NULL-able leaf beneath a ``Not`` two-valued with ``coalesce(..., FALSE)``, so
+the row sets agree; the parity suite asserts the equality as a regression test.
+Multi-value columns never diverged: an absent one is stored as ``[]``, not
+``NULL``, so ``NOT (list_contains(...))`` was already a real boolean.
 
 Row access
 ----------
