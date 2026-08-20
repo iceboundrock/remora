@@ -31,8 +31,8 @@ What RE2 refuses, measured against duckdb 1.5.5:
   to each bounded count *and* to the product of bounded counts along a nesting
   path: ``(?:a{31}){31}`` (961) compiles, ``(?:a{32}){32}`` (1024) does not, and
   ``(?:a{500}){3}`` (1500) does not. For ``{m,}`` (unbounded max), RE2 uses ``m``
-  as the factor; only ``*`` and ``+`` (min ≤ 1) contribute factor 1, and ``{0}``
-  or ``{0,}`` contribute factor 1.
+  as the factor; only ``*``, ``+``, and ``?`` contribute no factor, while ``{0}``
+  and ``{0,}`` contribute factor 1.
 
 Everything else the ``Expr`` subset admits -- ASCII literals, ``.``, anchors,
 alternation, groups, character classes, the shared escapes, ``\xHH`` -- RE2

@@ -117,7 +117,7 @@ count and to the **product of the factors along a nesting path**: `(?:a{31}){31}
 not. RE2 divides its budget by a repeat's *max*, falling back to the min when the
 max is unbounded, so `{m,}` contributes a factor of `m` — `(?:a{500,}){3}` is
 refused exactly like `(?:a{500}){3}`. `{0}` and `{0,}` contribute a factor of 1
-and never zero the product; only `*` and `+` contribute no factor at all.
+and never zero the product; only `*`, `+`, and `?` contribute no factor at all.
 
 The layering is deliberate: PCRE2 and Python `re` run lookarounds and large
 repeats identically, and a caller who never opens a workspace should not lose
