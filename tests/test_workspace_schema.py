@@ -24,6 +24,7 @@ from remora.workspace.schema import (
     find_duplicate_row_keys,
     iter_ddl,
     iter_scratch_ddl,
+    qualify,
     read_cache_key,
     read_fields,
     read_pkts_columns,
@@ -450,6 +451,84 @@ class TestSchemaVersion:
 
 
 UTC_NOW = datetime(2026, 8, 8, 12, 30, 45, 123456, tzinfo=timezone.utc)
+
+
+class TestAliasScopedCatalogReads:
+    """The three catalog readers can be pointed at an ATTACHed database (#37)."""
+
+    @staticmethod
+    def _peer(tmp_path: Path, name: str = "peer.duckdb", version: str | None = None) -> Path:
+        path = tmp_path / name
+        peer = duckdb.connect(str(path))
+        try:
+            create_schema(peer)
+            register_fields(
+                peer,
+                [
+                    FieldRecord(
+                        abbrev="ip.dst",
+                        column_name="ip_dst",
+                        ftype="FT_IPv4",
+                        multi=False,
+                        column_type="UINTEGER",
+                        materialized_at=UTC_NOW,
+                    )
+                ],
+            )
+            if version is not None:
+                peer.execute(
+                    "UPDATE meta.info SET value = ? WHERE key = 'schema_version'", [version]
+                )
+        finally:
+            peer.close()
+        return path
+
+    def test_qualify(self) -> None:
+        assert qualify(None, "meta.info") == "meta.info"
+        assert qualify("peer", "meta.info") == '"peer".meta.info'
+        assert qualify('we"ird', "main.pkts") == '"we""ird".main.pkts'
+
+    def test_version_reads_from_the_alias(self, con: DuckDBPyConnection, tmp_path: Path) -> None:
+        con.execute(f"ATTACH '{self._peer(tmp_path)}' AS peer (READ_ONLY)")
+        assert read_schema_version(con, database="peer") == SCHEMA_VERSION
+        check_compatible(con, database="peer")
+
+    def test_version_of_the_alias_is_not_the_current_database(
+        self, con: DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        stale = self._peer(tmp_path, "stale.duckdb", version="1")
+        con.execute(f"ATTACH '{stale}' AS old (READ_ONLY)")
+        # The current database is still fine ...
+        check_compatible(con)
+        # ... and the alias is refused by name of both versions.
+        with pytest.raises(SchemaVersionError, match="older remora") as excinfo:
+            check_compatible(con, database="old")
+        assert "1" in str(excinfo.value)
+        assert str(SCHEMA_VERSION) in str(excinfo.value)
+
+    def test_alias_without_a_meta_catalog_is_not_a_workspace(
+        self, con: DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        blank = tmp_path / "blank.duckdb"
+        other = duckdb.connect(str(blank))
+        other.execute("SELECT 1")
+        other.close()
+        con.execute(f"ATTACH '{blank}' AS blank (READ_ONLY)")
+        with pytest.raises(SchemaVersionError, match="not a remora workspace"):
+            read_schema_version(con, database="blank")
+
+    def test_unknown_alias_is_not_a_workspace(self, con: DuckDBPyConnection) -> None:
+        with pytest.raises(SchemaVersionError, match="not a remora workspace"):
+            read_schema_version(con, database="nosuchalias")
+
+    def test_fields_read_from_the_alias(self, con: DuckDBPyConnection, tmp_path: Path) -> None:
+        register_fields(con, sample_fields())
+        con.execute(f"ATTACH '{self._peer(tmp_path)}' AS peer (READ_ONLY)")
+        assert [record.abbrev for record in read_fields(con, database="peer")] == ["ip.dst"]
+        # The primary's registry is untouched by the alias-scoped read.
+        assert [record.abbrev for record in read_fields(con)] == [
+            record.abbrev for record in sorted(sample_fields(), key=lambda r: r.abbrev)
+        ]
 
 
 def sample_fields() -> tuple[FieldRecord, ...]:
