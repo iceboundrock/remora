@@ -338,3 +338,21 @@ class TestCompactIsUnaffectedByAttachments:
                     "SELECT count(*) FROM duckdb_tables() WHERE database_name = current_database()"
                 ).fetchone()
                 assert names == (6,)
+
+
+class TestPackageExports:
+    def test_new_names_are_exported(self) -> None:
+        import remora.workspace as pkg
+
+        for name in (
+            "Attachment",
+            "WorkspaceAliasError",
+            "apply_attachments",
+            "attach_database",
+            "attached_databases",
+            "detach_database",
+            "qualify",
+            "validate_alias",
+        ):
+            assert name in pkg.__all__, name
+            assert getattr(pkg, name) is not None

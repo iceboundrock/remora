@@ -8,7 +8,8 @@ type map (:mod:`remora.workspace.types`), the cache-key computation
 (:mod:`remora.workspace.materialize`), stream sessionization
 (:mod:`remora.workspace.streams`), the analyst-annotation API
 (:mod:`remora.workspace.annotations`), the cache-side query surface
-(:mod:`remora.workspace.query`), and the Parquet export
+(:mod:`remora.workspace.query`), cross-capture correlation and aliasing
+(:mod:`remora.workspace.attach`), and the Parquet export
 (:mod:`remora.workspace.export`); connection and lock ownership lives in
 :mod:`remora.workspace.workspace`'s ``Workspace`` class (#28).
 
@@ -31,6 +32,15 @@ from remora.workspace.annotations import (
     remove_annotation,
     remove_annotations,
 )
+from remora.workspace.attach import (
+    RESERVED_ALIASES,
+    Attachment,
+    apply_attachments,
+    attach_database,
+    attached_databases,
+    detach_database,
+    validate_alias,
+)
 from remora.workspace.cachekey import (
     CACHE_KEY_VERSION,
     FINGERPRINT_VERSION,
@@ -46,6 +56,7 @@ from remora.workspace.errors import (
     MaterializationMismatchError,
     MissingStreamFieldsError,
     SchemaVersionError,
+    WorkspaceAliasError,
     WorkspaceError,
     WorkspaceModeError,
 )
@@ -74,6 +85,7 @@ from remora.workspace.schema import (
     delete_cache_key,
     find_covering_cache_key,
     iter_ddl,
+    qualify,
     read_cache_key,
     read_cache_keys,
     read_fields,
@@ -107,6 +119,7 @@ __all__ = [
     "FINGERPRINT_VERSION",
     "PROBE_BYTES",
     "REQUIRED_FIELDS",
+    "RESERVED_ALIASES",
     "SCHEMA_VERSION",
     "SKELETON_ABBREVS",
     "SKELETON_COLUMNS",
@@ -114,6 +127,7 @@ __all__ = [
     "TEXT_EXPORTED_TYPES",
     "AnnotationRecord",
     "AnnotationScope",
+    "Attachment",
     "CacheKeyRecord",
     "ColumnNameCollisionError",
     "ColumnSpec",
@@ -132,10 +146,14 @@ __all__ = [
     "StreamsResult",
     "TsharkRunner",
     "Workspace",
+    "WorkspaceAliasError",
     "WorkspaceError",
     "WorkspaceModeError",
     "add_annotation",
     "add_field_column",
+    "apply_attachments",
+    "attach_database",
+    "attached_databases",
     "build_streams",
     "check_compatible",
     "column_name",
@@ -144,6 +162,7 @@ __all__ = [
     "create_schema",
     "delete_cache_key",
     "delete_orphan_annotations",
+    "detach_database",
     "detect_tshark_version",
     "export_parquet",
     "find_collisions",
@@ -155,6 +174,7 @@ __all__ = [
     "list_annotations",
     "make_cache_key",
     "materialize_into",
+    "qualify",
     "read_cache_key",
     "read_cache_keys",
     "read_fields",
@@ -164,4 +184,5 @@ __all__ = [
     "remove_annotation",
     "remove_annotations",
     "to_db_timestamp",
+    "validate_alias",
 ]
