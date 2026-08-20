@@ -11,21 +11,27 @@ from typing import TYPE_CHECKING
 import pytest
 
 from remora.workspace.errors import SchemaVersionError, WorkspaceError
-from remora.workspace.naming import column_name
+from remora.workspace.naming import SKELETON_COLUMNS, column_name
 from remora.workspace.schema import (
     SCHEMA_VERSION,
+    SKELETON_COLUMN_TYPES,
     CacheKeyRecord,
     FieldRecord,
     add_field_column,
     check_compatible,
+    create_backfill_scan,
     create_schema,
+    find_duplicate_row_keys,
     iter_ddl,
+    iter_scratch_ddl,
     read_cache_key,
     read_fields,
+    read_pkts_columns,
     read_schema_version,
     record_cache_key,
     register_fields,
 )
+from remora.workspace.types import COLUMN_TYPES, column_sql_type
 
 if TYPE_CHECKING:
     from duckdb import DuckDBPyConnection
@@ -35,15 +41,23 @@ duckdb = pytest.importorskip("duckdb")
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_MODULE = REPO_ROOT / "src" / "remora" / "workspace" / "schema.py"
 
-# Matches a DDL statement head. "\s+" is a literal backslash-s in this source,
-# so this pattern does not match its own definition.
-DDL_STATEMENT = re.compile(r"CREATE\s+(?:TABLE|SCHEMA|VIEW|INDEX)\b", re.IGNORECASE)
+# Matches a DDL statement head, through every spelling of the modifiers that
+# sit between CREATE and the object kind. TEMP is included deliberately: a
+# temporary table never reaches the workspace file, but it is still DDL and
+# still has to be declared in schema.py rather than built inline wherever it
+# is convenient (#32's backfill staging table is the first one). "\s+" is a
+# literal backslash-s in this source, so this pattern does not match its own
+# definition.
+_DDL_MODIFIERS = r"(?:OR\s+REPLACE\s+)?(?:TEMP(?:ORARY)?\s+)?"
+DDL_STATEMENT = re.compile(
+    rf"CREATE\s+{_DDL_MODIFIERS}(?:TABLE|SCHEMA|VIEW|INDEX)\b", re.IGNORECASE
+)
 
-# The same head plus the name it creates, through the "OR REPLACE" and
-# "IF NOT EXISTS" spellings that appear in _DDL. Self-matching is avoided the
-# same way DDL_STATEMENT avoids it.
+# The same head plus the name it creates, through the "OR REPLACE", "TEMP" and
+# "IF NOT EXISTS" spellings. Self-matching is avoided the same way
+# DDL_STATEMENT avoids it.
 DDL_TARGET = re.compile(
-    r"CREATE\s+(?:OR\s+REPLACE\s+)?(?:TABLE|SCHEMA|VIEW|INDEX)\s+"
+    rf"CREATE\s+{_DDL_MODIFIERS}(?:TABLE|SCHEMA|VIEW|INDEX)\s+"
     r"(?:IF\s+NOT\s+EXISTS\s+)?([\w.\"]+)",
     re.IGNORECASE,
 )
@@ -131,6 +145,15 @@ def table_names(connection: DuckDBPyConnection) -> set[tuple[str, str]]:
     return {(schema, table) for schema, table in rows}
 
 
+def database_table_names(connection: DuckDBPyConnection) -> set[tuple[str, str]]:
+    """Tables of the current database only — temp objects excluded."""
+    rows = connection.execute(
+        "SELECT schema_name, table_name FROM duckdb_tables() "
+        "WHERE database_name = current_database()"
+    ).fetchall()
+    return {(schema, table) for schema, table in rows}
+
+
 def column_names(connection: DuckDBPyConnection, schema: str, table: str) -> list[str]:
     rows = connection.execute(
         "SELECT column_name FROM duckdb_columns() "
@@ -172,12 +195,127 @@ class TestCreateSchema:
         }
         assert offenders == {}
 
-    def test_schema_module_keeps_all_ddl_in_the_constant(self) -> None:
-        # Within schema.py, every DDL statement belongs to iter_ddl() — none is
-        # built inline by a helper (the risk when #31 adds add_field_column).
+    def test_schema_module_keeps_all_ddl_in_its_constants(self) -> None:
+        # Within schema.py, every DDL statement belongs to one of the two
+        # declared constants — none is built inline by a helper (the risk when
+        # #31 added add_field_column, and again when #32 added the backfill
+        # staging table). iter_scratch_ddl() is counted alongside iter_ddl()
+        # rather than exempted: it is DDL this module owns, held to the same
+        # "declared, never assembled" rule, and merely excluded from the
+        # *layout* because it never reaches the file.
         in_source = len(DDL_STATEMENT.findall(SCHEMA_MODULE.read_text(encoding="utf-8")))
-        in_constant = sum(len(DDL_STATEMENT.findall(statement)) for statement in iter_ddl())
-        assert in_source == in_constant > 0
+        declared = (*iter_ddl(), *iter_scratch_ddl())
+        in_constants = sum(len(DDL_STATEMENT.findall(statement)) for statement in declared)
+        assert in_source == in_constants > 0
+
+    def test_scratch_ddl_is_temporary_and_owns_no_layout_name(self) -> None:
+        # What keeps scratch DDL from being a hole in the layout rule: every
+        # statement is TEMP (so it dies with the connection and never lands in
+        # the workspace file) and creates nothing the layout names.
+        assert iter_scratch_ddl()
+        for statement in iter_scratch_ddl():
+            assert re.search(r"CREATE\s+(?:OR\s+REPLACE\s+)?TEMP\b", statement, re.IGNORECASE)
+            assert workspace_names_created_in(statement) == set()
+
+    def test_skeleton_column_types_match_the_ddl(self, con: DuckDBPyConnection) -> None:
+        # SKELETON_COLUMN_TYPES is the authoritative statement of what the pkts
+        # row key columns are, imported by the materialize pipeline instead of
+        # restated there. It is declared beside _DDL rather than parsed out of
+        # it, so this is the guard that keeps the two in step: run the real
+        # DDL, read the real catalog, compare. Changing one without the other
+        # fails here rather than disagreeing silently.
+        assert read_pkts_columns(con) == dict(SKELETON_COLUMN_TYPES)
+
+    def test_skeleton_column_types_cover_the_reserved_names(self) -> None:
+        # naming.SKELETON_COLUMNS owns the names, SKELETON_COLUMN_TYPES the
+        # types; naming.py cannot import schema.py (schema imports naming), so
+        # the two definitions are pinned equal here instead.
+        assert set(SKELETON_COLUMN_TYPES) == SKELETON_COLUMNS
+
+    def test_reported_column_types_round_trip_every_ftype(self, con: DuckDBPyConnection) -> None:
+        # #32 refuses reuse when a pkts column's live type differs from the one
+        # meta.fields registered, comparing the two as strings. That is only
+        # correct if DuckDB reports back exactly what add_field_column was
+        # given — including the "T[]" spelling of a multi-value column, which
+        # is the one most likely to normalize differently. Checked across the
+        # whole ftype table so a future column type cannot break reuse
+        # silently.
+        for index, ftype in enumerate(sorted(COLUMN_TYPES)):
+            for multi in (False, True):
+                declared = column_sql_type(ftype, multi)
+                column = f"c{index}_{int(multi)}"
+                add_field_column(con, column, declared)
+                assert read_pkts_columns(con)[column] == declared
+
+    def test_read_pkts_columns_ignores_an_attached_workspace(
+        self, con: DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        # duckdb_columns() spans every attached database, so the probe is
+        # pinned to current_database() like every other catalog probe here.
+        # The second workspace is built through create_schema on its own
+        # connection rather than from DDL written here: nothing outside
+        # schema.py may create a layout name, test files included.
+        other = tmp_path / "other.duckdb"
+        side: DuckDBPyConnection = duckdb.connect(str(other))
+        try:
+            create_schema(side)
+            add_field_column(side, "intruder", "VARCHAR")
+        finally:
+            side.close()
+        con.execute(f"ATTACH '{other}' AS other (READ_ONLY)")
+        assert "intruder" not in read_pkts_columns(con)
+        assert set(read_pkts_columns(con)) == {"frame_number", "frame_time"}
+
+    def test_find_duplicate_row_keys(self, con: DuckDBPyConnection) -> None:
+        stamp = datetime(2026, 8, 18, tzinfo=timezone.utc)
+        con.executemany(
+            "INSERT INTO main.pkts (frame_number, frame_time) VALUES (?, ?)",
+            [[1, stamp], [2, stamp], [2, stamp], [3, stamp], [3, stamp], [None, stamp]],
+        )
+        assert find_duplicate_row_keys(con) == (1, [2, 3])
+
+    def test_find_duplicate_row_keys_bounds_its_examples(self, con: DuckDBPyConnection) -> None:
+        stamp = datetime(2026, 8, 18, tzinfo=timezone.utc)
+        con.executemany(
+            "INSERT INTO main.pkts (frame_number, frame_time) VALUES (?, ?)",
+            [[n, stamp] for n in range(1, 11) for _ in range(2)],
+        )
+        assert find_duplicate_row_keys(con, limit=3) == (0, [1, 2, 3])
+
+    def test_find_duplicate_row_keys_clean_table(self, con: DuckDBPyConnection) -> None:
+        stamp = datetime(2026, 8, 18, tzinfo=timezone.utc)
+        con.executemany(
+            "INSERT INTO main.pkts (frame_number, frame_time) VALUES (?, ?)",
+            [[1, stamp], [2, stamp], [3, stamp]],
+        )
+        assert find_duplicate_row_keys(con) == (0, [])
+
+    def test_backfill_scan_staging_stays_out_of_the_workspace(
+        self, con: DuckDBPyConnection
+    ) -> None:
+        # The staging table lives in DuckDB's temp database, so it is invisible
+        # to every current_database() catalog probe in this package — including
+        # the one that decides whether an rw open() may create the schema.
+        table = create_backfill_scan(con)
+        con.execute(f"INSERT INTO {table} (frame_number) VALUES (1)")
+        # It exists — in the temp database, which is not the workspace.
+        assert con.execute(
+            "SELECT database_name FROM duckdb_tables() WHERE table_name = 'backfill_scan'"
+        ).fetchall() == [("temp",)]
+        row = con.execute(
+            "SELECT count(*) FROM duckdb_tables() "
+            "WHERE database_name = current_database() AND table_name = 'backfill_scan'"
+        ).fetchone()
+        assert row is not None
+        assert row[0] == 0
+        # The layout the workspace file holds is untouched by it.
+        assert database_table_names(con) == EXPECTED_TABLES
+        # Creating it again resets it, so two runs on one connection cannot
+        # validate against each other's row keys.
+        create_backfill_scan(con)
+        row = con.execute(f"SELECT count(*) FROM {table}").fetchone()
+        assert row is not None
+        assert row[0] == 0
 
     def test_idempotent(self, con: DuckDBPyConnection) -> None:
         con.execute("INSERT INTO pkts VALUES (1, TIMESTAMP '2026-08-08 00:00:00')")
