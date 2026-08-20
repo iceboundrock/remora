@@ -132,11 +132,16 @@ def pcap_record(ts_sec: int, ts_usec: int, frame: bytes) -> bytes:
     return struct.pack("<IIII", ts_sec, ts_usec, len(frame), len(frame)) + frame
 
 
+#: Classic pcap global header: magic, v2.4, tz 0, sigfigs 0, snaplen,
+#: LINKTYPE_ETHERNET. Every capture this module builds starts with these bytes,
+#: so it is packed once — the committed fixtures are pinned byte-for-byte by
+#: tests/test_fixture_repro.py, and a second copy is a second thing to get wrong.
+PCAP_GLOBAL_HEADER: bytes = struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, 1)
+
+
 def pcap_file(frames: list[bytes], base_ts: int) -> bytes:
-    # Classic pcap global header: magic, v2.4, tz 0, sigfigs 0, snaplen, LINKTYPE_ETHERNET.
-    header = struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, 1)
     records = b"".join(pcap_record(base_ts + i, i * 1000, frame) for i, frame in enumerate(frames))
-    return header + records
+    return PCAP_GLOBAL_HEADER + records
 
 
 def build_tcp_mixed() -> bytes:
@@ -230,8 +235,7 @@ def build_bulk_tcp(packet_count: int, base_ts: int = 1700001000) -> bytes:
     a millisecond per packet (the microsecond field must stay below 1e6, which
     is why this does not go through ``pcap_file``).
     """
-    # Same classic pcap global header pcap_file writes.
-    chunks = [struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, 1)]
+    chunks = [PCAP_GLOBAL_HEADER]
     dst_ip = bytes([10, 0, 0, 200])
     for index in range(packet_count):
         src_ip = bytes([10, 0, 0, BULK_SRC_LAST_OCTETS[index % len(BULK_SRC_LAST_OCTETS)]])
