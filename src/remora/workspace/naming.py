@@ -32,7 +32,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Final
 
-__all__ = ["SKELETON_COLUMNS", "column_name", "find_collisions"]
+__all__ = ["SKELETON_ABBREVS", "SKELETON_COLUMNS", "column_name", "find_collisions"]
 
 
 def column_name(abbrev: str) -> str:
@@ -63,6 +63,16 @@ skeleton, already present in every workspace, so a field set asking for them
 needs no column added. :func:`find_collisions` will not flag them (they collide
 with nothing), which is why the reservation is stated here rather than left for
 ``ALTER TABLE`` to discover.
+"""
+
+
+SKELETON_ABBREVS: Final[frozenset[str]] = frozenset({"frame.number", "frame.time"})
+"""Field abbrevs whose data the ``pkts`` row key already holds.
+
+The abbrev side of :data:`SKELETON_COLUMNS`. Materializing one of these adds no
+column (#31 drops them from the projection), and querying one needs no
+``meta.fields`` entry (#35 treats them as always available), so both layers read
+the set from here rather than restating it.
 """
 
 

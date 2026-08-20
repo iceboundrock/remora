@@ -22,6 +22,10 @@ else:
 REPO = Path(__file__).resolve().parents[1]
 EXTRA_NAMES = ("wireless", "industrial", "telecom")
 
+#: Extras that pull a third-party dependency instead of a generated protocol
+#: distribution, so they carry no ``remora-<extra>==<version>`` requirement.
+THIRD_PARTY_EXTRAS = ("workspace", "arrow")
+
 
 def _toml(path: Path) -> dict[str, object]:
     with path.open("rb") as handle:
@@ -109,10 +113,14 @@ def test_optional_dependencies_cover_every_extra_and_all_is_the_union() -> None:
     optional = project["optional-dependencies"]
     assert isinstance(optional, dict)
     # A closed world: every protocol extra, "all" (the union of all the
-    # others), and "workspace". The last is exempt from the
-    # remora-<extra>==<version> shape because it is not a generated protocol
-    # distribution — it pulls in the third-party duckdb dependency instead.
-    assert set(optional) == {*EXTRA_NAMES, "all", "workspace"}
+    # others), and the third-party extras. The last group is exempt from the
+    # remora-<extra>==<version> shape because those are not generated protocol
+    # distributions — they pull in duckdb (the workspace) and pyarrow
+    # (Query.arrow()) instead. pyarrow is deliberately *not* folded into
+    # "workspace": duckdb names it only under duckdb's own "all" extra, so a
+    # workspace install does not get it, and a user who never calls .arrow()
+    # should not carry it.
+    assert set(optional) == {*EXTRA_NAMES, "all", *THIRD_PARTY_EXTRAS}
     for extra in EXTRA_NAMES:
         assert optional[extra] == [f"remora-{extra}=={version}"]
     # "all" means everything, so it is exactly the union of every other extra —

@@ -191,7 +191,7 @@ from remora.workspace.errors import (
     MaterializationMismatchError,
     WorkspaceError,
 )
-from remora.workspace.naming import find_collisions
+from remora.workspace.naming import SKELETON_ABBREVS, find_collisions
 from remora.workspace.schema import (
     SKELETON_COLUMN_TYPES,
     CacheKeyRecord,
@@ -242,13 +242,11 @@ class TsharkRun(Protocol):
 TsharkRunner: TypeAlias = Callable[[Sequence[str]], TsharkRun]
 """Build a :class:`TsharkRun` from an argv — the injection seam for tshark."""
 
-#: Requested abbrevs whose data already lives in the pkts row-key skeleton.
-_SKELETON_ABBREVS: Final[frozenset[str]] = frozenset({"frame.number", "frame.time"})
-
 #: argv options whose value another cache-key component already owns, and which
 #: are therefore stripped before two argvs are compared: ``-e`` belongs to the
 #: field set, ``-r`` to the capture fingerprint, ``-Y`` to the display filter.
 _ARGV_OPTIONS_OWNED_ELSEWHERE: Final[frozenset[str]] = frozenset({"-e", "-r", "-Y"})
+
 
 #: Wall-clock ceiling on the ``tshark --version`` probe. Generous, because it
 #: only has to bound a hung binary: the probe can run while
@@ -610,7 +608,7 @@ def materialize_into(
         requested.setdefault(ref.name, ref)
     # Skeleton-backed requests need no column; anything else claiming a
     # skeleton column name falls through to add_field_column's refusal.
-    material_refs = {name: ref for name, ref in requested.items() if name not in _SKELETON_ABBREVS}
+    material_refs = {name: ref for name, ref in requested.items() if name not in SKELETON_ABBREVS}
     stored_fields = read_fields(con)
     stored_keys = read_cache_keys(con)
     _refuse_collisions(stored_fields, material_refs)
@@ -750,7 +748,7 @@ def _refuse_inconsistent_catalog(
     loudly and **not** repaired: which of the two is the truth is exactly what
     cannot be known from here.
     """
-    claimed = {field for field in stored.fields if field not in _SKELETON_ABBREVS}
+    claimed = {field for field in stored.fields if field not in SKELETON_ABBREVS}
     registered = set(stored_by_abbrev)
     unregistered = sorted(claimed - registered)
     unclaimed = sorted(registered - claimed)

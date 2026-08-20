@@ -4,6 +4,8 @@ from __future__ import annotations
 
 __all__ = [
     "ColumnNameCollisionError",
+    "FieldDeclarationMismatchError",
+    "FieldNotMaterializedError",
     "MaterializationMismatchError",
     "SchemaVersionError",
     "WorkspaceError",
@@ -35,4 +37,25 @@ class MaterializationMismatchError(WorkspaceError):
     tshark version or tshark argument vector. The message names each component
     that changed. Reuse is refused rather than silently rematerialized: see
     :func:`remora.workspace.materialize.materialize_into` for the policy.
+    """
+
+
+class FieldNotMaterializedError(WorkspaceError):
+    """A query referenced a field the workspace holds no column for.
+
+    Raised by :mod:`remora.workspace.query` before anything is compiled or
+    executed, so a missing field reads as "re-materialize including it" rather
+    than as DuckDB's raw ``column not found``.
+    """
+
+
+class FieldDeclarationMismatchError(WorkspaceError):
+    """A field reference's ftype/multiplicity disagrees with the stored column.
+
+    The stored ``meta.fields`` declaration is what the column actually holds, so
+    a reference that disagrees with it would compile a predicate against the
+    wrong column shape. Raised by :mod:`remora.workspace.query` in the same
+    validation pass as :class:`FieldNotMaterializedError`, turning what would
+    otherwise leak out as a raw duckdb ``ConversionException`` /
+    ``BinderException`` into a refusal naming both declarations.
     """

@@ -36,13 +36,22 @@ industrial = ["remora-industrial==0.1.0"]
 telecom = ["remora-telecom==0.1.0"]
 # DuckDB workspace (M4). Core stays dependency-free for tshark-only users.
 workspace = ["duckdb>=1.1"]
-# "all" means everything: every protocol extra plus the workspace. Keep it the
-# exact union of the extras above — tests/test_packaging.py enforces that.
+# Arrow output for Query.arrow() (#35). Separate from "workspace" on purpose:
+# duckdb names pyarrow only under its own "all" extra, so `remora[workspace]`
+# installs duckdb *without* it, and a workspace user who never calls .arrow()
+# should not carry a ~35 MB wheel. Floor matches the dev group's, which is the
+# version the Arrow behaviour (including the FT_IPv6 decimal128 hazard) is
+# pinned against.
+arrow = ["pyarrow>=16"]
+# "all" means everything: every protocol extra, the workspace and Arrow. Keep it
+# the exact union of the extras above — tests/test_packaging.py derives that
+# union rather than listing it, so a new extra cannot silently skip this.
 all = [
     "remora-wireless==0.1.0",
     "remora-industrial==0.1.0",
     "remora-telecom==0.1.0",
     "duckdb>=1.1",
+    "pyarrow>=16",
 ]
 
 [project.scripts]
@@ -52,6 +61,9 @@ psdsl = "remora.codegen.cli:main"
 dev = [
     "duckdb>=1.1",
     "mypy>=1.14",
+    # Shipped to users as the optional "arrow" extra; here unconditionally,
+    # because the Arrow tests must run whether or not a user would install it.
+    "pyarrow>=16",
     "pytest>=8.0",
     "ruff>=0.16.2",
     "tomli>=2.0",

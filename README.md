@@ -58,9 +58,9 @@ Domain-specific protocol sets ship as separate distributions, selected with an e
 | `wireless` | `WLAN`, `RADIOTAP` | `remora-wireless` |
 | `industrial` | `MODBUS`, `MBTCP`, `DNP3` | `remora-industrial` |
 | `telecom` | `GTP`, `DIAMETER` | `remora-telecom` |
-| `all` | everything above, plus `workspace` | all three, plus `duckdb` |
+| `all` | everything above, plus `workspace` and `arrow` | all three, plus `duckdb` and `pyarrow` |
 
-One extra is not a protocol set: `workspace` pulls in DuckDB for the materialized workspace (M4 — the storage layer and the `Workspace` lifecycle class have landed, so `from remora.workspace import Workspace` gives you open/read/write/compact today; the `Query` API on top is still to come). `all` means everything, so it includes that one too.
+Two extras are not protocol sets. `workspace` pulls in DuckDB for the materialized workspace (M4 — `from remora.workspace import Workspace` gives you open/read/write/compact, `ws.materialize(pcap, [IP.src, TCP.port])` dissects a capture into columns once, and `ws.query().filter(TCP.port == 443)` runs the same `Expr` trees over those columns instead of over tshark). `arrow` adds pyarrow, which only `ws.query().arrow()` needs — duckdb does not pull pyarrow in, and a workspace user who never exports to Arrow should not carry it, so the two are separate. `all` means everything, so it includes both.
 
 The protocol extras' *distributions* are unpublished, so `pip install "remora[wireless]"` cannot resolve — the extra points at a `remora-wireless` distribution that no index carries. Until they ship, install them from a checkout, alongside core. Each extra lives at `packages/<distribution>`, so name the ones you want:
 
@@ -69,16 +69,18 @@ git clone https://github.com/iceboundrock/remora
 pip install ./remora ./remora/packages/remora-wireless
 ```
 
-Listing all three covers the protocol half of `remora[all]`; add `duckdb` for the other half:
+Listing all three covers the protocol half of `remora[all]`. The other half is `workspace` and `arrow`, which are ordinary extras of *core* — no unpublished distribution involved, so they resolve from PyPI — and you ask for them on the core path:
 
 ```sh
-pip install ./remora \
+pip install './remora[workspace,arrow]' \
   ./remora/packages/remora-wireless \
   ./remora/packages/remora-industrial \
   ./remora/packages/remora-telecom
 ```
 
-Working inside the repository, there is nothing to do: `uv sync` already installs all three extras as workspace members.
+That is the source-checkout equivalent of `remora[all]`: duckdb and pyarrow come along, so `ws.query().arrow()` works. Quote the core path — most shells treat `[...]` as a glob pattern. Drop either extra if you do not need it (`'./remora[workspace]'` alone gives you the workspace without pyarrow), and drop the package lines for protocol sets you do not use.
+
+Working inside the repository, there is nothing to do: `uv sync` already installs all three extras as workspace members, and the dev group brings duckdb and pyarrow.
 
 An extras distribution grafts its modules into `remora.proto` at install time, so no import path changes when you add one. Two import spellings, and the difference matters — the convenient one:
 
