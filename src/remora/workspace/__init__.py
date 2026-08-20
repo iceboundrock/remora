@@ -5,7 +5,8 @@ package owns the storage layout (:mod:`remora.workspace.schema`), the
 column-name policy (:mod:`remora.workspace.naming`), the ftype -> column
 type map (:mod:`remora.workspace.types`), the cache-key computation
 (:mod:`remora.workspace.cachekey`), the streaming materialize pipeline
-(:mod:`remora.workspace.materialize`), the analyst-annotation API
+(:mod:`remora.workspace.materialize`), stream sessionization
+(:mod:`remora.workspace.streams`), the analyst-annotation API
 (:mod:`remora.workspace.annotations`), and the cache-side query surface
 (:mod:`remora.workspace.query`); connection and lock ownership lives in
 :mod:`remora.workspace.workspace`'s ``Workspace`` class (#28).
@@ -42,6 +43,7 @@ from remora.workspace.errors import (
     FieldDeclarationMismatchError,
     FieldNotMaterializedError,
     MaterializationMismatchError,
+    MissingStreamFieldsError,
     SchemaVersionError,
     WorkspaceError,
     WorkspaceModeError,
@@ -77,6 +79,12 @@ from remora.workspace.schema import (
     record_cache_key,
     register_fields,
 )
+from remora.workspace.streams import (
+    REQUIRED_FIELDS,
+    STREAM_PROTOCOLS,
+    StreamsResult,
+    build_streams,
+)
 from remora.workspace.types import (
     COLUMN_TYPES,
     ColumnSpec,
@@ -95,9 +103,11 @@ __all__ = [
     "COLUMN_TYPES",
     "FINGERPRINT_VERSION",
     "PROBE_BYTES",
+    "REQUIRED_FIELDS",
     "SCHEMA_VERSION",
     "SKELETON_ABBREVS",
     "SKELETON_COLUMNS",
+    "STREAM_PROTOCOLS",
     "AnnotationRecord",
     "AnnotationScope",
     "CacheKeyRecord",
@@ -110,16 +120,19 @@ __all__ = [
     "MaterializationMismatchError",
     "MaterializeOutcome",
     "MaterializeResult",
+    "MissingStreamFieldsError",
     "PcapFingerprint",
     "Query",
     "Row",
     "SchemaVersionError",
+    "StreamsResult",
     "TsharkRunner",
     "Workspace",
     "WorkspaceError",
     "WorkspaceModeError",
     "add_annotation",
     "add_field_column",
+    "build_streams",
     "check_compatible",
     "column_name",
     "column_spec",

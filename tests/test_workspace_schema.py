@@ -172,6 +172,68 @@ class TestCreateSchema:
     def test_pkts_skeleton_columns(self, con: DuckDBPyConnection) -> None:
         assert column_names(con, "main", "pkts") == ["frame_number", "frame_time"]
 
+    def test_streams_rollup_columns(self, con: DuckDBPyConnection) -> None:
+        # The columns remora.workspace.streams (#33) populates. Adding the
+        # endpoints changed a v1 layout, which is why SCHEMA_VERSION is 2: an
+        # IF NOT EXISTS create cannot add a column to an existing file, so a v1
+        # workspace has to be refused at open rather than half-upgraded.
+        assert column_names(con, "main", "streams") == [
+            "stream_id",
+            "protocol",
+            "src_addr",
+            "src_port",
+            "dst_addr",
+            "dst_port",
+            "first_frame",
+            "last_frame",
+            "pkt_count",
+            "byte_count",
+            "first_time",
+            "last_time",
+        ]
+
+    def test_annotations_columns(self, con: DuckDBPyConnection) -> None:
+        # `protocol` joins target_id in naming a stream annotation's target,
+        # because main.streams is keyed by (protocol, stream_id): without it an
+        # annotation cannot say whether it means tcp stream 0 or udp stream 0,
+        # and the orphan check reads the wrong row.
+        assert column_names(con, "main", "annotations") == [
+            "annotation_id",
+            "scope",
+            "target_id",
+            "protocol",
+            "key",
+            "value",
+            "created_at",
+        ]
+
+    def test_stream_endpoints_match_the_pkts_representation(self, con: DuckDBPyConnection) -> None:
+        # schema.py writes these types out by hand (it never derives one from
+        # an ftype), so pin them against the type layer: an endpoint column
+        # must hold exactly what the pkts column it is rolled up from holds,
+        # or the documented `s.src_addr = p.ip_src` join stops being an
+        # integer comparison between equals.
+        types = {
+            name: data_type
+            for name, data_type in con.execute(
+                "SELECT column_name, data_type FROM duckdb_columns() "
+                "WHERE schema_name = 'main' AND table_name = 'streams'"
+            ).fetchall()
+        }
+        assert types["src_addr"] == types["dst_addr"] == column_sql_type("FT_IPv4")
+        assert types["src_port"] == types["dst_port"] == column_sql_type("FT_UINT16")
+
+    def test_streams_key_is_protocol_and_stream_id(self, con: DuckDBPyConnection) -> None:
+        # Unlike pkts, streams keeps a key: it holds one row per conversation
+        # rather than one per packet, so the ART index that would tax #31's
+        # bulk append costs nothing here and the duplicate becomes impossible
+        # instead of merely unintended. tcp and udp both number from zero, so
+        # the pair is the key — stream_id alone is not.
+        con.execute("INSERT INTO main.streams (stream_id, protocol) VALUES (0, 'tcp')")
+        con.execute("INSERT INTO main.streams (stream_id, protocol) VALUES (0, 'udp')")
+        with pytest.raises(duckdb.ConstraintException):
+            con.execute("INSERT INTO main.streams (stream_id, protocol) VALUES (0, 'tcp')")
+
     def test_ddl_is_the_only_source(self) -> None:
         # Rule A, file level: a file in src/ or tests/ containing a DDL head is
         # schema.py or a declared scratch file (DDL_SCRATCH_FILES — a test that

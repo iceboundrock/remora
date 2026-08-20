@@ -66,6 +66,7 @@ from remora.workspace.materialize import (
 )
 from remora.workspace.query import Query
 from remora.workspace.schema import check_compatible, create_schema
+from remora.workspace.streams import StreamsResult, build_streams
 
 if TYPE_CHECKING:
     from duckdb import DuckDBPyConnection
@@ -379,9 +380,14 @@ class Workspace:
         key: str,
         value: str | None = None,
         *,
+        protocol: str | None = None,
         created_at: datetime | None = None,
     ) -> int:
         """Attach an annotation to a packet or stream in one transaction.
+
+        A stream annotation names its target by ``(protocol, target_id)``, the
+        pair ``streams`` is keyed by; see
+        :mod:`remora.workspace.annotations`.
 
         Args:
             scope: ``"packet"`` (``target_id`` is a frame number) or
@@ -389,6 +395,8 @@ class Workspace:
             target_id: The frame number or stream id being annotated.
             key: Short label, e.g. ``"verdict"``. Must not be empty.
             value: Free-form body, or ``None`` for a bare tag.
+            protocol: Required for ``scope="stream"`` (``"tcp"``/``"udp"``),
+                refused for ``scope="packet"``.
             created_at: When the annotation was made; defaults to now.
 
         Returns:
@@ -398,7 +406,9 @@ class Workspace:
 
         Raises:
             WorkspaceModeError: In ro mode.
-            ValueError: If ``scope`` or ``key`` is invalid.
+            ValueError: If ``scope``, ``key`` or ``protocol`` is invalid — a
+                stream annotation without a legal protocol, or a packet
+                annotation with one.
             WorkspaceError: If the workspace holds annotation rows but no
                 ``next_annotation_id`` mark — the deleted-id history is
                 unrecoverable, so no seed can honour the never-reused
@@ -414,7 +424,7 @@ class Workspace:
         """
         with self.write() as con:
             return _annotations.add_annotation(
-                con, scope, target_id, key, value, created_at=created_at
+                con, scope, target_id, key, value, protocol=protocol, created_at=created_at
             )
 
     def remove_annotation(self, annotation_id: int) -> bool:
@@ -438,13 +448,17 @@ class Workspace:
         scope: AnnotationScope | None = None,
         target_id: int | None = None,
         key: str | None = None,
+        protocol: str | None = None,
     ) -> int:
         """Remove every annotation matching the filters, in one transaction.
 
         Args:
             scope: Restrict to one scope.
-            target_id: Restrict to one frame number / stream id.
+            target_id: Restrict to one frame number / stream id. A bare stream
+                id matches the tcp and the udp conversation alike; pair it with
+                ``protocol`` to mean one.
             key: Restrict to one label.
+            protocol: Restrict to one stream protocol.
 
         Returns:
             How many annotations were removed.
@@ -454,7 +468,9 @@ class Workspace:
             ValueError: If no filter is given.
         """
         with self.write() as con:
-            return _annotations.remove_annotations(con, scope=scope, target_id=target_id, key=key)
+            return _annotations.remove_annotations(
+                con, scope=scope, target_id=target_id, key=key, protocol=protocol
+            )
 
     def delete_orphan_annotations(self) -> int:
         """Remove annotations whose target is gone, in one transaction.
@@ -477,19 +493,25 @@ class Workspace:
         scope: AnnotationScope | None = None,
         target_id: int | None = None,
         key: str | None = None,
+        protocol: str | None = None,
     ) -> tuple[AnnotationRecord, ...]:
         """List annotations, each flagged for orphanhood. Works in ro mode.
 
         Args:
             scope: Restrict to one scope.
-            target_id: Restrict to one frame number / stream id.
+            target_id: Restrict to one frame number / stream id. A bare stream
+                id matches the tcp and the udp conversation alike; pair it with
+                ``protocol`` to mean one.
             key: Restrict to one label.
+            protocol: Restrict to one stream protocol.
 
         Returns:
             Matching annotations, ascending by ``annotation_id``.
         """
         with self.read() as con:
-            return _annotations.list_annotations(con, scope=scope, target_id=target_id, key=key)
+            return _annotations.list_annotations(
+                con, scope=scope, target_id=target_id, key=key, protocol=protocol
+            )
 
     def materialize(
         self,
@@ -657,6 +679,37 @@ class Workspace:
             A new :class:`~remora.workspace.query.Query` over this workspace.
         """
         return Query(self)
+
+    def build_streams(self) -> StreamsResult:
+        """Roll materialized packets up into ``streams`` in one transaction.
+
+        Sessionization is the capability a display filter cannot express: a
+        filter selects packets, this aggregates the conversations they belong
+        to — per-stream endpoints, packet and byte counts, first/last frame
+        and timestamp — so ``pkts`` can be joined back to the stream each row
+        belongs to. :mod:`remora.workspace.streams` documents the record
+        shape, the byte definition (``frame.len``, matching tshark's own
+        conversation statistics) and the endpoint convention.
+
+        The whole rebuild — delete plus one grouped insert per protocol — is
+        a single :meth:`write` transaction, so the exclusive lock is held
+        briefly and no reader ever sees the table empty. Rerunning it after a
+        re-materialization replaces the rollups rather than duplicating them.
+
+        Returns:
+            How many streams were written, per protocol.
+
+        Raises:
+            WorkspaceModeError: In ro mode.
+            MissingStreamFieldsError: If the fields sessionization reads were
+                not materialized. Both protocols' fields are required, and
+                the message names the exact abbrevs to add to
+                :meth:`materialize`'s field set; nothing is modified.
+            WorkspaceError: If a :meth:`compact` on this file is in progress
+                in this process.
+        """
+        with self.write() as con:
+            return build_streams(con)
 
     def compact(self) -> None:
         """Rewrite the workspace file to reclaim space.

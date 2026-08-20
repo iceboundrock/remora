@@ -78,6 +78,49 @@ class TestLifecycle:
         with pytest.raises(SchemaVersionError, match="newer"):
             Workspace(path, mode="rw").open()
 
+    @staticmethod
+    def _make_v1_workspace(path: Path) -> None:
+        """Write a file shaped like the version 1 layout #33 superseded.
+
+        Built by degrading a current workspace rather than by hand-writing the
+        old DDL: nothing outside ``schema.py`` may CREATE a layout name (the
+        DDL-invariant rule in ``tests/test_workspace_schema.py``), and ALTER is
+        not CREATE. The result is byte-for-byte the shape that mattered — a
+        ``streams`` table without #33's endpoint columns, recorded as version 1.
+        """
+        with Workspace(path, mode="rw"):
+            pass
+        con = duckdb.connect(str(path))
+        try:
+            for column in ("src_addr", "src_port", "dst_addr", "dst_port"):
+                con.execute(f"ALTER TABLE main.streams DROP COLUMN {column}")
+            con.execute("UPDATE meta.info SET value = '1' WHERE key = 'schema_version'")
+        finally:
+            con.close()
+
+    def test_rw_rejects_a_version_1_workspace(self, tmp_path: Path) -> None:
+        # #33 added main.streams' endpoint columns, so SCHEMA_VERSION went to
+        # 2. Without the bump a v1 file opened happily (1 == 1) and only blew
+        # up later, deep inside build_streams(), as a raw DuckDB binder error
+        # about a missing src_addr column: create_schema is IF NOT EXISTS-only
+        # and cannot add a column to an existing file. The refusal has to
+        # happen at open, naming both versions.
+        path = tmp_path / "v1.duckdb"
+        self._make_v1_workspace(path)
+        with pytest.raises(SchemaVersionError) as excinfo:
+            Workspace(path, mode="rw").open()
+        message = str(excinfo.value)
+        assert "1" in message
+        assert str(SCHEMA_VERSION) in message
+        assert "older remora" in message
+        assert "recreate the workspace" in message
+
+    def test_ro_rejects_a_version_1_workspace(self, tmp_path: Path) -> None:
+        path = tmp_path / "v1.duckdb"
+        self._make_v1_workspace(path)
+        with pytest.raises(SchemaVersionError, match="older remora"):
+            Workspace(path).open()
+
     @pytest.mark.parametrize(
         "ddl",
         [

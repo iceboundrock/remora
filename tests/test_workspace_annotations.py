@@ -43,7 +43,7 @@ def con() -> Iterator[DuckDBPyConnection]:
         "INSERT INTO main.pkts (frame_number, frame_time) VALUES "
         "(1, TIMESTAMP '2026-08-18 00:00:00'), (2, TIMESTAMP '2026-08-18 00:00:01')"
     )
-    connection.execute("INSERT INTO main.streams (stream_id) VALUES (7)")
+    connection.execute("INSERT INTO main.streams (stream_id, protocol) VALUES (7, 'tcp')")
     try:
         yield connection
     finally:
@@ -72,11 +72,16 @@ class TestAddAndList:
         )
 
     def test_stream_annotation_round_trips(self, con: DuckDBPyConnection) -> None:
-        add_annotation(con, "stream", 7, "owner", "ruoshi", created_at=UTC_NOW)
+        add_annotation(con, "stream", 7, "owner", "ruoshi", protocol="tcp", created_at=UTC_NOW)
         record = list_annotations(con)[0]
         assert record.scope == "stream"
         assert record.target_id == 7
+        assert record.protocol == "tcp"
         assert record.orphaned is False
+
+    def test_packet_annotation_carries_no_protocol(self, con: DuckDBPyConnection) -> None:
+        add_annotation(con, "packet", 1, "verdict", created_at=UTC_NOW)
+        assert list_annotations(con)[0].protocol is None
 
     def test_value_is_optional(self, con: DuckDBPyConnection) -> None:
         add_annotation(con, "packet", 1, "flagged", created_at=UTC_NOW)
@@ -107,7 +112,7 @@ class TestAddAndList:
 
     def test_missing_target_is_flagged_orphaned(self, con: DuckDBPyConnection) -> None:
         add_annotation(con, "packet", 999, "ghost", created_at=UTC_NOW)
-        add_annotation(con, "stream", 42, "ghost", created_at=UTC_NOW)
+        add_annotation(con, "stream", 42, "ghost", protocol="tcp", created_at=UTC_NOW)
         assert [r.orphaned for r in list_annotations(con)] == [True, True]
 
     def test_unknown_scope_is_refused(self, con: DuckDBPyConnection) -> None:
@@ -121,7 +126,7 @@ class TestAddAndList:
     def test_filters(self, con: DuckDBPyConnection) -> None:
         add_annotation(con, "packet", 1, "verdict", "bad", created_at=UTC_NOW)
         add_annotation(con, "packet", 2, "verdict", "good", created_at=UTC_NOW)
-        add_annotation(con, "stream", 7, "owner", "ruoshi", created_at=UTC_NOW)
+        add_annotation(con, "stream", 7, "owner", "ruoshi", protocol="tcp", created_at=UTC_NOW)
         assert [r.annotation_id for r in list_annotations(con, scope="stream")] == [3]
         assert [r.annotation_id for r in list_annotations(con, target_id=2)] == [2]
         assert [r.annotation_id for r in list_annotations(con, key="verdict")] == [1, 2]
@@ -139,6 +144,88 @@ class TestAddAndList:
         assert len(list_annotations(con)) == 1
 
 
+class TestStreamIdentity:
+    """A stream annotation names ``(protocol, stream_id)``, not a bare id.
+
+    ``main.streams`` is keyed by that pair since #33 — tcp and udp each number
+    their conversations from zero — so an annotation carrying only the id
+    cannot say which conversation it means, and the orphan check cannot
+    either.
+    """
+
+    def test_a_bare_stream_id_is_refused(self, con: DuckDBPyConnection) -> None:
+        with pytest.raises(ValueError, match="must name the protocol") as excinfo:
+            add_annotation(con, "stream", 7, "owner", created_at=UTC_NOW)
+        # The message has to name the legal values, not just complain.
+        assert "'tcp'" in str(excinfo.value)
+        assert "'udp'" in str(excinfo.value)
+        assert list_annotations(con) == ()
+
+    def test_an_unknown_protocol_is_refused(self, con: DuckDBPyConnection) -> None:
+        with pytest.raises(ValueError, match="must name the protocol"):
+            add_annotation(con, "stream", 7, "owner", protocol="sctp", created_at=UTC_NOW)
+
+    def test_a_packet_annotation_refuses_a_protocol(self, con: DuckDBPyConnection) -> None:
+        # frame_number is unique on its own, so a protocol here would be stored
+        # and never matched by anything.
+        with pytest.raises(ValueError, match="takes no protocol"):
+            add_annotation(con, "packet", 1, "a", protocol="tcp", created_at=UTC_NOW)
+
+    def test_an_annotation_on_the_missing_protocol_is_orphaned(
+        self, con: DuckDBPyConnection
+    ) -> None:
+        # The regression: tcp stream 0 exists, udp stream 0 does not. Matching
+        # on stream_id alone made the udp annotation read as live because the
+        # tcp row existed, and delete_orphan_annotations() then kept it.
+        con.execute("INSERT INTO main.streams (stream_id, protocol) VALUES (0, 'tcp')")
+        live = add_annotation(con, "stream", 0, "tcp-one", protocol="tcp", created_at=UTC_NOW)
+        ghost = add_annotation(con, "stream", 0, "udp-one", protocol="udp", created_at=UTC_NOW)
+        by_id = {r.annotation_id: r for r in list_annotations(con)}
+        assert by_id[live].orphaned is False
+        assert by_id[ghost].orphaned is True
+        assert delete_orphan_annotations(con) == 1
+        assert [r.annotation_id for r in list_annotations(con)] == [live]
+
+    def test_the_reverse_direction_holds_too(self, con: DuckDBPyConnection) -> None:
+        # udp stream 0 exists, tcp stream 0 does not — neither protocol is
+        # privileged by the check.
+        con.execute("INSERT INTO main.streams (stream_id, protocol) VALUES (0, 'udp')")
+        ghost = add_annotation(con, "stream", 0, "tcp-one", protocol="tcp", created_at=UTC_NOW)
+        live = add_annotation(con, "stream", 0, "udp-one", protocol="udp", created_at=UTC_NOW)
+        by_id = {r.annotation_id: r for r in list_annotations(con)}
+        assert by_id[ghost].orphaned is True
+        assert by_id[live].orphaned is False
+        assert delete_orphan_annotations(con) == 1
+        assert [r.annotation_id for r in list_annotations(con)] == [live]
+
+    def test_both_protocols_live_side_by_side(self, con: DuckDBPyConnection) -> None:
+        con.execute("INSERT INTO main.streams (stream_id, protocol) VALUES (0, 'tcp'), (0, 'udp')")
+        add_annotation(con, "stream", 0, "t", protocol="tcp", created_at=UTC_NOW)
+        add_annotation(con, "stream", 0, "u", protocol="udp", created_at=UTC_NOW)
+        assert [r.orphaned for r in list_annotations(con)] == [False, False]
+        assert delete_orphan_annotations(con) == 0
+
+    def test_protocol_filters_reads_and_removals(self, con: DuckDBPyConnection) -> None:
+        con.execute("INSERT INTO main.streams (stream_id, protocol) VALUES (0, 'tcp'), (0, 'udp')")
+        add_annotation(con, "packet", 1, "p", created_at=UTC_NOW)
+        tcp_one = add_annotation(con, "stream", 0, "t", protocol="tcp", created_at=UTC_NOW)
+        udp_one = add_annotation(con, "stream", 0, "u", protocol="udp", created_at=UTC_NOW)
+        # target_id=0 alone spans both conversations; the pair names one.
+        assert len(list_annotations(con, scope="stream", target_id=0)) == 2
+        assert [r.annotation_id for r in list_annotations(con, protocol="tcp")] == [tcp_one]
+        assert [r.annotation_id for r in list_annotations(con, protocol="udp")] == [udp_one]
+        assert remove_annotations(con, target_id=0, protocol="udp") == 1
+        assert [r.annotation_id for r in list_annotations(con)] == [1, tcp_one]
+
+    def test_protocol_alone_is_filter_enough_to_remove(self, con: DuckDBPyConnection) -> None:
+        # It restricts to stream annotations of one protocol, so it satisfies
+        # the "no unfiltered wipe" rule on its own.
+        add_annotation(con, "packet", 1, "p", created_at=UTC_NOW)
+        add_annotation(con, "stream", 7, "t", protocol="tcp", created_at=UTC_NOW)
+        assert remove_annotations(con, protocol="tcp") == 1
+        assert [r.scope for r in list_annotations(con)] == ["packet"]
+
+
 class TestRemoval:
     def test_remove_by_id(self, con: DuckDBPyConnection) -> None:
         first = add_annotation(con, "packet", 1, "a", created_at=UTC_NOW)
@@ -152,13 +239,13 @@ class TestRemoval:
     def test_remove_by_key(self, con: DuckDBPyConnection) -> None:
         add_annotation(con, "packet", 1, "verdict", created_at=UTC_NOW)
         add_annotation(con, "packet", 2, "verdict", created_at=UTC_NOW)
-        add_annotation(con, "stream", 7, "owner", created_at=UTC_NOW)
+        add_annotation(con, "stream", 7, "owner", protocol="tcp", created_at=UTC_NOW)
         assert remove_annotations(con, key="verdict") == 2
         assert [r.key for r in list_annotations(con)] == ["owner"]
 
     def test_remove_by_scope_and_target(self, con: DuckDBPyConnection) -> None:
         add_annotation(con, "packet", 1, "a", created_at=UTC_NOW)
-        add_annotation(con, "stream", 1, "a", created_at=UTC_NOW)
+        add_annotation(con, "stream", 1, "a", protocol="tcp", created_at=UTC_NOW)
         assert remove_annotations(con, scope="stream", target_id=1) == 1
         assert [r.scope for r in list_annotations(con)] == ["packet"]
 
@@ -174,8 +261,8 @@ class TestRemoval:
     def test_delete_orphans_leaves_live_annotations(self, con: DuckDBPyConnection) -> None:
         add_annotation(con, "packet", 1, "live", created_at=UTC_NOW)
         add_annotation(con, "packet", 999, "ghost", created_at=UTC_NOW)
-        add_annotation(con, "stream", 7, "live", created_at=UTC_NOW)
-        add_annotation(con, "stream", 42, "ghost", created_at=UTC_NOW)
+        add_annotation(con, "stream", 7, "live", protocol="tcp", created_at=UTC_NOW)
+        add_annotation(con, "stream", 42, "ghost", protocol="tcp", created_at=UTC_NOW)
         assert delete_orphan_annotations(con) == 2
         assert [r.key for r in list_annotations(con)] == ["live", "live"]
         assert all(r.orphaned is False for r in list_annotations(con))
@@ -348,8 +435,8 @@ class TestWorkspaceMethods:
         path = tmp_path / "ws.duckdb"
         with Workspace(path, mode="rw") as ws:
             with ws.write() as con:
-                con.execute("INSERT INTO main.streams (stream_id) VALUES (7)")
-            ws.add_annotation("stream", 7, "owner", "ruoshi", created_at=UTC_NOW)
+                con.execute("INSERT INTO main.streams (stream_id, protocol) VALUES (7, 'tcp')")
+            ws.add_annotation("stream", 7, "owner", "ruoshi", protocol="tcp", created_at=UTC_NOW)
             assert ws.list_annotations(scope="stream")[0].target_id == 7
 
     def test_remove_annotations_and_orphan_cleanup_through_the_workspace(

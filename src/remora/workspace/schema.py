@@ -13,11 +13,16 @@ Table                Holds
                      skeleton (``frame_number``, ``frame_time``); projected
                      field columns are added by the materialize pipeline
                      (#31) through :func:`add_field_column`.
-``main.streams``     Stream sessionization output — a documented placeholder
-                     here; #33 owns the semantics.
+``main.streams``     One row per transport stream, rolled up from ``pkts`` by
+                     :mod:`remora.workspace.streams` (#33): endpoints, packet
+                     and byte counts, first/last frame and timestamp.
+                     ``(protocol, stream_id)`` is the key — tcp and udp each
+                     number their streams from zero.
 ``main.annotations`` Analyst annotations on packets and streams; the API and
                      the kept-but-flagged orphan policy live in
-                     :mod:`remora.workspace.annotations` (#30).
+                     :mod:`remora.workspace.annotations` (#30). A stream
+                     annotation names its target by ``(protocol, target_id)``,
+                     matching ``streams``' own key.
 ``meta.info``        Key/value catalog, including ``schema_version``.
 ``meta.fields``      What has been materialized: abbrev, column, ftype,
                      multiplicity, column type, timestamp.
@@ -33,17 +38,41 @@ index that taxes exactly the bulk append path #31 must keep cheap.
 ascending in capture order. The small catalog tables keep their keys; they take
 single-row writes, and the constraint is the point.
 
+``streams`` keeps a key too — ``UNIQUE (protocol, stream_id)`` — because it is
+on the catalog side of that trade rather than the bulk side: it holds one row
+per conversation, not one per packet, and is rebuilt wholesale rather than
+appended to. tcp and udp both number their streams from zero, so the pair is
+the key and the stream id alone is not. The index cost is what makes the
+duplicate impossible instead of merely unintended, and it does not obstruct the
+rebuild: deleting every row and re-inserting the same keys inside one
+transaction is accepted (pinned by a test, since an index that still held the
+deleted keys until commit would reject it).
+
 Column types come from the caller. :mod:`remora.workspace.types` maps an ftype
-to its column type; nothing here invents a type mapping.
+to its column type; nothing here invents a type mapping. ``streams``' endpoint
+columns are the one place the layout writes such a type out by hand — they
+must hold exactly what the ``pkts`` columns they are rolled up from hold, so
+``src_addr``/``dst_addr`` are ``FT_IPv4``'s ``UINTEGER`` and
+``src_port``/``dst_port`` are ``FT_UINT16``'s ``USMALLINT``, and a test pins
+them against :func:`remora.workspace.types.column_sql_type` so the two cannot
+drift.
 
 Timestamps follow the UTC convention stated in :mod:`remora.workspace.types`
 and use its :func:`~remora.workspace.types.to_db_timestamp` /
 :func:`~remora.workspace.types.from_db_timestamp` pair on every catalog
 column.
 
-There is exactly one layout version and no migration path: a file whose
-recorded version differs from :data:`SCHEMA_VERSION` in either direction is
-refused by :func:`check_compatible`.
+There is exactly one supported layout version at a time and no migration path:
+a file whose recorded version differs from :data:`SCHEMA_VERSION` in either
+direction is refused by :func:`check_compatible`. Changing a table here is
+therefore always a version bump, even when the table is one nothing has
+populated yet: ``create_schema`` is ``IF NOT EXISTS``-only, so it cannot add a
+column to an existing file, and an older file that still *opened* would carry
+a ``streams`` table missing the columns SQL written against this layout names —
+surfacing as a raw DuckDB binder error deep inside a query rather than as a
+refusal at open. That is what version 2 is: #33 added ``main.streams``'
+endpoint columns and its ``UNIQUE`` key, so a version 1 workspace is now
+refused by name of both versions and has to be recreated.
 
 Connections are supplied by the caller — this module never opens one, because
 connection and lock ownership belongs to ``Workspace`` (#28). It therefore
@@ -90,8 +119,15 @@ __all__ = [
     "register_fields",
 ]
 
-SCHEMA_VERSION: Final[int] = 1
-"""Storage layout version written into ``meta.info`` at creation."""
+SCHEMA_VERSION: Final[int] = 2
+"""Storage layout version written into ``meta.info`` at creation.
+
+Version 2 is #33's: ``main.streams``' four endpoint columns and its
+``UNIQUE (protocol, stream_id)`` key, plus the ``main.annotations.protocol``
+column that key forced — a stream annotation has to name the same pair the
+stream itself is keyed by. A version 1 file is refused at open by
+:func:`check_compatible` rather than migrated — see the module docstring.
+"""
 
 _SCHEMA_VERSION_KEY: Final[str] = "schema_version"
 
@@ -106,12 +142,17 @@ _DDL: Final[tuple[str, ...]] = (
     CREATE TABLE IF NOT EXISTS main.streams (
         stream_id   BIGINT,
         protocol    VARCHAR,
+        src_addr    UINTEGER,
+        src_port    USMALLINT,
+        dst_addr    UINTEGER,
+        dst_port    USMALLINT,
         first_frame BIGINT,
         last_frame  BIGINT,
         pkt_count   BIGINT,
         byte_count  BIGINT,
         first_time  TIMESTAMP,
-        last_time   TIMESTAMP
+        last_time   TIMESTAMP,
+        UNIQUE (protocol, stream_id)
     )
     """,
     """
@@ -119,6 +160,7 @@ _DDL: Final[tuple[str, ...]] = (
         annotation_id BIGINT,
         scope         VARCHAR,
         target_id     BIGINT,
+        protocol      VARCHAR,
         key           VARCHAR,
         value         VARCHAR,
         created_at    TIMESTAMP
