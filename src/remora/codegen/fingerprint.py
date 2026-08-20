@@ -7,7 +7,7 @@ generated file carries a provenance header:
     # remora-fingerprint: v1
     # tshark: <version>
     # dump-sha256: <sha256 of the canonicalized ``-G fields`` dump, 64 hex>
-    # env: plugins=none | plugins=sha256:<12 hex of the -G plugins dump>
+    # env: plugins=none | plugins=sha256:<12 hex of the -G plugins identities>
     # generator: remora <version>
 
 ``dump-sha256`` covers the *canonicalized* (line-sorted) fields dump, not
@@ -18,14 +18,18 @@ seam, so hashing and parsing both see the same stable text.
 
 The canonicalization is deliberately asymmetric: the ``-G fields`` dump is
 line-sorted before both hashing and parsing, while the ``-G plugins`` dump is
-hashed raw, because its emission order was verified stable (16 lines, identical
-digests across repeated runs of the same binary) — if plugins ordering ever
-drifts, canonicalize it too.
+left in emission order, because that order was verified stable (16 lines,
+identical digests across repeated runs of the same binary) — if plugins
+ordering ever drifts, sort it too.
 
-The ``env:`` line summarizes only the ``-G plugins`` dump; Lua scripts are not
+The ``env:`` line summarizes only the ``-G plugins`` dump, and only the
+``(name, version, type)`` columns of each record: the fourth column is the
+plugin's path, which embeds the multiarch triplet, so hashing it made the
+committed headers reproducible on amd64 alone (issue #97). Lua scripts are not
 separately summarized, because the fields and protocols they register surface
 through the ``-G fields`` dump itself, so ``dump-sha256`` (not ``env``) is what
-catches Lua-driven drift.
+catches Lua-driven drift — as it is for any behavioral difference between two
+same-version builds of one plugin.
 
 ``python -m remora.codegen check`` regenerates everything named by
 ``codegen.toml`` under the pinned tshark and diffs against the committed
@@ -89,12 +93,62 @@ def canonicalize_dump(dump: str) -> str:
     return "".join(f"{record}\n" for record in records)
 
 
+# Marks a malformed ``-G plugins`` line in the hashed material. A record comes
+# out of tshark through C string formatting, so no byte of it can be NUL — a NUL
+# would have terminated the string before it was ever printed. No *reduced*
+# record can therefore start with (or contain) U+0000, which is what makes this
+# marker unambiguous: marked and unmarked material occupy disjoint spaces.
+# Well-formed dumps contain no malformed line, so they are hashed exactly as
+# they were before the marker existed and committed ``env:`` values are stable.
+_MALFORMED_MARKER = "\x00"
+
+
+def _plugin_identity(line: str) -> str:
+    r"""Reduce one ``-G plugins`` record to its architecture-independent identity.
+
+    A record is ``name\tversion\ttype\tpath``; the path embeds the multiarch
+    triplet (``/usr/lib/x86_64-linux-gnu/...`` vs ``aarch64-linux-gnu``), which
+    is a property of the machine rather than of the plugin, so it is dropped.
+
+    Well-formed means **exactly** four columns. Anything else — too few or too
+    many — is malformed and is kept in full, so nothing is silently dropped and
+    hashing stays total, the same philosophy as ``cachekey._to_bytes``'s
+    ``surrogateescape`` — but prefixed with :data:`_MALFORMED_MARKER`, because
+    keeping it bare let a malformed ``a\t1.0\tcodec`` hash identically to a
+    valid ``a\t1.0\tcodec\t/path`` whose path had just been dropped. The count
+    is exact rather than a minimum for the same reason from the other side: a
+    five-column ``a\t1.0\tcodec\t/path\textra`` truncated to its first three
+    columns would collide with that valid record too. The marker cannot occur
+    in a reduced record, so nothing marked can be confused with anything
+    reduced.
+    """
+    columns = line.split("\t")
+    if len(columns) != 4:
+        return f"{_MALFORMED_MARKER}{line}"
+    return "\t".join(columns[:3])
+
+
 def summarize_env(plugins_dump: str) -> str:
-    """Summarize a ``tshark -G plugins`` dump: ``plugins=none`` or a short hash."""
-    stripped = plugins_dump.strip()
-    if not stripped:
+    """Summarize a ``tshark -G plugins`` dump: ``plugins=none`` or a short hash.
+
+    Only ``(name, version, type)`` of each record is hashed — a plugin's
+    semantic identity — so the summary is the same on amd64 and arm64 (issue
+    #97). Fields stay tab-separated in the hashed text, so ``("a", "b.c")`` and
+    ``("a.b", "c")`` cannot collide. Record order is preserved, not sorted:
+    ``-G plugins`` emission order was verified stable (see the module docs).
+    A line without exactly four columns is kept whole but marked, so it cannot
+    collide with a valid record either (see :func:`_plugin_identity`).
+
+    The trade-off is deliberate: a per-architecture behavioral difference in a
+    same-version plugin no longer flips ``env:``. Any such difference that is
+    visible in dissection still changes the ``-G fields`` dump and is caught by
+    ``dump-sha256``; ``env:`` is the second line of defense, not the first.
+    """
+    if not plugins_dump.strip():
         return "plugins=none"
-    digest = hashlib.sha256(stripped.encode("utf-8")).hexdigest()[:12]
+    records = [_plugin_identity(line) for line in plugins_dump.splitlines() if line.strip()]
+    material = "".join(f"{record}\n" for record in records)
+    digest = hashlib.sha256(material.encode("utf-8")).hexdigest()[:12]
     return f"plugins=sha256:{digest}"
 
 
