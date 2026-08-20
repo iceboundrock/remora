@@ -565,8 +565,9 @@ def read_fields(con: DuckDBPyConnection, *, database: str | None = None) -> tupl
     Args:
         con: An open connection to the workspace.
         database: Attached database alias to read, or ``None`` (the default) for
-            the workspace this connection was opened on. An unknown alias reads
-            as 'not a remora workspace' rather than as a raw catalog error.
+            the workspace this connection was opened on. Callers must have
+            validated the alias first (``check_compatible(con, database=...)``);
+            an unknown alias surfaces as DuckDB's own catalog error.
 
     Returns:
         Every registry entry, ascending by ``abbrev``.
