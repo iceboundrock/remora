@@ -148,6 +148,31 @@ from remora import TCP
 not_port_80 = TCP.port != 80  # compiles to !(tcp.port == 80)
 ```
 
+## The DuckDB workspace
+
+`Capture` re-dissects the pcap on every iteration. A **workspace** dissects it once into DuckDB columns and answers every later question from those columns — the same `Expr` trees, compiled to a SQL predicate instead of a display filter, plus aggregates and sessionization a display filter cannot express. It needs the `workspace` extra (`pip install 'remora[workspace]'`).
+
+<!-- ci:typecheck -->
+```python
+from remora import IP, TCP
+from remora.workspace import Workspace
+
+with Workspace("capture.duckdb", mode="rw") as ws:
+    ws.materialize("capture.pcap", [IP.src, IP.dst, TCP.port])  # dissect once
+    ws.build_streams()  # roll packets up into conversations
+
+with Workspace("capture.duckdb") as ws:  # read-only is the default
+    for row in ws.query().filter(TCP.port == 443).select(IP.src):
+        print(row.frame_number, row.get(IP.src))
+    ws.export_parquet("streams", "streams.parquet")
+```
+
+Three things to know before trusting one, all covered in the [workspace guide](docs/workspace.md):
+
+- **It is a cache, not an archive.** The file holds the columns you asked for and nothing else — no payloads, no field you did not project. Keep the original pcaps.
+- **Cache keys cover the tshark argv**, so `-X lua_script:`, `-d` and `-o` invalidate a workspace: they dissect identical bytes differently. A repeat `materialize()` is a hit, a backfill, or a loud refusal.
+- **`mode="ro"` is the default** because DuckDB allows one writer at a time and a long-lived read-write connection blocks every other process's reads. Writes are short transactions; `compact()` reclaims space and needs sole access.
+
 ## Local generation (`psdsl gen`)
 
 The committed protocol modules only cover what a stock tshark knows. If your tshark has plugins, Lua dissectors, or unusual protocols, generate typed modules locally against *your* binary:
@@ -178,7 +203,13 @@ This works as long as the *parent* of the output directory is on the import path
 
 For a worked end-to-end example (non-core protocol, `--multi` curation, imports), see the [codegen guide](docs/codegen.md).
 
-What an operator means when a field is absent, and which regex constructs survive all three backends, is documented in [docs/semantics.md](docs/semantics.md).
+## Further reading
+
+The durable documents, each CI-checked against the code it describes:
+
+- [docs/semantics.md](docs/semantics.md) — what an operator means when a field is absent, and which regex constructs survive all three backends.
+- [docs/workspace.md](docs/workspace.md) — the DuckDB workspace: cache keys and what invalidates them, locking and `compact()`, Parquet export, annotations, streams, cross-capture `attach()`.
+- [docs/codegen.md](docs/codegen.md) — regenerating protocol modules, and a worked `psdsl gen` example.
 
 ## Contributing: regenerating the committed protocols
 
