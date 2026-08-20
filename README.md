@@ -60,7 +60,7 @@ Domain-specific protocol sets ship as separate distributions, selected with an e
 | `telecom` | `GTP`, `DIAMETER` | `remora-telecom` |
 | `all` | everything above, plus `workspace` and `arrow` | all three, plus `duckdb` and `pyarrow` |
 
-Two extras are not protocol sets. `workspace` pulls in DuckDB for the materialized workspace (M4 — `from remora.workspace import Workspace` gives you open/read/write/compact, `ws.materialize(pcap, [IP.src, TCP.port])` dissects a capture into columns once, and `ws.query().filter(TCP.port == 443)` runs the same `Expr` trees over those columns instead of over tshark). `arrow` adds pyarrow, which only `ws.query().arrow()` needs — duckdb does not pull pyarrow in, and a workspace user who never exports to Arrow should not carry it, so the two are separate. `all` means everything, so it includes both.
+Two extras are not protocol sets. `workspace` pulls in DuckDB for the materialized workspace (M4 — `from remora.workspace import Workspace` gives you open/read/write/compact, `ws.materialize(pcap, [IP.src, IP.dst, TCP.port])` dissects a capture into columns once, and `ws.query().filter(TCP.port == 443)` runs the same `Expr` trees over those columns instead of over tshark). `arrow` adds pyarrow, which only `ws.query().arrow()` needs — duckdb does not pull pyarrow in, and a workspace user who never exports to Arrow should not carry it, so the two are separate. `all` means everything, so it includes both.
 
 The protocol extras' *distributions* are unpublished, so `pip install "remora[wireless]"` cannot resolve — the extra points at a `remora-wireless` distribution that no index carries. Until they ship, install them from a checkout, alongside core. Each extra lives at `packages/<distribution>`, so name the ones you want:
 
@@ -152,20 +152,23 @@ not_port_80 = TCP.port != 80  # compiles to !(tcp.port == 80)
 
 `Capture` re-dissects the pcap on every iteration. A **workspace** dissects it once into DuckDB columns and answers every later question from those columns — the same `Expr` trees, compiled to a SQL predicate instead of a display filter, plus aggregates and sessionization a display filter cannot express. It needs the `workspace` extra (`pip install 'remora[workspace]'`).
 
-<!-- ci:typecheck -->
+<!-- ci:run -->
 ```python
 from remora import IP, TCP
 from remora.workspace import Workspace
 
 with Workspace("capture.duckdb", mode="rw") as ws:
     ws.materialize("capture.pcap", [IP.src, IP.dst, TCP.port])  # dissect once
-    ws.build_streams()  # roll packets up into conversations
 
 with Workspace("capture.duckdb") as ws:  # read-only is the default
     for row in ws.query().filter(TCP.port == 443).select(IP.src):
         print(row.frame_number, row.get(IP.src))
-    ws.export_parquet("streams", "streams.parquet")
+    ws.export_parquet("pkts", "pkts.parquet")
 ```
+
+This snippet is executed by CI against the same test pcap, not merely typechecked — a call that is type-correct and fails at runtime is exactly what a typecheck-only fence cannot see.
+
+Sessionization — `ws.build_streams()`, which rolls packets up into conversations carrying endpoints, counts and durations — is deliberately not an afterthought line on that snippet: it reads nine specific fields out of `pkts` and refuses loudly if any of them was never materialized, so it needs a projection of its own. The guide's [Streams](docs/workspace.md#streams-build_streams) section lists the set.
 
 Three things to know before trusting one, all covered in the [workspace guide](docs/workspace.md):
 

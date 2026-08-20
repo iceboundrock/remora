@@ -32,6 +32,7 @@ import re
 import shutil
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -124,14 +125,34 @@ def exec_snippet(code: str, label: str) -> None:
     exec(compile(code, label, "exec"), {"__name__": "__main__"})
 
 
-def run_snippets_in(tmp_path: Path, doc: Path, label: str) -> None:
-    """Execute every ``ci:run`` fence in *doc* with a capture in the working dir.
+def needs_workspace(code: str) -> bool:
+    """True when a fence drives the DuckDB workspace, so it needs the extra.
+
+    ``ci:run`` fences otherwise need only tshark, and duckdb is optional
+    (``remora[workspace]``) — a checkout without it must still exercise the
+    fences that never touch it, so the two are selected apart rather than
+    gated together.
+    """
+    return "remora.workspace" in code
+
+
+def run_snippets_in(
+    tmp_path: Path,
+    doc: Path,
+    label: str,
+    *,
+    where: Callable[[str], bool] | None = None,
+) -> None:
+    """Execute the ``ci:run`` fences in *doc* with a capture in the working dir.
 
     The caller is responsible for ``monkeypatch.chdir(tmp_path)``; this copies
     ``sample.pcap`` in as ``capture.pcap`` and runs the fences in document
-    order, sharing no namespace between them.
+    order, sharing no namespace between them. *where* selects a subset by code
+    text (see :func:`needs_workspace`); omitting it runs every ``ci:run`` fence.
     """
-    run_snippets = [code for mode, code in snippets(doc) if mode == "run"]
+    run_snippets = [
+        code for mode, code in snippets(doc) if mode == "run" and (where is None or where(code))
+    ]
     assert run_snippets, f"{doc.name} must keep a <!-- ci:run --> fence"
     shutil.copy(SAMPLE_PCAP, tmp_path / "capture.pcap")
     for code in run_snippets:
