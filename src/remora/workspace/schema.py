@@ -110,6 +110,7 @@ __all__ = [
     "find_duplicate_row_keys",
     "iter_ddl",
     "iter_scratch_ddl",
+    "qualify",
     "read_cache_key",
     "read_cache_keys",
     "read_fields",
@@ -375,11 +376,14 @@ def create_backfill_scan(con: DuckDBPyConnection) -> str:
     return BACKFILL_SCAN_TABLE
 
 
-def read_schema_version(con: DuckDBPyConnection) -> int:
+def read_schema_version(con: DuckDBPyConnection, *, database: str | None = None) -> int:
     """Return the schema version recorded in ``meta.info``.
 
     Args:
         con: An open DuckDB connection to the workspace.
+        database: Attached database alias to read, or ``None`` (the default) for
+            the workspace this connection was opened on. An unknown alias reads
+            as 'not a remora workspace' rather than as a raw catalog error.
 
     Returns:
         The recorded schema version.
@@ -388,18 +392,24 @@ def read_schema_version(con: DuckDBPyConnection) -> int:
         SchemaVersionError: If the catalog or the version row is missing, or
             the recorded value is not an integer.
     """
-    # duckdb_tables() spans every attached database, so pin the probe to the
-    # current one — otherwise an unrelated workspace attached alongside makes a
-    # blank database look like a workspace and the next statement escapes as a
-    # raw duckdb.CatalogException.
+    # duckdb_tables() spans every attached database, so pin the probe to one:
+    # the current database by default, or the named alias when reading an
+    # attached workspace (#37). coalesce keeps that a single statement, and a
+    # bound parameter keeps the alias out of the SQL text of the *probe* — the
+    # table reference below still has to interpolate it, which is what qualify
+    # quotes it for.
     catalog = con.execute(
         "SELECT count(*) FROM duckdb_tables() "
-        "WHERE database_name = current_database() "
-        "AND schema_name = 'meta' AND table_name = 'info'"
+        "WHERE database_name = coalesce(CAST(? AS VARCHAR), current_database()) "
+        "AND schema_name = 'meta' AND table_name = 'info'",
+        [database],
     ).fetchone()
     if catalog is None or catalog[0] == 0:
         raise SchemaVersionError("not a remora workspace: the meta.info catalog table is missing")
-    row = con.execute("SELECT value FROM meta.info WHERE key = ?", [_SCHEMA_VERSION_KEY]).fetchone()
+    row = con.execute(
+        f"SELECT value FROM {qualify(database, 'meta.info')} WHERE key = ?",
+        [_SCHEMA_VERSION_KEY],
+    ).fetchone()
     if row is None:
         raise SchemaVersionError("not a remora workspace: meta.info has no schema_version row")
     try:
@@ -408,7 +418,7 @@ def read_schema_version(con: DuckDBPyConnection) -> int:
         raise SchemaVersionError(f"workspace schema_version is not an integer: {row[0]!r}") from exc
 
 
-def check_compatible(con: DuckDBPyConnection) -> None:
+def check_compatible(con: DuckDBPyConnection, *, database: str | None = None) -> None:
     """Verify this library can read the workspace opened on ``con``.
 
     Only the exact :data:`SCHEMA_VERSION` is accepted. There is no migration
@@ -419,12 +429,15 @@ def check_compatible(con: DuckDBPyConnection) -> None:
 
     Args:
         con: An open DuckDB connection to the workspace.
+        database: Attached database alias to read, or ``None`` (the default) for
+            the workspace this connection was opened on. An unknown alias reads
+            as 'not a remora workspace' rather than as a raw catalog error.
 
     Raises:
         SchemaVersionError: If the file's schema version is not
             :data:`SCHEMA_VERSION`, or the workspace catalog is missing.
     """
-    found = read_schema_version(con)
+    found = read_schema_version(con, database=database)
     if found > SCHEMA_VERSION:
         raise SchemaVersionError(
             f"workspace schema version {found} is newer than this remora "
@@ -500,6 +513,21 @@ def _quote_identifier(name: str) -> str:
     return f'"{escaped}"'
 
 
+def qualify(database: str | None, name: str) -> str:
+    """Prefix a schema-qualified table name with a database alias.
+
+    Args:
+        database: Attached database alias, or ``None`` for the current one.
+        name: Schema-qualified table name, e.g. ``"meta.info"``.
+
+    Returns:
+        ``name`` unchanged for ``None``, otherwise ``name`` prefixed with the
+        quoted alias — ``'"peer".meta.info'``. An alias cannot be a bound
+        parameter, so it is quoted rather than interpolated bare.
+    """
+    return name if database is None else f"{_quote_identifier(database)}.{name}"
+
+
 def register_fields(con: DuckDBPyConnection, records: Iterable[FieldRecord]) -> None:
     """Write field registry entries, replacing any entry with the same abbrev.
 
@@ -531,19 +559,23 @@ def register_fields(con: DuckDBPyConnection, records: Iterable[FieldRecord]) -> 
         )
 
 
-def read_fields(con: DuckDBPyConnection) -> tuple[FieldRecord, ...]:
+def read_fields(con: DuckDBPyConnection, *, database: str | None = None) -> tuple[FieldRecord, ...]:
     """Read the whole field registry, ordered by abbrev.
 
     Args:
         con: An open connection to the workspace.
+        database: Attached database alias to read, or ``None`` (the default) for
+            the workspace this connection was opened on. Callers must have
+            validated the alias first (``check_compatible(con, database=...)``);
+            an unknown alias surfaces as DuckDB's own catalog error.
 
     Returns:
         Every registry entry, ascending by ``abbrev``.
     """
     rows = con.execute(
-        """
+        f"""
         SELECT abbrev, column_name, ftype, multi, column_type, materialized_at
-        FROM meta.fields ORDER BY abbrev
+        FROM {qualify(database, "meta.fields")} ORDER BY abbrev
         """
     ).fetchall()
     return tuple(

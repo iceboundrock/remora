@@ -133,6 +133,32 @@ is a read-time projection, not a storage change, and the DuckDB-native path
 (:meth:`Query.__iter__`) still decodes straight to :class:`ipaddress.IPv6Address`.
 Nothing else is cast: every other column keeps its natural Arrow type.
 
+Attached workspaces
+-------------------
+``Workspace.query(alias=...)`` binds the query to a workspace attached with
+``Workspace.attach`` instead of to this one: the statement selects
+``FROM "alias".main.pkts``, and every field is validated and decoded against
+*that* workspace's ``"alias".meta.fields``. So a field materialized here but not
+there is refused with the alias named — the catalog that answers the question is
+the one the rows come from, and a query that read the primary's registry would
+compile a column the attached ``pkts`` may not hold. The row key needs no
+catalog either way (:data:`_ROW_KEY_SPECS`), since every workspace's ``pkts``
+carries it.
+
+The alias is checked against the recorded attachments **at every execution**,
+not only where the query was built: a ``Query`` is immutable and lazy, so the
+alias it was constructed with may have been detached since, and ``Query`` is
+public, so it can be constructed without going through ``Workspace.query()`` at
+all. Either way a stale alias is a :class:`WorkspaceAliasError` naming it,
+never the raw ``Catalog Error: Catalog "peer" does not exist!`` DuckDB would
+otherwise raise from inside the compiled statement.
+
+``Query`` stays **single-table**: an alias re-targets the one table it selects
+from, and nothing here joins. A cross-capture *join* is ordinary SQL over the
+connection ``Workspace.read()`` hands out, which is where an attached workspace
+was reachable from all along — :meth:`Query.sql` renders a statement that can be
+embedded there as a subquery.
+
 Read path only
 --------------
 ``Query`` executes through ``Workspace.read()``: it never enters the write API
@@ -165,9 +191,13 @@ from typing import TYPE_CHECKING, Any, Final, TypeAlias, TypeVar, cast
 from remora.compile import sql as _sql_backend
 from remora.expr import Expr, FieldLike, field_refs
 from remora.fields import FieldNotProjectedError, FieldRef
-from remora.workspace.errors import FieldDeclarationMismatchError, FieldNotMaterializedError
+from remora.workspace.errors import (
+    FieldDeclarationMismatchError,
+    FieldNotMaterializedError,
+    WorkspaceAliasError,
+)
 from remora.workspace.naming import SKELETON_ABBREVS, column_name
-from remora.workspace.schema import FieldRecord, read_fields
+from remora.workspace.schema import FieldRecord, qualify, read_fields
 from remora.workspace.types import ColumnSpec
 
 if TYPE_CHECKING:
@@ -268,11 +298,17 @@ class Row:
     multi-value one).
     """
 
-    __slots__ = ("_specs", "_values")
+    __slots__ = ("_alias", "_specs", "_values")
 
-    def __init__(self, values: Mapping[str, Any], specs: Mapping[str, ColumnSpec]) -> None:
+    def __init__(
+        self,
+        values: Mapping[str, Any],
+        specs: Mapping[str, ColumnSpec],
+        alias: str | None = None,
+    ) -> None:
         self._values = values
         self._specs = specs
+        self._alias = alias
 
     @property
     def frame_number(self) -> int | None:
@@ -309,14 +345,18 @@ class Row:
         """
         spec = self._specs.get(field.name)
         if spec is None:
+            # Named the way the mismatch below names it: both refusals are
+            # about a column, and which workspace's catalog the column would
+            # have come from is half of what the caller has to act on.
+            scope = "" if self._alias is None else f" over attached workspace {self._alias!r}"
             raise FieldNotProjectedError(
-                f"{field.name} is not in this query's projection; add it with "
+                f"{field.name} is not in this query's projection{scope}; add it with "
                 f".select({field.name!r}) or drop the .select() call to project "
                 f"every materialized field"
             )
         problem = _declaration_mismatch(field, spec)
         if problem is not None:
-            raise FieldDeclarationMismatchError(_mismatch_message([problem]))
+            raise FieldDeclarationMismatchError(_mismatch_message([problem], self._alias))
         return spec
 
     def get(self, field: FieldRef[T]) -> T | None:
@@ -383,6 +423,9 @@ class _Plan:
     sql: str
     params: tuple[Any, ...]
     specs: tuple[ColumnSpec, ...]
+    #: The attached workspace this plan reads, or ``None`` for the primary one.
+    #: Carried so a :class:`Row` built from it can name the alias in a refusal.
+    alias: str | None = None
 
 
 class Query:
@@ -404,17 +447,31 @@ class Query:
         workspace: The open workspace to read. Every execution goes through
             ``Workspace.read()``; a ``Query`` never enters the write API and
             never writes.
+        alias: A workspace attached to ``workspace`` under this alias, to query
+            instead of ``workspace`` itself. The statement then selects from
+            ``alias.main.pkts`` and validates against ``alias.meta.fields`` —
+            see the module docstring. ``Workspace.query()`` checks the alias
+            against the recorded attachments when it builds the query, and
+            every execution re-checks it: a ``Query`` is immutable and lazy, so
+            the alias can be detached in between, and this class is public, so
+            it can also be constructed without that first check.
+
+    Raises:
+        WorkspaceAliasError: From any execution (:meth:`sql`, iteration,
+            :meth:`arrow`) whose ``alias`` names nothing attached to the
+            workspace at that moment.
     """
 
-    __slots__ = ("_select", "_terms", "_workspace")
+    __slots__ = ("_alias", "_select", "_terms", "_workspace")
 
-    def __init__(self, workspace: Workspace) -> None:
+    def __init__(self, workspace: Workspace, alias: str | None = None) -> None:
         self._workspace = workspace
+        self._alias = alias
         self._terms: tuple[Expr, ...] = ()
         self._select: tuple[FieldRef[Any], ...] = ()
 
     def _clone(self, terms: tuple[Expr, ...], select: tuple[FieldRef[Any], ...]) -> Query:
-        clone = Query(self._workspace)
+        clone = Query(self._workspace, self._alias)
         clone._terms = terms
         clone._select = select
         return clone
@@ -466,6 +523,8 @@ class Query:
             The SQL text with ``?`` placeholders, and the values to bind.
 
         Raises:
+            WorkspaceAliasError: If this query names an alias that is not
+                attached to the workspace right now.
             FieldNotMaterializedError: If a referenced field has no column.
             FieldDeclarationMismatchError: If a reference's ftype or
                 multiplicity disagrees with the stored catalog record.
@@ -506,6 +565,8 @@ class Query:
             An iterator of :class:`Row`, ascending by ``frame_number``.
 
         Raises:
+            WorkspaceAliasError: If this query names an alias that is not
+                attached to the workspace right now.
             FieldNotMaterializedError: If a referenced field has no column.
             FieldDeclarationMismatchError: If a reference's ftype or
                 multiplicity disagrees with the stored catalog record.
@@ -515,7 +576,7 @@ class Query:
             plan = self._build(con, arrow=False)
             rows = con.execute(plan.sql, list(plan.params)).fetchall()
         index = {spec.abbrev: spec for spec in plan.specs}
-        return (_decode_row(raw, plan.specs, index) for raw in rows)
+        return (_decode_row(raw, plan.specs, index, plan.alias) for raw in rows)
 
     def arrow(self) -> ArrowTable:
         """Execute the query and return the result as a ``pyarrow.Table``.
@@ -537,6 +598,8 @@ class Query:
             key first.
 
         Raises:
+            WorkspaceAliasError: If this query names an alias that is not
+                attached to the workspace right now.
             FieldNotMaterializedError: If a referenced field has no column.
             FieldDeclarationMismatchError: If a reference's ftype or
                 multiplicity disagrees with the stored catalog record.
@@ -563,8 +626,22 @@ class Query:
         return table
 
     def _build(self, con: DuckDBPyConnection, *, arrow: bool) -> _Plan:
-        """Validate every referenced field, then compile the statement."""
-        records = {record.abbrev: record for record in read_fields(con)}
+        """Validate the alias and every referenced field, then compile."""
+        # Re-checked here, not only in Workspace.query(): a Query is immutable
+        # and lazy, so an alias validated at construction can have been
+        # detached by the time this runs, and Query(ws, alias) is public and
+        # never went through that check at all. Without it the statement below
+        # reaches DuckDB and comes back as a raw BinderError far from the
+        # cause, which is exactly what naming the alias exists to prevent. It
+        # is a plain read of a public property: no connection, no write.
+        if self._alias is not None and self._alias not in self._workspace.attachments:
+            raise WorkspaceAliasError(
+                f"no workspace is attached as {self._alias!r}; it may have been "
+                f"detached since this query was built"
+            )
+        # The catalog read follows the alias: an aliased query's fields are the
+        # attached workspace's, never this one's.
+        records = {record.abbrev: record for record in read_fields(con, database=self._alias)}
         self._validate(records)
         # The row key leads every projection, as ordinary specs: it is always
         # selected, so it always decodes and is always reachable via Row.get().
@@ -572,13 +649,18 @@ class Query:
             _spec_of(records[abbrev]) for abbrev in self._projection(records)
         )
         projection = [_arrow_column(spec) if arrow else _quote(spec.column_name) for spec in specs]
-        sql = f"SELECT {', '.join(projection)} FROM main.pkts"
+        sql = f"SELECT {', '.join(projection)} FROM {qualify(self._alias, 'main.pkts')}"
         params: tuple[Any, ...] = ()
         if self._terms:
             predicate = _sql_backend.compile_sql(_conjoin(self._terms))
             sql += f" WHERE {predicate.sql}"
             params = predicate.params
-        return _Plan(sql=f"{sql} ORDER BY frame_number", params=params, specs=specs)
+        return _Plan(
+            sql=f"{sql} ORDER BY frame_number",
+            params=params,
+            specs=specs,
+            alias=self._alias,
+        )
 
     def _references(self) -> tuple[FieldLike, ...]:
         """Every field reference this query mentions, in first-use order.
@@ -603,7 +685,9 @@ class Query:
 
         Two checks, both naming every offender rather than the first, and both
         ahead of :func:`~remora.compile.sql.compile_sql` so nothing derived from
-        a bad reference is ever handed to DuckDB.
+        a bad reference is ever handed to DuckDB. On an aliased query both name
+        the attached workspace, because that is the catalog ``records`` came
+        from and a field missing *there* says nothing about this workspace.
         """
         missing: list[str] = []
         mismatched: list[str] = []
@@ -619,16 +703,18 @@ class Query:
         # Missing first: a field with no column at all is the coarser problem,
         # and a declaration comparison against a record that does not exist is
         # not a thing anyone can act on.
+        scope = "" if self._alias is None else f" in attached workspace {self._alias!r}"
         if len(missing) == 1:
             raise FieldNotMaterializedError(
-                f"field {missing[0]} is not materialized — re-materialize including it"
+                f"field {missing[0]} is not materialized{scope} — re-materialize including it"
             )
         if missing:
             raise FieldNotMaterializedError(
-                f"fields {', '.join(missing)} are not materialized — re-materialize including them"
+                f"fields {', '.join(missing)} are not materialized{scope} — "
+                f"re-materialize including them"
             )
         if mismatched:
-            raise FieldDeclarationMismatchError(_mismatch_message(mismatched))
+            raise FieldDeclarationMismatchError(_mismatch_message(mismatched, self._alias))
 
     def _projection(self, records: Mapping[str, FieldRecord]) -> tuple[str, ...]:
         """Abbrevs to project: the selected fields, or every materialized one.
@@ -648,7 +734,11 @@ class Query:
 
     def __repr__(self) -> str:
         projection = "*" if not self._select else ",".join(f.name for f in self._select)
-        return f"<Query {str(self._workspace.path)!r} terms={len(self._terms)} select={projection}>"
+        target = "" if self._alias is None else f" alias={self._alias!r}"
+        return (
+            f"<Query {str(self._workspace.path)!r}{target} "
+            f"terms={len(self._terms)} select={projection}>"
+        )
 
 
 def _conjoin(terms: Sequence[Expr]) -> Expr:
@@ -717,12 +807,24 @@ def _accepted_ftypes(spec: ColumnSpec) -> frozenset[str]:
     return _ROW_KEY_FTYPES.get(spec.abbrev, frozenset({spec.ftype}))
 
 
-def _mismatch_message(problems: Sequence[str]) -> str:
-    """Assemble the refusal for one or more declaration mismatches."""
+def _mismatch_message(problems: Sequence[str], alias: str | None = None) -> str:
+    """Assemble the refusal for one or more declaration mismatches.
+
+    Args:
+        problems: One rendering of each disagreement, from
+            :func:`_declaration_mismatch`.
+        alias: The attached workspace whose catalog was consulted, or ``None``
+            for this one — named so a mismatch points at the workspace that
+            actually stores the column.
+
+    Returns:
+        The refusal text.
+    """
+    scope = "this workspace" if alias is None else f"attached workspace {alias!r}"
     return (
-        f"{'; '.join(problems)}. The stored declaration is what the column "
-        f"holds, so re-materialize the workspace, or query it with the field "
-        f"references it was materialized from"
+        f"{'; '.join(problems)}. The stored declaration in {scope} is what the "
+        f"column holds, so re-materialize the workspace, or query it with the "
+        f"field references it was materialized from"
     )
 
 
@@ -752,7 +854,10 @@ def _arrow_column(spec: ColumnSpec) -> str:
 
 
 def _decode_row(
-    raw: Sequence[Any], order: Sequence[ColumnSpec], index: Mapping[str, ColumnSpec]
+    raw: Sequence[Any],
+    order: Sequence[ColumnSpec],
+    index: Mapping[str, ColumnSpec],
+    alias: str | None = None,
 ) -> Row:
     """Turn one fetched tuple into a :class:`Row`, decoding through the codecs.
 
@@ -763,4 +868,5 @@ def _decode_row(
     return Row(
         values={spec.abbrev: spec.decode(value) for spec, value in zip(order, raw, strict=True)},
         specs=index,
+        alias=alias,
     )
