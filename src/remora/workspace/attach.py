@@ -28,6 +28,13 @@ attachments onto every connection it opens. Replay is verified rather than
 blind: an alias the instance already holds is left alone when it points at the
 same file read-only, and refused when it does not.
 
+"Gone by the next" is a statement about the *last* connection closing, not
+about one operation ending: any other live connection to the same file — an
+enclosing ``read()``/``write()`` body, or one a caller opened themselves — keeps
+the instance and its attachments alive. ``Workspace.detach`` documents what
+that costs a record-only rw-mode detach; the shared read lock below is held for
+exactly the same span.
+
 What an attachment costs
 ------------------------
 A read-only attachment takes a **shared read lock** on the peer file for as

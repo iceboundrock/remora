@@ -957,18 +957,34 @@ class Workspace:
         connection is the one it was attached on, so the ``DETACH`` is issued
         there **before** the record is dropped: a statement that fails leaves
         the workspace exactly as it was, rather than reporting a failure for
-        something that already took effect. In ``"rw"`` mode there is no
-        connection between operations and therefore nothing attached, so this
-        is pure bookkeeping — dropping the record stops :meth:`read` and
+        something that already took effect. In ``"rw"`` mode there is normally
+        no connection between operations and therefore nothing attached (see
+        the residual below for when that does not hold), so this is pure
+        bookkeeping — dropping the record stops :meth:`read` and
         :meth:`write` replaying the alias onto the connections they open, which
         is the whole of what "attached" means there. No connection is opened
         for it, so a :meth:`detach` cannot fail on a lock or on a
         :meth:`compact` in flight.
 
-        The one rw-mode residual: a :meth:`detach` nested inside an enclosing
-        :meth:`read` or :meth:`write` body does not detach from that body's
-        live connection — the alias stays reachable through it until the body
-        ends, and is not replayed onto any later connection.
+        The rw-mode residual is the reach of "nothing is attached between
+        operations", which holds only while **no** connection to this
+        workspace's database file is live. The attach belongs to the database
+        *instance*, so any live connection keeps the instance — and the
+        attachment on it — alive: an enclosing :meth:`read` or :meth:`write`
+        body, or one a caller opened themselves (a bare
+        ``duckdb.connect(ws_path)`` held alongside). While one exists, a
+        record-only rw-mode :meth:`detach` reports success but the alias stays
+        attached on that instance, with three consequences. The alias remains
+        queryable — through that connection and through a later :meth:`read`,
+        which joins the same instance. Re-attaching under the same alias fails
+        with DuckDB's ``database with name "peer" already exists``, so
+        detach-then-reattach of one alias is not possible while a connection is
+        live. And the peer's **shared read lock is still held** for that
+        connection's lifetime, so ``Workspace(peer, mode="rw")`` can keep
+        failing after a detach that reported success. Only once every
+        connection to this file closes does the instance — and the attachment —
+        go, and no later connection replays it. In ``"ro"`` mode none of this
+        applies: the ``DETACH`` is really issued.
 
         Args:
             alias: The alias to detach.
