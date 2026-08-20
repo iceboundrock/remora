@@ -371,6 +371,280 @@ CASES: tuple[Case, ...] = (
 )
 
 
+#: The operators the absent-field truth table covers. `!=` is not listed
+#: separately: the DSL has no Ne node, so `f != v` IS `~(f == v)` and appears as
+#: the negated twin of the `==` row.
+TRUTH_OPERATORS: tuple[str, ...] = (
+    "==",
+    "<",
+    "<=",
+    ">",
+    ">=",
+    "in",
+    "contains",
+    "matches",
+    "present",
+)
+
+#: Operator label -> the id suffix used by NULL_TRUTH_POSITIVE.
+_OP_SLUG: dict[str, str] = {
+    "==": "eq",
+    "<": "lt",
+    "<=": "le",
+    ">": "gt",
+    ">=": "ge",
+    "in": "in",
+    "contains": "contains",
+    "matches": "matches",
+    "present": "present",
+}
+
+#: One packet that satisfies each positive test, one that does not, and EMPTY.
+#: EMPTY is the whole point: every positive operator is False on an absent
+#: field, on every backend, whether the column stores NULL (scalar) or []
+#: (multi) — and every negated one is therefore True.
+NULL_TRUTH_POSITIVE: tuple[Case, ...] = (
+    Case(
+        id="null-eq-scalar",
+        expr=TTL == 64,
+        dfilter="ip.ttl == 64",
+        rows=(
+            (FakePacket({"ip.ttl": ("64",)}), True),
+            (FakePacket({"ip.ttl": ("63",)}), False),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
+        id="null-eq-multi",
+        expr=PORT == 443,
+        dfilter="tcp.port == 443",
+        rows=(
+            (FakePacket({"tcp.port": ("52034", "443")}), True),
+            (FakePacket({"tcp.port": ("52034", "80")}), False),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
+        id="null-lt-scalar",
+        expr=TTL < 64,
+        dfilter="ip.ttl < 64",
+        rows=(
+            (FakePacket({"ip.ttl": ("63",)}), True),
+            (FakePacket({"ip.ttl": ("64",)}), False),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
+        id="null-lt-multi",
+        expr=PORT < 1024,
+        dfilter="tcp.port < 1024",
+        rows=(
+            (FakePacket({"tcp.port": ("52034", "443")}), True),
+            (FakePacket({"tcp.port": ("52034", "8080")}), False),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
+        id="null-le-scalar",
+        expr=TTL <= 64,
+        dfilter="ip.ttl <= 64",
+        rows=(
+            (FakePacket({"ip.ttl": ("64",)}), True),
+            (FakePacket({"ip.ttl": ("65",)}), False),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
+        id="null-le-multi",
+        expr=PORT <= 443,
+        dfilter="tcp.port <= 443",
+        rows=(
+            (FakePacket({"tcp.port": ("52034", "443")}), True),
+            (FakePacket({"tcp.port": ("52034", "8080")}), False),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
+        id="null-gt-scalar",
+        expr=TTL > 64,
+        dfilter="ip.ttl > 64",
+        rows=(
+            (FakePacket({"ip.ttl": ("65",)}), True),
+            (FakePacket({"ip.ttl": ("64",)}), False),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
+        id="null-gt-multi",
+        expr=PORT > 1024,
+        dfilter="tcp.port > 1024",
+        rows=(
+            (FakePacket({"tcp.port": ("443", "52034")}), True),
+            (FakePacket({"tcp.port": ("80", "443")}), False),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
+        id="null-ge-scalar",
+        expr=TTL >= 64,
+        dfilter="ip.ttl >= 64",
+        rows=(
+            (FakePacket({"ip.ttl": ("64",)}), True),
+            (FakePacket({"ip.ttl": ("63",)}), False),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
+        id="null-ge-multi",
+        expr=PORT >= 1024,
+        dfilter="tcp.port >= 1024",
+        rows=(
+            (FakePacket({"tcp.port": ("443", "52034")}), True),
+            (FakePacket({"tcp.port": ("80", "443")}), False),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
+        id="null-in-scalar",
+        expr=TTL.in_([64, 128]),
+        dfilter="ip.ttl in {64, 128}",
+        rows=(
+            (FakePacket({"ip.ttl": ("128",)}), True),
+            (FakePacket({"ip.ttl": ("63",)}), False),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
+        id="null-in-multi",
+        expr=PORT.in_([80, 443]),
+        dfilter="tcp.port in {80, 443}",
+        rows=(
+            (FakePacket({"tcp.port": ("52034", "443")}), True),
+            (FakePacket({"tcp.port": ("52034", "8080")}), False),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
+        id="null-contains-scalar",
+        expr=HOST.contains("ample"),
+        dfilter='http.host contains "ample"',
+        rows=(
+            (FakePacket({"http.host": ("example.com",)}), True),
+            (FakePacket({"http.host": ("other.org",)}), False),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
+        id="null-contains-multi",
+        expr=QNAME.contains("ample"),
+        dfilter='dns.qry.name contains "ample"',
+        rows=(
+            (FakePacket({"dns.qry.name": ("beta.io", "alpha.example")}), True),
+            (FakePacket({"dns.qry.name": ("beta.io", "gamma.net")}), False),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
+        id="null-matches-scalar",
+        expr=HOST.matches("^ex"),
+        dfilter='http.host matches "^ex"',
+        rows=(
+            (FakePacket({"http.host": ("example.com",)}), True),
+            (FakePacket({"http.host": ("other.org",)}), False),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
+        id="null-matches-multi",
+        expr=QNAME.matches("^alpha"),
+        dfilter='dns.qry.name matches "^alpha"',
+        rows=(
+            (FakePacket({"dns.qry.name": ("beta.io", "alpha.example")}), True),
+            (FakePacket({"dns.qry.name": ("beta.io", "gamma.net")}), False),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
+        id="null-present-scalar",
+        expr=TTL.present(),
+        dfilter="ip.ttl",
+        rows=(
+            (FakePacket({"ip.ttl": ("64",)}), True),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
+        id="null-present-multi",
+        expr=PORT.present(),
+        dfilter="tcp.port",
+        rows=(
+            (FakePacket({"tcp.port": ("443",)}), True),
+            (EMPTY, False),
+        ),
+    ),
+)
+
+
+def _negated(case: Case) -> Case:
+    """The ``~case.expr`` twin: same packets, inverted expectations.
+
+    Every backend must invert together — that is the whole claim. The dfilter
+    golden is the ``!(...)`` wrapper compile_dfilter renders for any Not, and a
+    case the dfilter backend refuses stays refused under negation.
+    """
+    return Case(
+        id=f"not-{case.id}",
+        expr=~case.expr,
+        dfilter=None if case.dfilter is None else f"!({case.dfilter})",
+        rows=tuple((packet, not hit) for packet, hit in case.rows),
+        sql_refusal=case.sql_refusal,
+        sql_guard_rows=case.sql_guard_rows,
+    )
+
+
+NULL_TRUTH_CASES: tuple[Case, ...] = NULL_TRUTH_POSITIVE + tuple(
+    _negated(case) for case in NULL_TRUTH_POSITIVE
+)
+
+CASES = CASES + NULL_TRUTH_CASES
+
+
+class TestTruthTableCompleteness:
+    """The absent-field truth table is complete and matches its own claim."""
+
+    def test_every_operator_multiplicity_polarity_triple_is_covered(self) -> None:
+        expected = {
+            f"{prefix}null-{_OP_SLUG[op]}-{multi}"
+            for op in TRUTH_OPERATORS
+            for multi in ("scalar", "multi")
+            for prefix in ("", "not-")
+        }
+        assert {case.id for case in NULL_TRUTH_CASES} == expected
+        assert len(expected) == len(TRUTH_OPERATORS) * 2 * 2
+
+    def test_every_positive_case_is_false_on_the_absent_packet(self) -> None:
+        for case in NULL_TRUTH_POSITIVE:
+            packet, hit = case.rows[-1]
+            assert packet is EMPTY, case.id
+            assert hit is False, case.id
+
+    def test_every_negated_case_is_true_on_the_absent_packet(self) -> None:
+        for case in NULL_TRUTH_CASES:
+            if not case.id.startswith("not-"):
+                continue
+            packet, hit = case.rows[-1]
+            assert packet is EMPTY, case.id
+            assert hit is True, case.id
+
+    def test_the_truth_cases_are_in_the_shared_table(self) -> None:
+        ids = {case.id for case in CASES}
+        assert {case.id for case in NULL_TRUTH_CASES} <= ids
+
+    def test_case_ids_are_unique(self) -> None:
+        ids = [case.id for case in CASES]
+        assert len(ids) == len(set(ids))
+
+
 def _case_id(case: Case) -> str:
     return case.id
 
