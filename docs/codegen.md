@@ -6,7 +6,7 @@ Everything under `src/remora/proto/` except `_meta.py` and `__init__.py` — and
 # remora-fingerprint: v1
 # tshark: 4.6.6
 # dump-sha256: <sha256 of the canonicalized `tshark -G fields` dump>
-# env: plugins=sha256:<12 hex of the `tshark -G plugins` dump>
+# env: plugins=sha256:<12 hex of the `tshark -G plugins` name/version/type columns>
 # generator: remora <version>
 ```
 
@@ -36,10 +36,18 @@ That is the expected outcome on a developer machine — your Wireshark is almost
 
 Past the pin check, `check` exits 1 and prints a unified diff per drifted file (plus a line for any missing file, and for any *orphan* — a fingerprinted file still on disk that the current `codegen.toml` no longer generates). `write` overwrites every destination and exits 0 — except that a protocol abbrev in `codegen.toml` that the dump does not contain fails both commands loudly with exit 2 rather than being skipped. Both accept `--config`, `--proto-dir`, `--packages-dir`, and `--tshark` if you need to point them somewhere else; the defaults assume you run from the repository root.
 
-Regeneration must also happen on **amd64**. The header's `env:` line hashes the raw `tshark -G plugins` dump, and that dump embeds multiarch paths (`x86_64-linux-gnu` vs `aarch64-linux-gnu`), so the committed hashes only reproduce on CI's architecture — an arm64 run produces a different `env:` line for an otherwise identical toolchain. Pass `--platform linux/amd64` regardless of your host CPU:
+Regeneration is **architecture-neutral** (issue #97): run it natively on whatever your host is. Two things make it so. The canonicalized `-G fields` dump is the same text on either architecture under one pinned tshark — a native arm64 run of the pinned 4.6.6 reproduces the `dump-sha256` of the committed artifacts, which CI's amd64 `codegen-drift` job independently keeps green. And the `env:` line hashes only the `(name, version, type)` columns of each `-G plugins` record — never the fourth, path column, which embeds the multiarch triplet (`/usr/lib/x86_64-linux-gnu/...` vs `aarch64-linux-gnu`) and used to confine reproduction to amd64 by itself. The PPA publishes the same tshark revision for both architectures, so the pin is reachable either way.
+
+`.github/workflows/codegen-arch-verify.yml` is what measures this directly: a matrix `probe` job running natively on GitHub-managed `ubuntu-latest` (x86_64) and `ubuntu-24.04-arm` (aarch64), plus a `compare` job that diffs the two results so the verdict is the job status. Only the two matrix legs run `.github/scripts/codegen_arch_probe.py` — each on its own architecture, uploading its report as an artifact; `compare` runs no tshark and no probe of its own, it downloads both reports and fails unless their `tshark`, `dump-sha256` and `env` lines are identical (`machine:` is expected to differ). The probe reads the pin from `codegen.toml` and **exits 2 rather than probing** if the installed tshark is not that version — evidence collected under an unpinned toolchain would compare two builds that were never the same.
+
+It has two triggers. `workflow_dispatch` runs it on demand, against any ref. A paths-filtered `pull_request` trigger runs it automatically on pull requests that touch what the architecture claim rests on — `src/remora/codegen/fingerprint.py`, the probe script, `codegen.toml`, or the workflow file — so a change to the fingerprint scheme or the pin re-proves the claim on both architectures before it merges. Every other pull request leaves it idle. It is evidence-gathering, not the guard on committed bytes: `codegen-drift` in `ci.yml` is that.
+
+The trade-off, accepted deliberately: a per-architecture behavioral difference in a same-version plugin no longer flips `env:`. Anything such a difference changes about dissection still changes the `-G fields` dump, so `dump-sha256` catches it — `env:` is the second line of defense.
+
+Run the container natively; do not emulate a foreign architecture, which is slow and proves nothing a native run does not:
 
 ```sh
-docker run --rm --platform linux/amd64 -v "$PWD":/work -w /work ubuntu:24.04 bash -c '
+docker run --rm -v "$PWD":/work -w /work ubuntu:24.04 bash -c '
   set -e
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
@@ -55,7 +63,7 @@ docker run --rm --platform linux/amd64 -v "$PWD":/work -w /work ubuntu:24.04 bas
 
 `UV_PROJECT_ENVIRONMENT` keeps the container's virtualenv out of the mounted checkout — without it `uv run` finds the host's `.venv`, sees an interpreter that does not exist inside the container, and rebuilds it, leaving your host environment broken. On a Linux host the regenerated files also land root-owned (`sudo chown -R "$(id -u):$(id -g)" src packages` afterwards); Docker Desktop on macOS maps ownership for you.
 
-Under an emulated amd64 container the run takes a few minutes: `tshark -G fields` on a stock 4.6.x build is a ~270k-line dump, and every configured protocol is emitted from it.
+The run takes a minute or two: `tshark -G fields` on a stock 4.6.x build is a ~270k-line dump, and every configured protocol is emitted from it.
 
 Then run the usual gate and commit the regenerated files together with whatever change motivated them:
 
@@ -76,7 +84,7 @@ uv run ruff check . && uv run ruff format --check . \
 | `[tshark] version`, deliberately | Regenerate with `write` under the new pin; pin bump and regenerated artifacts land as one PR, never separately. |
 | Nothing — the check broke on `main` | The PPA rolled a new tshark past the pin, so the drift job's tshark no longer matches and `check` exits 2 on the version line. Bump `[tshark] version` to what the PPA now ships, regenerate with `write`, and land the bump plus the regenerated artifacts as one PR. |
 
-If a regenerated file differs only in its `env:` line, you regenerated on the wrong architecture — re-run with `--platform linux/amd64`.
+If a regenerated file differs only in its `env:` line, your tshark's plugin set differs from the pin's — a different plugin, or a different plugin *version*, since #97 the only things `env:` hashes. The architecture is not it: `env:` no longer sees the plugin paths.
 
 ## Worked example: generating a non-core protocol with `psdsl gen`
 

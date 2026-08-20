@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
@@ -84,6 +85,152 @@ class TestFingerprintValue:
         assert hashed.startswith("plugins=sha256:")
         assert len(hashed) == len("plugins=sha256:") + 12
         assert summarize_env("other\n") != hashed
+
+
+def plugins_dump(triplet: str, *, mate_version: str = "1.0.1") -> str:
+    """A realistic ``-G plugins`` dump for one multiarch triplet (name/version/type/path)."""
+    lib = f"/usr/lib/{triplet}/wireshark/plugins/4.6"
+    return (
+        f"g711.so         \t0.1.0\tcodec\t{lib}/codecs/g711.so\n"
+        f"mate.so         \t{mate_version}\tdissector\t{lib}/epan/mate.so\n"
+        f"usbdump.so      \t0.0.1\tfile type\t{lib}/wiretap/usbdump.so\n"
+    )
+
+
+class TestSummarizeEnvIsArchitectureIndependent:
+    """``env:`` hashes (name, version, type) only — never the arch-shaped path (#97)."""
+
+    def test_multiarch_paths_do_not_change_the_summary(self) -> None:
+        amd64 = plugins_dump("x86_64-linux-gnu")
+        arm64 = plugins_dump("aarch64-linux-gnu")
+        assert amd64 != arm64
+        assert summarize_env(amd64) == summarize_env(arm64)
+
+    def test_a_version_change_does_change_the_summary(self) -> None:
+        assert summarize_env(plugins_dump("x86_64-linux-gnu")) != summarize_env(
+            plugins_dump("x86_64-linux-gnu", mate_version="1.0.2")
+        )
+
+    def test_a_name_or_type_change_does_change_the_summary(self) -> None:
+        base = "a\t1.0\tcodec\t/usr/lib/x/a.so\n"
+        assert summarize_env(base) != summarize_env("b\t1.0\tcodec\t/usr/lib/x/a.so\n")
+        assert summarize_env(base) != summarize_env("a\t1.0\tdissector\t/usr/lib/x/a.so\n")
+
+    def test_fields_stay_tab_separated_so_they_cannot_collide(self) -> None:
+        assert summarize_env("a\tb.c\tcodec\t/p\n") != summarize_env("a.b\tc\tcodec\t/p\n")
+
+    def test_dropping_the_path_column_is_all_that_changes(self) -> None:
+        """A dump already free of a path column hashes like the full one."""
+        assert summarize_env(plugins_dump("x86_64-linux-gnu")) == summarize_env(
+            "g711.so         \t0.1.0\tcodec\t\n"
+            "mate.so         \t1.0.1\tdissector\t\n"
+            "usbdump.so      \t0.0.1\tfile type\t\n"
+        )
+
+    def test_malformed_lines_are_kept_whole_and_distinguished(self) -> None:
+        """Hashing stays total: a line without four columns is kept, not dropped."""
+        assert summarize_env("a\t1.0\tcodec\n") != summarize_env("a\t1.0\tdissector\n")
+        assert summarize_env("not a record at all\n") != summarize_env("plugins\n")
+        assert summarize_env("a\t1.0\n") != summarize_env("a\t1.0\tcodec\t/p\n")
+
+    def test_a_malformed_record_never_collides_with_a_reduced_valid_one(self) -> None:
+        """The exact collision the marker exists for: three columns vs four-minus-path.
+
+        ``a\\t1.0\\tcodec`` is malformed; ``a\\t1.0\\tcodec\\t/path`` is valid and
+        reduces to the same three columns. Marking the malformed line keeps the
+        two apart — a NUL can never appear in a record tshark printed, so the
+        marked and unmarked spaces are disjoint.
+        """
+        assert summarize_env("a\t1.0\tcodec\n") != summarize_env("a\t1.0\tcodec\t/path\n")
+        # ...and the malformed line is still not confusable with any other path.
+        assert summarize_env("a\t1.0\tcodec\n") != summarize_env("a\t1.0\tcodec\t/other\n")
+
+    def test_an_extra_column_record_never_collides_with_a_valid_one(self) -> None:
+        """Well-formed is *exactly* four columns, so truncation cannot forge one.
+
+        Treating four as a minimum let a five-column line be reduced to its
+        first three columns and hash like the valid four-column record sharing
+        that ``(name, version, type)``. Five columns is malformed, so it is
+        marked and kept whole instead.
+        """
+        five = "a\t1.0\tcodec\t/path\textra\n"
+        assert summarize_env(five) != summarize_env("a\t1.0\tcodec\t/path\n")
+        # Extra columns still carry information, so two of them stay distinct.
+        assert summarize_env(five) != summarize_env("a\t1.0\tcodec\t/path\tother\n")
+        # And a six-column line is neither of them.
+        assert summarize_env(five) != summarize_env("a\t1.0\tcodec\t/path\textra\tmore\n")
+
+    def test_the_marker_leaves_well_formed_dumps_untouched(self) -> None:
+        """Only malformed lines are marked, so committed ``env:`` values are stable.
+
+        States the hashed text independently: three tab-separated columns per
+        record, newline-terminated, no marker anywhere.
+        """
+        import hashlib
+
+        material = (
+            "g711.so         \t0.1.0\tcodec\n"
+            "mate.so         \t1.0.1\tdissector\n"
+            "usbdump.so      \t0.0.1\tfile type\n"
+        )
+        digest = hashlib.sha256(material.encode("utf-8")).hexdigest()[:12]
+        assert summarize_env(plugins_dump("x86_64-linux-gnu")) == f"plugins=sha256:{digest}"
+        assert digest == "bd876b138bf2"
+
+    def test_blank_lines_are_ignored(self) -> None:
+        dump = plugins_dump("x86_64-linux-gnu")
+        assert summarize_env(dump) == summarize_env(f"\n{dump}   \n\n")
+
+    def test_record_order_is_preserved(self) -> None:
+        """``-G plugins`` emission order is stable, so it is hashed as emitted."""
+        forward = "a\t1.0\tcodec\t/p\nb\t1.0\tcodec\t/p\n"
+        reversed_ = "b\t1.0\tcodec\t/p\na\t1.0\tcodec\t/p\n"
+        assert summarize_env(forward) != summarize_env(reversed_)
+
+    def test_digest_is_stable(self) -> None:
+        """Golden: the ``env:`` value of every committed artifact depends on it."""
+        assert summarize_env(plugins_dump("x86_64-linux-gnu")) == "plugins=sha256:bd876b138bf2"
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def load_arch_probe() -> ModuleType:
+    """Load the CI arch probe by path (``.github/scripts`` is not a package)."""
+    path = REPO_ROOT / ".github" / "scripts" / "codegen_arch_probe.py"
+    spec = importlib.util.spec_from_file_location("codegen_arch_probe", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class TestArchProbePinGate:
+    """The arch probe must refuse to record evidence for an unpinned tshark (#97)."""
+
+    def test_matching_version_passes_the_gate(self) -> None:
+        probe = load_arch_probe()
+        assert probe.pin_mismatch_message("4.6.6", "4.6.6", "codegen.toml") is None
+
+    def test_mismatched_version_is_refused_naming_both(self) -> None:
+        probe = load_arch_probe()
+        message = probe.pin_mismatch_message("4.6.7", "4.6.6", "codegen.toml")
+        assert message is not None
+        assert "4.6.7" in message
+        assert "4.6.6" in message
+        assert "codegen.toml" in message
+
+    def test_the_pin_is_read_from_the_repository_config(self) -> None:
+        """The probe never restates a version: it reads ``codegen.toml``."""
+        probe = load_arch_probe()
+        assert probe.CONFIG_PATH == REPO_ROOT / "codegen.toml"
+        source = probe.CONFIG_PATH.read_text(encoding="utf-8")
+        pinned = load_config(probe.CONFIG_PATH).tshark_version
+        assert pinned in source
+        probe_source = (REPO_ROOT / ".github" / "scripts" / "codegen_arch_probe.py").read_text(
+            encoding="utf-8"
+        )
+        assert pinned not in probe_source
 
 
 class TestCanonicalizeDump:

@@ -1,0 +1,86 @@
+# Issue #97: prove that one pinned tshark produces the same canonical
+# `-G fields` dump and the same `env:` summary on amd64 and on arm64.
+#
+# Both probe jobs run *natively* — `ubuntu-latest` is x86_64, `ubuntu-24.04-arm`
+# is aarch64, both GitHub-managed and ephemeral — install the pinned PPA tshark,
+# and upload the same values. `compare` then diffs the two, so the verdict is
+# the job status rather than something a human has to eyeball.
+#
+# The probe refuses to run unless tshark equals the `codegen.toml` pin, so a PPA
+# that has rolled past the pin fails here instead of producing evidence for a
+# toolchain the committed artifacts were never generated with.
+#
+# This is evidence-gathering, not the guard on committed bytes — `codegen-drift`
+# in ci.yml is that. It runs on demand, and automatically on a pull request that
+# touches the pieces the architecture claim rests on: the fingerprint scheme,
+# the probe, the pin, or this file. Everything else leaves it idle.
+name: codegen-arch-verify
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/codegen-arch-verify.yml
+      - .github/scripts/codegen_arch_probe.py
+      - src/remora/codegen/fingerprint.py
+      - codegen.toml
+
+# Nothing here needs to write to the repository; the probe only reads the
+# checkout and runs tshark.
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    # Generous but bounded: arm64 completes the whole job in about a minute and
+    # the equivalent apt install in `codegen-drift` takes ~7, so 15 leaves room
+    # for a slow mirror while a wedged runner fails in minutes instead of
+    # sitting pending for the 6-hour default.
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned tshark (ppa:wireshark-dev/stable)
+        run: |
+          sudo add-apt-repository -y ppa:wireshark-dev/stable
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tshark
+          tshark --version | head -n 1
+          dpkg-query -W -f '${Package} ${Version} ${Architecture}\n' tshark
+      - name: Probe (refuses a tshark that is not the codegen.toml pin)
+        run: python3 .github/scripts/codegen_arch_probe.py probe-${{ matrix.arch }}.txt
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: codegen-arch-probe-${{ matrix.arch }}
+          path: probe-${{ matrix.arch }}.txt
+
+  compare:
+    needs: probe
+    # Two small downloads and a diff; five minutes is already slack.
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: codegen-arch-probe-*
+          merge-multiple: true
+      - name: Compare the two architectures
+        run: |
+          echo '--- amd64'; cat probe-amd64.txt
+          echo '--- arm64'; cat probe-arm64.txt
+          # `machine:` is expected to differ; the dump digest and env summary
+          # are the claim under test, so compare exactly those lines.
+          grep -E '^(tshark|dump-sha256|env):' probe-amd64.txt > amd64.keys
+          grep -E '^(tshark|dump-sha256|env):' probe-arm64.txt > arm64.keys
+          diff -u amd64.keys arm64.keys
+          echo 'amd64 and arm64 agree on tshark version, dump-sha256 and env'
