@@ -1,10 +1,12 @@
-"""Table-driven semantics suite run through BOTH compile backends.
+"""Table-driven semantics suite run through THREE compile backends.
 
 ONE table of cases, each executed against the display-filter backend (golden
 string, or an expected :class:`UnsupportedExprError` when the expression is
-not pushdown-able) AND against the Python predicate backend (packet rows with
-expected boolean results). Because both parametrized tests consume the same
-``Case`` objects, the two backends cannot drift apart silently.
+not pushdown-able), the Python predicate backend (packet rows with expected
+boolean results), and the SQL backend run through DuckDB
+(``tests/test_sql_duckdb.py``, gated on duckdb). Because all three parametrized
+tests consume the same ``Case`` objects, the three backends cannot drift apart
+silently.
 
 This file also hosts the cross-module drift guard promised in the PR #46
 review: every ``py_type`` in ``remora.values.FTYPE_TABLE`` must be accepted as
@@ -40,14 +42,27 @@ EMPTY = FakePacket({})
 
 @dataclass(frozen=True)
 class Case:
-    """One semantics scenario, shared verbatim by both backend tests."""
+    """One semantics scenario, shared verbatim by all three backend tests.
+
+    ``rows`` is the single expected row set: the display-filter, Python
+    predicate and DuckDB SQL backends must all select exactly the packets
+    flagged True. The two escape hatches below are the only ways a backend is
+    allowed to differ, and each one is a *loud* difference (a refusal or an
+    error), never a quiet row-set fork.
+    """
 
     id: str
     expr: Expr
     dfilter: str | None
     """Expected golden dfilter string; None = UnsupportedExprError expected."""
     rows: tuple[tuple[FakePacket, bool], ...]
-    """(packet, expected predicate result) pairs."""
+    """(packet, expected result) pairs — the same answer on all three backends."""
+    sql_refusal: str | None = None
+    """Regex fragment the SQL backend's UnsupportedSqlExprError must match;
+    None means compile_sql must succeed."""
+    sql_guard_rows: frozenset[int] = frozenset()
+    """Row indices whose stored text trips the SQL backend's portable-text
+    guard, so the DuckDB run raises instead of returning rows."""
 
 
 _MOMENT = datetime(2021, 7, 1, tzinfo=timezone.utc)  # epoch 1625097600
@@ -302,6 +317,7 @@ CASES: tuple[Case, ...] = (
             (FakePacket({"tcp.payload": ("aa:bb",)}), False),
             (EMPTY, False),
         ),
+        sql_refusal="BLOB",
     ),
     Case(
         # Wireshark's `matches` is case-insensitive by default — pinned here
@@ -315,10 +331,13 @@ CASES: tuple[Case, ...] = (
             (FakePacket({"http.host": ("other.org",)}), False),
             (EMPTY, False),
         ),
+        sql_refusal="RE2",
     ),
     Case(
         # PCRE2 without UTF mode counts bytes, not characters; the predicate
-        # backend mirrors that ("café" is 5 UTF-8 bytes).
+        # backend mirrors that ("café" is 5 UTF-8 bytes). DuckDB's RE2 counts
+        # runes, which is exactly what the portable-text guard refuses rather
+        # than silently answering differently (issue #36).
         id="matches-byte-oriented",
         expr=HOST.matches("^.{5}$"),
         dfilter='http.host matches "^.{5}$"',
@@ -328,6 +347,7 @@ CASES: tuple[Case, ...] = (
             (FakePacket({"http.host": ("abcd",)}), False),
             (EMPTY, False),
         ),
+        sql_refusal="RE2",
     ),
     Case(
         # Any-occurrence under matches, like every operator (PR #73 review).
@@ -339,6 +359,7 @@ CASES: tuple[Case, ...] = (
             (FakePacket({"dns.qry.name": ("beta.io", "gamma.net")}), False),
             (EMPTY, False),
         ),
+        sql_refusal="RE2",
     ),
     Case(
         id="not-matches-absent-is-true",
@@ -348,6 +369,7 @@ CASES: tuple[Case, ...] = (
             (FakePacket({"http.host": ("example.com",)}), False),
             (EMPTY, True),
         ),
+        sql_refusal="RE2",
     ),
 )
 

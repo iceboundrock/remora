@@ -229,17 +229,6 @@ class TestBackfilledNullMultiColumn:
         assert select(con, ~PORTS.present()) == {0}
 
 
-#: Cases the SQL backend refuses outright, with the reason it refuses them.
-#: Values are regex-safe fragments for pytest.raises(match=...) assertions.
-SQL_UNSUPPORTED_CASES: dict[str, str] = {
-    "matches-case-insensitive": "RE2",
-    "matches-byte-oriented": "RE2",
-    "matches-multi-value-any-occurrence": "RE2",
-    "not-matches-absent-is-true": "RE2",
-    "contains-bytes": "BLOB",
-}
-
-
 def seed_case(connection: DuckDBPyConnection, case: Case) -> None:
     """Materialize one semantics case's packets as pkts rows.
 
@@ -270,25 +259,40 @@ def _case_id(case: Case) -> str:
 
 
 @pytest.mark.parametrize("case", CASES, ids=_case_id)
-def test_sql_backend_matches_the_predicate_backend(con: DuckDBPyConnection, case: Case) -> None:
-    """Acceptance criterion 5: identical row sets for every covered operator.
+def test_sql_backend_matches_the_other_two(con: DuckDBPyConnection, case: Case) -> None:
+    """One table, three backends, one row set (issue #36).
 
-    ONE table, three backends. The rows are seeded through the real
-    materialization codecs, so an absent scalar lands as NULL and an absent
-    multi-value field as [] — the shapes the SQL backend's semantics are stated
-    against.
+    Rows are seeded through the real materialization codecs, so an absent scalar
+    lands as NULL and an absent multi-value field as []. A backend is allowed to
+    differ from the shared expectation only by refusing to compile
+    (``sql_refusal``) or by raising the portable-text guard
+    (``sql_guard_rows``) — never by returning a different row set.
     """
-    reason = SQL_UNSUPPORTED_CASES.get(case.id)
-    if reason is not None:
-        with pytest.raises(UnsupportedSqlExprError, match=reason):
+    if case.sql_refusal is not None:
+        with pytest.raises(UnsupportedSqlExprError, match=case.sql_refusal):
             compile_sql(case.expr)
         return
     seed_case(con, case)
+    if case.sql_guard_rows:
+        with pytest.raises(duckdb.Error, match="pure-ASCII"):
+            select(con, case.expr)
+        return
     expected = {index for index, (_packet, hit) in enumerate(case.rows) if hit}
     assert select(con, case.expr) == expected
 
 
-def test_coverage_maps_name_real_cases() -> None:
-    """The coverage map may not carry an id the shared table no longer has."""
-    ids = {case.id for case in CASES}
-    assert set(SQL_UNSUPPORTED_CASES) <= ids
+def test_no_case_carries_both_escape_hatches() -> None:
+    """A case is refused, or guarded, or compared — never two of the three."""
+    for case in CASES:
+        assert not (case.sql_refusal is not None and case.sql_guard_rows), case.id
+
+
+def test_escape_hatches_are_still_needed() -> None:
+    """A hatch that has stopped being needed must be deleted, not kept.
+
+    Otherwise the table would quietly exempt a case that now agrees.
+    """
+    for case in CASES:
+        if case.sql_refusal is not None:
+            with pytest.raises(UnsupportedSqlExprError):
+                compile_sql(case.expr)
