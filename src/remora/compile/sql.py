@@ -149,8 +149,9 @@ Regex portability (the portable-text guard, issue #36)
 ------------------------------------------------------
 ``matches`` runs on three engines. :class:`remora.expr.Matches` already limits a
 pattern to the Python-re/PCRE2 intersection, and :mod:`remora.compile.re2` names
-the further constructs DuckDB's RE2 cannot compile at all (lookarounds, repeats
-above 1000) -- those raise :class:`UnsupportedSqlExprError` here.
+what remains: the constructs DuckDB's RE2 cannot compile at all (lookarounds,
+repeats above 1000) *and* a non-ASCII pattern character, which RE2 compiles but
+does not agree about. Both raise :class:`UnsupportedSqlExprError` here.
 
 What no construct check can catch is that RE2 matches UTF-8 *runes* and folds
 case by Unicode, while Wireshark's PCRE2 (``PCRE2_CASELESS``, no UTF/UCP) and
@@ -160,15 +161,23 @@ match before a single trailing newline. ``'café' matches '^.{5}$'`` is true on
 two engines and false on the third; the difference is in the *value*, not the
 pattern.
 
-Every such difference needs a non-ASCII byte or a newline in the value, so the
-compiled predicate refuses exactly those: ``strlen(v) <> length(v)`` (byte count
-differs from character count, i.e. not pure ASCII) or a ``chr(10)`` anywhere
-raises DuckDB ``error()`` naming the column and pointing at the pcap path. On
-the text that survives the guard the three engines are provably identical -- an
-ASCII byte never occurs inside a multi-byte UTF-8 sequence, so ``.``, ``[^...]``
-and counted quantifiers consume one byte = one rune; ASCII text cannot contain
-U+212A or U+017F, so Unicode folding is unreachable; and no newline means ``$``
-cannot differ.
+**Both sides need closing, because the fold relation runs both ways.** The
+pattern side belongs to :mod:`remora.compile.re2` and is why a pattern must be
+pure ASCII: RE2 folds U+212A KELVIN SIGN onto ``k`` and U+017F LATIN SMALL
+LETTER LONG S onto ``s``,
+so a non-ASCII *pattern* selects ASCII *values* the other two engines reject,
+which no value-side test can see.
+
+The value side is this module's guard. Every remaining difference needs a
+non-ASCII byte or a newline in the value, so the compiled predicate refuses
+exactly those: ``strlen(v) <> length(v)`` (byte count differs from character
+count, i.e. not pure ASCII) or a ``chr(10)`` anywhere raises DuckDB ``error()``
+naming the column and pointing at the pcap path. With **both** halves in place
+the three engines are provably identical on what survives: pattern and value are
+ASCII, an ASCII byte never occurs inside a multi-byte UTF-8 sequence, so ``.``,
+``[^...]`` and counted quantifiers consume one byte = one rune; no character on
+either side has a simple-fold orbit leaving ASCII, so Unicode folding degenerates
+to ASCII folding; and no newline means ``$`` cannot differ.
 
 Two residuals, stated rather than implied: the guard is a property of the
 *column's data*, not of the answer, so a query can fail on a row another conjunct
@@ -180,8 +189,9 @@ Error policy
 ------------
 :class:`UnsupportedSqlExprError` means "this backend legitimately cannot render
 the expression" — an unknown ``Expr`` node, a ``Matches`` *pattern* DuckDB's RE2
-engine cannot compile (what :func:`remora.compile.re2.unportable_reason` names:
-lookarounds and repeats above 1000 — ``Matches`` itself is no longer refused
+engine cannot run *or* cannot agree about (what
+:func:`remora.compile.re2.unportable_reason` names: lookarounds, repeats above
+1000, and any non-ASCII character — ``Matches`` itself is no longer refused
 categorically), and ``Contains`` on a ``BLOB`` column
 (DuckDB's ``contains`` takes ``VARCHAR`` or ``LIST``, not ``BLOB``). User errors
 — a malformed literal such as ``IP.src == "not-an-ip"``, a ``contains`` needle

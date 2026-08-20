@@ -452,6 +452,15 @@ class TestMatches:
         with pytest.raises(UnsupportedSqlExprError, match="RE2"):
             compile_sql(HOST.matches(pattern))
 
+    @pytest.mark.parametrize("pattern", ["\u212a", "\u017f", "caf\u00e9"])
+    def test_non_ascii_pattern_is_refused(self, pattern: str) -> None:
+        # The reviewer's reproduction: RE2 folds U+212A onto "k" by Unicode, so
+        # `HOST.matches("K")` selected the ASCII value "kelvin" that both other
+        # backends reject. The value is ASCII, so the portable-text guard never
+        # fires — the pattern side has to be refused instead.
+        with pytest.raises(UnsupportedSqlExprError, match="RE2"):
+            compile_sql(HOST.matches(pattern))
+
     def test_refusal_names_the_pcap_path(self) -> None:
         with pytest.raises(UnsupportedSqlExprError, match="Capture"):
             compile_sql(HOST.matches("a(?=b)"))

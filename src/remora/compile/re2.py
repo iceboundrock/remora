@@ -13,6 +13,16 @@ Python ``re`` both run lookarounds and large repeats identically, and a caller
 who never opens a workspace should not lose them (see ``docs/semantics.md``,
 "Regex support matrix").
 
+One further rule is remora's, not RE2's: a **non-ASCII pattern is refused** even
+though RE2 compiles it. RE2 folds case by Unicode in *both* directions, so a
+pattern character whose simple-fold orbit reaches ASCII matches pure-ASCII text
+that PCRE2 (``PCRE2_CASELESS``, no UTF/UCP) and Python ``re`` over UTF-8 bytes
+would not: U+212A KELVIN SIGN folds onto ``k`` and U+017F LATIN SMALL LETTER
+LONG S onto ``s``, so ``'kelvin' matches '\u212a'`` is true on RE2 and false on
+the other two. The value-side guard in :mod:`remora.compile.sql` cannot
+see this — the *value* is ASCII — so the pattern side is closed here, and the two
+halves together are what make the three engines agree.
+
 What RE2 refuses, measured against duckdb 1.5.5:
 
 - **Lookarounds** ``(?=`` ``(?!`` ``(?<=`` ``(?<!`` -> "invalid perl operator".
@@ -24,11 +34,11 @@ What RE2 refuses, measured against duckdb 1.5.5:
   as the factor; only ``*`` and ``+`` (min ≤ 1) contribute factor 1, and ``{0}``
   or ``{0,}`` contribute factor 1.
 
-Everything else the ``Expr`` subset admits -- literals, ``.``, anchors,
+Everything else the ``Expr`` subset admits -- ASCII literals, ``.``, anchors,
 alternation, groups, character classes, the shared escapes, ``\xHH`` -- RE2
-compiles. Whether it *means* the same thing is a separate question about the
-data, not the pattern: see the portable-text guard in
-:mod:`remora.compile.sql`.
+compiles. Whether a *value* means the same thing on all
+three engines is the remaining question, and it is about the data rather than
+the pattern: see the portable-text guard in :mod:`remora.compile.sql`.
 
 This module is a leaf: stdlib only, nothing from ``remora``.
 """
@@ -70,8 +80,20 @@ def unportable_reason(pattern: str) -> str | None:
 
     Returns:
         A lowercase reason fragment naming the construct, its position and RE2,
-        or ``None`` when RE2 can compile the pattern.
+        or ``None`` when RE2 can compile the pattern *and* agrees with the other
+        two engines about what it means.
     """
+    # RE2 compiles a non-ASCII pattern happily; the refusal is remora's, because
+    # RE2's Unicode case folding reaches ASCII from outside it (U+212A -> "k").
+    # See the module docstring: the value side is sql.py's portable-text guard.
+    if not pattern.isascii():
+        position = next(index for index, char in enumerate(pattern) if not char.isascii())
+        char = pattern[position]
+        return (
+            f"non-ASCII character {char!r} (U+{ord(char):04X}) at position {position} — "
+            "DuckDB's RE2 engine folds case by Unicode, so it can match ASCII text "
+            "Wireshark's PCRE2 and Python re would not"
+        )
     # Each stack frame collects the expanded repeat sizes seen at that group
     # level, so a quantifier on the closing ")" can multiply them.
     stack: list[list[int]] = [[]]

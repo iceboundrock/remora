@@ -8,6 +8,8 @@ unit expectations, and (where duckdb is installed) against RE2 itself.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from remora.compile.re2 import MAX_REPEAT, unportable_reason
@@ -57,6 +59,23 @@ UNPORTABLE = (
     ("(?:(?:a{500}){3}){0}", "1500"),
 )
 
+#: Patterns RE2 compiles perfectly well and remora refuses anyway, because the
+#: *meaning* forks: RE2 folds case by Unicode in both directions, so a non-ASCII
+#: pattern character can match ASCII text PCRE2 and Python `re` would not
+#: (U+212A KELVIN SIGN -> "k", U+017F LATIN SMALL LETTER LONG S -> "s"). The
+#: portable-text guard in sql.py covers the value side and cannot see this one,
+#: because the value is ASCII. Kept apart from UNPORTABLE because the
+#: real-engine cross-check below asserts the opposite thing about each table.
+UNPORTABLE_BUT_RE2_COMPILES = (
+    # Written as escapes rather than literal characters: an editor or tool that
+    # NFKC-normalizes the source would turn U+212A into a plain "k" and quietly
+    # neuter the test (it happened once while writing this file).
+    ("\u212a", "U+212A"),  # KELVIN SIGN -> "k"
+    ("\u017f", "U+017F"),  # LATIN SMALL LETTER LONG S -> "s"
+    ("caf\u00e9", "U+00E9"),
+    ("^\u00e9.*$", "U+00E9"),
+)
+
 
 @pytest.mark.parametrize("pattern", PORTABLE)
 def test_portable_patterns_have_no_reason(pattern: str) -> None:
@@ -65,6 +84,16 @@ def test_portable_patterns_have_no_reason(pattern: str) -> None:
 
 @pytest.mark.parametrize(("pattern", "fragment"), UNPORTABLE)
 def test_unportable_patterns_name_the_construct(pattern: str, fragment: str) -> None:
+    reason = unportable_reason(pattern)
+    assert reason is not None
+    assert fragment in reason
+    assert "RE2" in reason
+
+
+@pytest.mark.parametrize(("pattern", "fragment"), UNPORTABLE_BUT_RE2_COMPILES)
+def test_non_ascii_patterns_are_refused_naming_the_character(pattern: str, fragment: str) -> None:
+    # A semantic refusal, not an engine one: RE2 would compile these (the class
+    # below proves it), but a Unicode fold onto ASCII forks the row set.
     reason = unportable_reason(pattern)
     assert reason is not None
     assert fragment in reason
@@ -102,3 +131,20 @@ class TestAgainstRealRE2:
         duckdb = pytest.importorskip("duckdb")
         with pytest.raises(duckdb.Error):
             con.execute("SELECT regexp_matches('a', ?)", [pattern]).fetchall()  # type: ignore[attr-defined]
+
+    @pytest.mark.parametrize(("pattern", "_fragment"), UNPORTABLE_BUT_RE2_COMPILES)
+    def test_non_ascii_patterns_really_compile(
+        self, con: object, pattern: str, _fragment: str
+    ) -> None:
+        # The engine accepts them — which is why this table is separate from
+        # UNPORTABLE, whose entries RE2 itself rejects.
+        con.execute("SELECT regexp_matches('a', ?)", [pattern]).fetchall()  # type: ignore[attr-defined]
+
+    def test_the_unicode_fold_onto_ascii_is_real(self, con: object) -> None:
+        # The defect this rule closes, reproduced on the engine: RE2 says the
+        # Kelvin sign matches an ASCII "k"; Python re over UTF-8 bytes does not,
+        # and neither does Wireshark's PCRE2.
+        row = con.execute("SELECT regexp_matches('kelvin', ?, 'i')", ["\u212a"]).fetchone()  # type: ignore[attr-defined]
+        assert row is not None
+        assert row[0] is True
+        assert re.search("\u212a".encode(), b"kelvin", re.IGNORECASE) is None
