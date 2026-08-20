@@ -4,6 +4,9 @@ The pattern subset `Expr` accepts is the Python-re/PCRE2 intersection; DuckDB's
 RE2 is a third engine that cannot compile some of it. This module's rules are
 what `remora.compile.sql` refuses on, so they are pinned here twice: as pure
 unit expectations, and (where duckdb is installed) against RE2 itself.
+
+It also carries the drift guard for the brace-quantifier grammar the two layers
+each spell out for themselves (see `TestBraceGrammarAgreement`).
 """
 
 from __future__ import annotations
@@ -12,7 +15,9 @@ import re
 
 import pytest
 
+from remora.compile.re2 import _BRACE as RE2_BRACE
 from remora.compile.re2 import MAX_REPEAT, unportable_reason
+from remora.expr import _QUANTIFIER_BRACE as EXPR_BRACE
 
 PORTABLE = (
     "^ex.*com$",
@@ -108,6 +113,81 @@ def test_reason_names_a_position() -> None:
     reason = unportable_reason("ab(?=c)")
     assert reason is not None
     assert "position 2" in reason
+
+
+#: Brace-ish strings both layers must classify identically. Each is fed to both
+#: regexes at position 0, the position their callers scan from when they see a
+#: "{". The forms each layer actually cares about are all here: the three shared
+#: quantifiers ({m}, {m,}, {m,n}), the zero counts re2._brace_bound floors to a
+#: factor of 1, the large count expr's PCRE2 ceiling is expressed in, and the
+#: near-misses both must treat as a literal "{" rather than a quantifier.
+BRACE_CORPUS = (
+    "{2}",
+    "{2,}",
+    "{2,5}",
+    "{0}",
+    "{0,}",
+    "{0,0}",
+    "{}",
+    "{,5}",
+    "{a}",
+    "{2,5,7}",
+    "\\{2\\}",
+    "{ 2 }",
+    "{2",
+    "{2,",
+    "{65535}",
+    "{65536}",
+    "{1000}",
+    "{1001}",
+    "{2}{3}",
+    "{2,}?",
+    "{007}",
+    "{12345678901234567890}",
+    "",
+    "a{2}",
+)
+
+
+class TestBraceGrammarAgreement:
+    r"""`re2._BRACE` and `expr._QUANTIFIER_BRACE` must accept the same language.
+
+    The two patterns are written out twice on purpose and **must stay
+    duplicated**: `expr.py` is a leaf module that imports nothing from remora,
+    and `re2.py` is a leaf that imports nothing but the stdlib, so neither can
+    import the other and neither can be the single source for the other. A
+    shared constant would need a third module both depend on, which is the
+    import edge both leaf invariants exist to forbid — so the coupling is this
+    test, and a future reader tempted to "fix" the duplication by adding an
+    import should stop here.
+
+    The assertion is behavioural, not textual: comparing the two `.pattern`
+    strings would be a tautology today and a false alarm the moment one side is
+    rewritten into an equivalent form. Instead both regexes are driven over one
+    corpus and their verdicts, spans and captured groups are compared.
+    """
+
+    @pytest.mark.parametrize("text", BRACE_CORPUS)
+    def test_both_grammars_agree(self, text: str) -> None:
+        re2_match = RE2_BRACE.match(text)
+        expr_match = EXPR_BRACE.match(text)
+        assert (re2_match is None) == (expr_match is None), (
+            f"one layer matched {text!r} and the other did not: "
+            f"re2={re2_match!r} expr={expr_match!r}"
+        )
+        if re2_match is None or expr_match is None:
+            return
+        assert re2_match.group(0) == expr_match.group(0)
+        assert re2_match.groups() == expr_match.groups()
+        assert re2_match.span() == expr_match.span()
+
+    def test_both_grammars_anchor_at_the_scan_position(self) -> None:
+        # Both callers pass the index of a "{" as `pos`, so the anchoring the
+        # two layers rely on has to agree as well as the language does.
+        assert RE2_BRACE.match("a{2,5}", 1) is not None
+        assert EXPR_BRACE.match("a{2,5}", 1) is not None
+        assert RE2_BRACE.match("a{2,5}", 0) is None
+        assert EXPR_BRACE.match("a{2,5}", 0) is None
 
 
 class TestAgainstRealRE2:

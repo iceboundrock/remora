@@ -333,7 +333,13 @@ def _render(expr: Expr, params: list[Any], *, negated: bool = False) -> str:
         The SQL text for this node, self-delimiting.
 
     Raises:
-        UnsupportedSqlExprError: If the node's type is one this backend refuses.
+        UnsupportedSqlExprError: If the node's type is one this backend refuses,
+            or a leaf renderer refuses its own contents (an unrunnable
+            ``matches`` pattern, ``contains`` on a BLOB column).
+        ValueError: If a leaf's literal is malformed for the field's ftype, or a
+            membership range is inverted.
+        TypeError: If a leaf's literal has the wrong type for the field's ftype
+            (``matches`` on a non-string field included).
     """
     if isinstance(expr, Comparison):
         return _render_comparison(expr, params, negated=negated)
