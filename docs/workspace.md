@@ -448,15 +448,22 @@ re-materialize including it), `FieldNotProjectedError` (a column exists but this
 query's `.select()` left it out), and `FieldDeclarationMismatchError` (the
 reference's ftype or multiplicity disagrees with the stored catalog, which is
 version skew between a workspace and the protocol modules querying it). All three
-name the field, but they do not all fire at the same moment. The two that are
-statements about *storage* — `FieldNotMaterializedError` and
-`FieldDeclarationMismatchError` — are raised while the query is being built,
-before any generated SQL reaches DuckDB, because every reference in the filter
-tree and the projection is checked against `meta.fields` first.
-`FieldNotProjectedError` is a statement about *this query*, and it is raised at
-row-access time, from `row.get()`/`row.get_all()` while decoding a result the
-database has already returned: a projection is only wrong once you ask it for
-something it left out.
+name the field, but they do not all fire at the same moment.
+`FieldNotMaterializedError` is a statement about *storage* and is raised while
+the query is being built, before any generated SQL reaches DuckDB, because every
+reference in the filter tree and the projection is checked against `meta.fields`
+first. `FieldNotProjectedError` is a statement about *this query*, and it is
+raised at row-access time, from `row.get()`/`row.get_all()` while decoding a
+result the database has already returned: a projection is only wrong once you
+ask it for something it left out.
+
+`FieldDeclarationMismatchError` fires on **both** paths, because a field
+reference is a static type as much as it is a column address. At build time the
+declaration is what a literal gets encoded with, so a stale one compiles a
+predicate against the wrong column shape; at row access it is what an accessor's
+return type was checked as, so a name-only lookup would hand an `IPv4Address`
+back through an accessor mypy typed `str | None`. One rule
+(`_declaration_mismatch`), applied in the two places a reference is used.
 
 ## Annotations
 
@@ -578,5 +585,6 @@ operations the peer opens read-write fine.
 | Hit / backfill / refuse | `tests/test_workspace_materialize.py`, `tests/test_workspace_cache.py` |
 | Modes, locking, `compact()` coordination | `tests/test_workspace_lifecycle.py` |
 | Export destination safety and the two type rewrites | `tests/test_workspace_export.py` |
+| The three query-time refusals, at both the moments they fire | `tests/test_workspace_query.py` |
 | Pcap-path / cache-path parity | `tests/integration/test_query_parity.py` |
 | This document's fences | `tests/test_workspace_docs.py` |

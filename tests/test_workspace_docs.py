@@ -189,6 +189,7 @@ def test_the_doc_names_where_each_rule_is_enforced() -> None:
         "tests/test_workspace_cache.py",
         "tests/test_workspace_lifecycle.py",
         "tests/test_workspace_export.py",
+        "tests/test_workspace_query.py",
         "tests/integration/test_query_parity.py",
         "tests/test_workspace_docs.py",
     ):
