@@ -891,8 +891,9 @@ class Workspace:
         Args:
             path: The workspace file to attach. Must exist, must be a workspace
                 of this library's layout version, and must not be this
-                workspace's own file (under any spelling — the comparison is by
-                resolved path).
+                workspace's own file — under any spelling, symlink or hard
+                link, since the comparison is by file identity
+                (``(st_dev, st_ino)``) rather than by pathname.
             alias: Database name to reach it by. A bare SQL identifier
                 (``[A-Za-z_][A-Za-z0-9_]*``), not one of DuckDB's reserved
                 names ``main``/``temp``/``system``, not already attached here,
@@ -918,7 +919,13 @@ class Workspace:
                 f"{self._attachments[alias].path}; detach it first or choose another"
             )
         resolved = Path(os.path.realpath(os.fspath(path)))
-        if resolved == Path(os.path.realpath(self._path)):
+        # By file identity, not by pathname: (st_dev, st_ino) is the same for
+        # every spelling of one file, symlinks and hard links alike, which
+        # realpath gets wrong for a hard link. _file_key falls back to the
+        # resolved pathname for a path it cannot stat, so a missing `path`
+        # never keys equal to the (stat-able) open workspace file and the
+        # missing-file refusal below still gets to name it.
+        if _file_key(resolved) == _file_key(self._path):
             raise WorkspaceError(
                 f"{path} is this workspace's own file; its tables are already "
                 f"reachable as main.pkts"

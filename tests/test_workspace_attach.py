@@ -364,6 +364,23 @@ class TestWorkspaceAttachRefusals:
         with Workspace(primary) as ws, pytest.raises(WorkspaceError, match="own file"):
             ws.attach(alias_path, "self")
 
+    @pytest.mark.skipif(os.name != "posix", reason="hard links need privileges on Windows")
+    @pytest.mark.parametrize("mode", ["ro", "rw"])
+    def test_attaching_the_workspaces_own_file_through_a_hard_link(
+        self, tmp_path: Path, mode: Mode
+    ) -> None:
+        # realpath preserves a hard link's own name, so a pathname comparison
+        # lets the primary attach itself: in ro mode that takes a shared read
+        # lock on the file the held connection already owns, and a later
+        # Workspace(primary, mode="rw") fails on the configuration conflict.
+        primary = make_workspace(tmp_path / "ws.duckdb")
+        alias_path = tmp_path / "hard.duckdb"
+        os.link(primary, alias_path)
+        with Workspace(primary, mode=mode) as ws:
+            with pytest.raises(WorkspaceError, match="own file"):
+                ws.attach(alias_path, "self")
+            assert dict(ws.attachments) == {}
+
 
 class TestCompactIsUnaffectedByAttachments:
     def test_compact_copies_only_the_primary(self, tmp_path: Path) -> None:
