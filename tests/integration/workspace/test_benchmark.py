@@ -163,15 +163,13 @@ def test_the_cached_query_beats_re_parsing_the_pcap(bench: Bench) -> None:
     pcap_median = statistics.median(pcap_timings)
     cache_median = statistics.median(cache_timings)
     speedup = pcap_median / cache_median
-    queries_to_break_even = bench.materialize_seconds / (pcap_median - cache_median)
 
     print(
         f"\nbreak-even benchmark ({PACKET_COUNT} packets, {pcap_rows} selected)\n"
         f"  materialize (one-time): {bench.materialize_seconds:.3f}s\n"
         f"  pcap re-parse, median of {TIMED_RUNS}: {pcap_median:.4f}s {pcap_timings}\n"
         f"  cached query, median of {TIMED_RUNS}: {cache_median:.4f}s {cache_timings}\n"
-        f"  speedup: {speedup:.1f}x (floor asserted: {MIN_SPEEDUP}x)\n"
-        f"  materialization pays for itself after {queries_to_break_even:.1f} repeat queries"
+        f"  speedup: {speedup:.1f}x (floor asserted: {MIN_SPEEDUP}x)"
     )
 
     # Anti-vacuity: a benchmark over an empty result set proves nothing, and
@@ -184,6 +182,13 @@ def test_the_cached_query_beats_re_parsing_the_pcap(bench: Bench) -> None:
         f"the workspace's whole reason to exist is that this stays well above "
         f"{MIN_SPEEDUP}x"
     )
+
+    # Derived only once the floor holds. The divisor is the *difference* of the
+    # medians, so on a failing run it is zero or negative — a ZeroDivisionError
+    # or a "pays for itself after -3.0 queries" line would replace the message
+    # above that says what actually went wrong.
+    queries_to_break_even = bench.materialize_seconds / (pcap_median - cache_median)
+    print(f"  materialization pays for itself after {queries_to_break_even:.1f} repeat queries")
 
 
 def test_the_one_time_materialization_cost_is_reported(bench: Bench) -> None:
