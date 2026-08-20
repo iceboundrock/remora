@@ -305,6 +305,21 @@ class TestWorkspaceAttachRefusals:
                 ws.attach(b, "peer")
             assert dict(ws.attachments) == {"peer": Path(os.path.realpath(a))}
 
+    def test_alias_differing_only_in_case(self, tmp_path: Path) -> None:
+        """DuckDB compares database names case-insensitively, so 'Peer' is 'peer'.
+
+        Without the fold this reached the ATTACH and came back as DuckDB's
+        generic ``database with name "peer" already exists`` wrapped in a bare
+        WorkspaceError, where the same-case duplicate gets the named type.
+        """
+        a = make_workspace(tmp_path / "a.duckdb")
+        b = make_workspace(tmp_path / "b.duckdb")
+        with Workspace(make_workspace(tmp_path / "ws.duckdb")) as ws:
+            ws.attach(a, "peer")
+            with pytest.raises(WorkspaceAliasError, match="differs only in case"):
+                ws.attach(b, "Peer")
+            assert dict(ws.attachments) == {"peer": Path(os.path.realpath(a))}
+
     def test_invalid_alias(self, tmp_path: Path) -> None:
         peer = make_workspace(tmp_path / "peer.duckdb")
         primary = make_workspace(tmp_path / "ws.duckdb")

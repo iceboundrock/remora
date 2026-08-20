@@ -345,8 +345,12 @@ class Row:
         """
         spec = self._specs.get(field.name)
         if spec is None:
+            # Named the way the mismatch below names it: both refusals are
+            # about a column, and which workspace's catalog the column would
+            # have come from is half of what the caller has to act on.
+            scope = "" if self._alias is None else f" over attached workspace {self._alias!r}"
             raise FieldNotProjectedError(
-                f"{field.name} is not in this query's projection; add it with "
+                f"{field.name} is not in this query's projection{scope}; add it with "
                 f".select({field.name!r}) or drop the .select() call to project "
                 f"every materialized field"
             )

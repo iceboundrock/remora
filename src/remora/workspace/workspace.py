@@ -896,12 +896,15 @@ class Workspace:
                 (``(st_dev, st_ino)``) rather than by pathname.
             alias: Database name to reach it by. A bare SQL identifier
                 (``[A-Za-z_][A-Za-z0-9_]*``), not one of DuckDB's reserved
-                names ``main``/``temp``/``system``, not already attached here,
-                and not this workspace's own database name.
+                names ``main``/``temp``/``system``, not already attached here —
+                **compared case-insensitively**, since DuckDB compares database
+                names that way, so ``"Peer"`` is refused while ``"peer"`` is
+                attached — and not this workspace's own database name.
 
         Raises:
             WorkspaceAliasError: If the alias is invalid, reserved, already in
-                use here, or names this workspace's own database.
+                use here (exactly, or differing from a recorded alias only in
+                case), or names this workspace's own database.
             WorkspaceError: If the workspace is not open, if ``path`` does not
                 exist or is this workspace's own file, or if DuckDB refuses the
                 attach — a file that is not a DuckDB database, or one another
@@ -913,10 +916,24 @@ class Workspace:
         """
         self._require_open()
         validate_alias(alias)
-        if alias in self._attachments:
+        # Case-insensitively, because DuckDB compares database names that way:
+        # 'Peer' and 'peer' are one database to it, so a case-differing alias
+        # would reach the ATTACH and come back as a generic binder error rather
+        # than as this named refusal. The record stays case-sensitive on
+        # purpose — folding the keys would change lookup semantics for
+        # `attachments`, `detach`, `query(alias=)` and the replay check.
+        recorded = next((a for a in self._attachments if a.lower() == alias.lower()), None)
+        if recorded is not None:
+            if recorded == alias:
+                raise WorkspaceAliasError(
+                    f"alias {alias!r} is already attached to "
+                    f"{self._attachments[alias].path}; detach it first or choose another"
+                )
             raise WorkspaceAliasError(
-                f"alias {alias!r} is already attached to "
-                f"{self._attachments[alias].path}; detach it first or choose another"
+                f"alias {alias!r} differs only in case from {recorded!r}, already attached "
+                f"to {self._attachments[recorded].path}; DuckDB compares database names "
+                f"case-insensitively, so the two name one database — detach {recorded!r} "
+                f"first or choose another alias"
             )
         resolved = Path(os.path.realpath(os.fspath(path)))
         # By file identity, not by pathname: (st_dev, st_ino) is the same for

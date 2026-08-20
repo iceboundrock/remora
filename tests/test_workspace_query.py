@@ -842,6 +842,24 @@ class TestAliasedQuery:
         with pytest.raises(FieldNotMaterializedError, match="'peer'"):
             ws_with_peer.query(alias="peer").select(TCP.port).sql()
 
+    def test_unprojected_field_names_the_alias(self, ws_with_peer: Workspace) -> None:
+        # ip.src IS materialized in the peer; it is merely outside this
+        # projection, which is the other refusal Row._spec can raise — it names
+        # the attached workspace the way the declaration mismatch beside it
+        # does.
+        row = next(iter(ws_with_peer.query(alias="peer").select(IP.dst)))
+        with pytest.raises(FieldNotProjectedError) as info:
+            row.get(IP.src)
+        message = str(info.value)
+        assert "ip.src is not in this query's projection" in message
+        assert "attached workspace 'peer'" in message
+
+    def test_unprojected_field_on_the_primary_names_no_alias(self, ws_with_peer: Workspace) -> None:
+        row = next(iter(ws_with_peer.query().select(TCP.port)))
+        with pytest.raises(FieldNotProjectedError) as info:
+            row.get(IP.src)
+        assert "peer" not in str(info.value)
+
     def test_unknown_alias_is_refused_at_construction(self, ws_with_peer: Workspace) -> None:
         with pytest.raises(WorkspaceAliasError, match="no workspace is attached as 'nope'"):
             ws_with_peer.query(alias="nope")
