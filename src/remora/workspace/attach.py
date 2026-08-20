@@ -164,6 +164,7 @@ def attach_database(con: DuckDBPyConnection, attachment: Attachment) -> None:
         attachment: The alias and resolved path to attach.
 
     Raises:
+        WorkspaceAliasError: If the alias is not valid.
         SchemaVersionError: If the file is not a remora workspace, or its layout
             version is not this library's. The alias is detached again first, so
             a refused attach leaves nothing behind.
@@ -172,6 +173,7 @@ def attach_database(con: DuckDBPyConnection, attachment: Attachment) -> None:
             ``Workspace.attach`` translates these; a caller holding its own
             connection sees them as themselves.
     """
+    validate_alias(attachment.alias)
     con.execute(
         f"ATTACH '{_quote_path(str(attachment.path))}' "
         f"AS {_quote_ident(attachment.alias)} (READ_ONLY)"
@@ -226,6 +228,7 @@ def apply_attachments(con: DuckDBPyConnection, attachments: Iterable[Attachment]
     for attachment in attachments:
         current = live.get(attachment.alias)
         if current is None:
+            validate_alias(attachment.alias)
             con.execute(
                 f"ATTACH '{_quote_path(str(attachment.path))}' "
                 f"AS {_quote_ident(attachment.alias)} (READ_ONLY)"

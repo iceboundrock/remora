@@ -106,6 +106,15 @@ class TestAttachDatabase:
             attach_database(con, Attachment("blank", blank))
         assert "blank" not in attached_databases(con)
 
+    def test_invalid_alias_is_refused_without_sql(
+        self, con: DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        peer = make_peer(tmp_path / "peer.duckdb")
+        with pytest.raises(WorkspaceAliasError, match="not a valid workspace alias"):
+            attach_database(con, Attachment("my peer", peer))
+        # The failed attach left nothing behind.
+        assert "my peer" not in attached_databases(con)
+
 
 class TestDetachDatabase:
     def test_round_trip(self, con: DuckDBPyConnection, tmp_path: Path) -> None:
@@ -139,3 +148,11 @@ class TestApplyAttachments:
         other = Attachment("a", make_peer(tmp_path / "other.duckdb"))
         with pytest.raises(WorkspaceAliasError, match="already attached to"):
             apply_attachments(con, [other])
+
+    def test_refuses_a_writable_alias(self, con: DuckDBPyConnection, tmp_path: Path) -> None:
+        peer_path = make_peer(tmp_path / "peer.duckdb")
+        # Attach it read-write on this connection (default ATTACH mode is read-write)
+        con.execute(f"ATTACH '{peer_path}' AS w")
+        # Try to apply it as read-only via apply_attachments
+        with pytest.raises(WorkspaceAliasError, match="read-write"):
+            apply_attachments(con, [Attachment("w", peer_path)])
