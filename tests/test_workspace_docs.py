@@ -25,8 +25,11 @@ from docs_snippets import (
     snippets_for,
     typecheck_snippet,
 )
+from remora import IP
+from remora.compile.sql import compile_sql
 from remora.fields import FieldRef
 from remora.workspace import EXPORTABLE_TABLES, PROBE_BYTES, REQUIRED_FIELDS
+from test_semantics_table import EMPTY, NULL_TRUTH_CASES
 
 DOC = REPO_ROOT / "docs" / "workspace.md"
 
@@ -137,6 +140,45 @@ def test_the_doc_defers_to_the_enforced_semantics_document() -> None:
     assert "docs/semantics.md" in text or "(semantics.md)" in text
     # The truth table has one home; duplicating it here would fork the contract.
     assert "absent scalar" not in text
+
+
+def _flowed() -> str:
+    """The guide with its line wrapping collapsed, for matching whole sentences."""
+    return " ".join(DOC.read_text(encoding="utf-8").split())
+
+
+def test_the_absence_summary_still_describes_the_enforced_truth_table() -> None:
+    """The guide paraphrases the table it deliberately does not restate.
+
+    Deferring to ``docs/semantics.md`` is guarded by the link and by the absent
+    header, but the one sentence that *summarizes* the table is prose, and prose
+    cannot be parsed against it. What is pinned instead is the shape the sentence
+    claims: if the enforced truth table ever stops being uniform, this fails and
+    the sentence has to be rewritten rather than quietly becoming false.
+    """
+    claim = "Every positive operator is False on an absent field and every negated one is True"
+    assert claim in _flowed()
+    for case in NULL_TRUTH_CASES:
+        packet, hit = case.rows[-1]
+        assert packet is EMPTY, case.id
+        assert hit is case.id.startswith("not-"), case.id
+
+
+def test_the_coalesce_claim_is_what_the_sql_backend_emits() -> None:
+    """The doc describes the NULL harmonization; the emitter is asked to confirm it.
+
+    Two halves, both stated in the guide and both checked here rather than
+    trusted: the wrap happens **only** beneath a ``Not`` (a positive leaf keeps
+    DuckDB's scan-level filter pushdown), and it happens **at the leaf** rather
+    than over the subtree (a subtree wrap gets nested negation wrong). Derived
+    from the real backend the way ``tests/test_semantics_docs.py`` derives its
+    expected guard fragment from ``sql.py``'s own emitter.
+    """
+    positive = compile_sql(IP.src == "10.0.0.1")
+    negated = compile_sql(~(IP.src == "10.0.0.1"))
+    assert "coalesce" not in positive.sql
+    assert negated.sql == f"NOT (coalesce({positive.sql}, FALSE))"
+    assert "coalesce(<leaf>, FALSE)" in _flowed()
 
 
 def test_the_doc_names_where_each_rule_is_enforced() -> None:
