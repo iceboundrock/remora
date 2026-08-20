@@ -145,6 +145,14 @@ compile a column the attached ``pkts`` may not hold. The row key needs no
 catalog either way (:data:`_ROW_KEY_SPECS`), since every workspace's ``pkts``
 carries it.
 
+The alias is checked against the recorded attachments **at every execution**,
+not only where the query was built: a ``Query`` is immutable and lazy, so the
+alias it was constructed with may have been detached since, and ``Query`` is
+public, so it can be constructed without going through ``Workspace.query()`` at
+all. Either way a stale alias is a :class:`WorkspaceAliasError` naming it,
+never the raw ``Catalog Error: Catalog "peer" does not exist!`` DuckDB would
+otherwise raise from inside the compiled statement.
+
 ``Query`` stays **single-table**: an alias re-targets the one table it selects
 from, and nothing here joins. A cross-capture *join* is ordinary SQL over the
 connection ``Workspace.read()`` hands out, which is where an attached workspace
@@ -183,7 +191,11 @@ from typing import TYPE_CHECKING, Any, Final, TypeAlias, TypeVar, cast
 from remora.compile import sql as _sql_backend
 from remora.expr import Expr, FieldLike, field_refs
 from remora.fields import FieldNotProjectedError, FieldRef
-from remora.workspace.errors import FieldDeclarationMismatchError, FieldNotMaterializedError
+from remora.workspace.errors import (
+    FieldDeclarationMismatchError,
+    FieldNotMaterializedError,
+    WorkspaceAliasError,
+)
 from remora.workspace.naming import SKELETON_ABBREVS, column_name
 from remora.workspace.schema import FieldRecord, qualify, read_fields
 from remora.workspace.types import ColumnSpec
@@ -434,8 +446,16 @@ class Query:
         alias: A workspace attached to ``workspace`` under this alias, to query
             instead of ``workspace`` itself. The statement then selects from
             ``alias.main.pkts`` and validates against ``alias.meta.fields`` —
-            see the module docstring. ``Workspace.query()`` is what checks the
-            alias against the recorded attachments; nothing here does.
+            see the module docstring. ``Workspace.query()`` checks the alias
+            against the recorded attachments when it builds the query, and
+            every execution re-checks it: a ``Query`` is immutable and lazy, so
+            the alias can be detached in between, and this class is public, so
+            it can also be constructed without that first check.
+
+    Raises:
+        WorkspaceAliasError: From any execution (:meth:`sql`, iteration,
+            :meth:`arrow`) whose ``alias`` names nothing attached to the
+            workspace at that moment.
     """
 
     __slots__ = ("_alias", "_select", "_terms", "_workspace")
@@ -499,6 +519,8 @@ class Query:
             The SQL text with ``?`` placeholders, and the values to bind.
 
         Raises:
+            WorkspaceAliasError: If this query names an alias that is not
+                attached to the workspace right now.
             FieldNotMaterializedError: If a referenced field has no column.
             FieldDeclarationMismatchError: If a reference's ftype or
                 multiplicity disagrees with the stored catalog record.
@@ -539,6 +561,8 @@ class Query:
             An iterator of :class:`Row`, ascending by ``frame_number``.
 
         Raises:
+            WorkspaceAliasError: If this query names an alias that is not
+                attached to the workspace right now.
             FieldNotMaterializedError: If a referenced field has no column.
             FieldDeclarationMismatchError: If a reference's ftype or
                 multiplicity disagrees with the stored catalog record.
@@ -570,6 +594,8 @@ class Query:
             key first.
 
         Raises:
+            WorkspaceAliasError: If this query names an alias that is not
+                attached to the workspace right now.
             FieldNotMaterializedError: If a referenced field has no column.
             FieldDeclarationMismatchError: If a reference's ftype or
                 multiplicity disagrees with the stored catalog record.
@@ -596,7 +622,19 @@ class Query:
         return table
 
     def _build(self, con: DuckDBPyConnection, *, arrow: bool) -> _Plan:
-        """Validate every referenced field, then compile the statement."""
+        """Validate the alias and every referenced field, then compile."""
+        # Re-checked here, not only in Workspace.query(): a Query is immutable
+        # and lazy, so an alias validated at construction can have been
+        # detached by the time this runs, and Query(ws, alias) is public and
+        # never went through that check at all. Without it the statement below
+        # reaches DuckDB and comes back as a raw BinderError far from the
+        # cause, which is exactly what naming the alias exists to prevent. It
+        # is a plain read of a public property: no connection, no write.
+        if self._alias is not None and self._alias not in self._workspace.attachments:
+            raise WorkspaceAliasError(
+                f"no workspace is attached as {self._alias!r}; it may have been "
+                f"detached since this query was built"
+            )
         # The catalog read follows the alias: an aliased query's fields are the
         # attached workspace's, never this one's.
         records = {record.abbrev: record for record in read_fields(con, database=self._alias)}

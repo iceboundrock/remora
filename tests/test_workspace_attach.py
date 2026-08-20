@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+import remora.workspace.workspace as workspace_module
 from remora.workspace.attach import (
     RESERVED_ALIASES,
     Attachment,
@@ -231,6 +232,46 @@ class TestWorkspaceAttach:
             assert dict(ws.attachments) == {}
             with ws.read() as connection:
                 assert "peer" not in attached_databases(connection)
+
+    def test_detach_in_rw_mode_opens_no_connection(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # rw mode holds no connection between operations, so nothing is attached
+        # and there is nothing to DETACH from: the record is the whole of the
+        # attachment there. Opening a connection for it bought nothing and could
+        # fail (a compact in flight) on an operation whose record deletion had
+        # already happened.
+        peer = make_workspace(tmp_path / "peer.duckdb")
+        with Workspace(make_workspace(tmp_path / "ws.duckdb"), mode="rw") as ws:
+            ws.attach(peer, "peer")
+
+            def forbidden(self: Workspace) -> Iterator[DuckDBPyConnection]:
+                raise AssertionError("detach must open no connection in rw mode")
+
+            monkeypatch.setattr(Workspace, "read", forbidden)
+            ws.detach("peer")
+            assert dict(ws.attachments) == {}
+
+    def test_detach_keeps_the_record_when_the_statement_fails(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # ro mode does issue the DETACH, on the held connection, and drops the
+        # record only afterwards: a failure must not report itself on an
+        # operation that already took effect.
+        peer = make_workspace(tmp_path / "peer.duckdb")
+        with Workspace(make_workspace(tmp_path / "ws.duckdb")) as ws:
+            ws.attach(peer, "peer")
+
+            def boom(con: DuckDBPyConnection, alias: str) -> None:
+                raise RuntimeError("DETACH failed")
+
+            monkeypatch.setattr(workspace_module, "detach_database", boom)
+            with pytest.raises(RuntimeError, match="DETACH failed"):
+                ws.detach("peer")
+            assert dict(ws.attachments) == {"peer": Path(os.path.realpath(peer))}
+            # Still live on the connection, exactly as the record says.
+            with ws.read() as connection:
+                assert "peer" in attached_databases(connection)
 
     def test_detach_unknown_alias(self, tmp_path: Path) -> None:
         primary = make_workspace(tmp_path / "ws.duckdb")

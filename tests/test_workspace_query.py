@@ -859,3 +859,126 @@ class TestAliasedQuery:
         upper = sql.upper()
         for verb in ("INSERT", "UPDATE", "DELETE", "CREATE", "ALTER", "DROP", "ATTACH"):
             assert verb not in upper
+
+    def test_arrow_reads_the_attached_rows(self, ws_with_peer: Workspace) -> None:
+        pytest.importorskip("pyarrow")
+        table = ws_with_peer.query(alias="peer").select(IP.dst).arrow()
+        assert table.num_rows == 2
+        assert table.column("frame_number").to_pylist() == [1, 2]
+
+
+class TestAliasedDeclarationMismatch:
+    """An alias-scoped mismatch names the workspace whose catalog was read.
+
+    The two workspaces are the same library version here; what diverges is the
+    *declaration* of one abbrev, which is the shape version skew takes — a
+    reference that is right for the primary is wrong for the peer, and the
+    refusal has to say which catalog it consulted or it reads as a contradiction
+    of the query that just worked.
+    """
+
+    @pytest.fixture
+    def ws_with_skewed_peer(self, tmp_path: Path) -> Iterator[Workspace]:
+        """A peer whose ``tcp.port`` is a *scalar* where the primary's is multi."""
+        peer_path = tmp_path / "peer.duckdb"
+        scalar_port = FieldRef[int]("tcp.port", "FT_UINT16", False)
+        with Workspace(peer_path, mode="rw") as peer:
+            seed(peer, (IP.src, scalar_port), ({"ip.src": ("10.0.0.1",), "tcp.port": ("443",)},))
+        with Workspace(tmp_path / "ws.duckdb", mode="rw") as workspace:
+            seed(workspace, (IP.src, TCP.port), PACKETS)
+            workspace.attach(peer_path, "peer")
+            yield workspace
+
+    def test_multiplicity_skew_is_refused_with_the_alias_named(
+        self, ws_with_skewed_peer: Workspace
+    ) -> None:
+        # The very same reference is correct for the primary...
+        assert frames(ws_with_skewed_peer.query().filter(TCP.port == 443)) == [1, 2]
+        # ...and disagrees with the peer, which stores tcp.port as a scalar.
+        with pytest.raises(FieldDeclarationMismatchError) as info:
+            list(ws_with_skewed_peer.query(alias="peer").filter(TCP.port == 443))
+        message = str(info.value)
+        assert "tcp.port is materialized as FT_UINT16 scalar" in message
+        assert "the reference declares FT_UINT16 multi-valued" in message
+        assert "attached workspace 'peer'" in message
+        assert "this workspace" not in message
+
+    def test_select_of_a_skewed_field_names_the_alias(self, ws_with_skewed_peer: Workspace) -> None:
+        with pytest.raises(FieldDeclarationMismatchError, match="attached workspace 'peer'"):
+            ws_with_skewed_peer.query(alias="peer").select(TCP.port).sql()
+
+    def test_row_access_mismatch_names_the_alias(self, ws_with_peer: Workspace) -> None:
+        # The Row.get fire site: the row carries the alias its plan was built
+        # with, so a stale reference there points at the peer's catalog too.
+        row = next(iter(ws_with_peer.query(alias="peer").select(IP.dst)))
+        stale = FieldRef[str]("ip.dst", "FT_STRING", False)
+        with pytest.raises(FieldDeclarationMismatchError) as info:
+            row.get(stale)
+        message = str(info.value)
+        assert "ip.dst is materialized as FT_IPv4 scalar" in message
+        assert "attached workspace 'peer'" in message
+
+    def test_row_access_get_all_mismatch_names_the_alias(self, ws_with_peer: Workspace) -> None:
+        row = next(iter(ws_with_peer.query(alias="peer").select(IP.dst)))
+        stale = FieldRef[IPv4Address]("ip.dst", "FT_IPv4", True)
+        with pytest.raises(FieldDeclarationMismatchError, match="attached workspace 'peer'"):
+            row.get_all(stale)
+
+    def test_the_primary_still_names_no_alias(self, ws_with_peer: Workspace) -> None:
+        stale = FieldRef[str]("ip.src", "FT_STRING", False)
+        with pytest.raises(FieldDeclarationMismatchError, match="this workspace"):
+            list(ws_with_peer.query().filter(stale == "10.0.0.1"))
+
+
+class TestDetachedAliasIsRefusedAtExecution:
+    """A Query is immutable and lazy, so the construction-time check goes stale.
+
+    Without the re-check in ``_build`` the compiled statement reached DuckDB and
+    came back as a raw ``BinderException: Catalog "peer" does not exist!`` — the
+    driver-error leak the up-front alias check exists to prevent, in the one
+    shape that check cannot cover.
+    """
+
+    MESSAGE = "no workspace is attached as 'peer'"
+
+    def test_iteration_after_detach(self, ws_with_peer: Workspace) -> None:
+        query = ws_with_peer.query(alias="peer")
+        assert frames(query) == [1, 2]
+        ws_with_peer.detach("peer")
+        with pytest.raises(WorkspaceAliasError, match=self.MESSAGE):
+            list(query)
+
+    def test_sql_after_detach(self, ws_with_peer: Workspace) -> None:
+        query = ws_with_peer.query(alias="peer")
+        ws_with_peer.detach("peer")
+        with pytest.raises(WorkspaceAliasError, match=self.MESSAGE):
+            query.sql()
+
+    def test_arrow_after_detach(self, ws_with_peer: Workspace) -> None:
+        pytest.importorskip("pyarrow")
+        query = ws_with_peer.query(alias="peer")
+        ws_with_peer.detach("peer")
+        with pytest.raises(WorkspaceAliasError, match=self.MESSAGE):
+            query.arrow()
+
+    def test_the_primary_query_is_unaffected(self, ws_with_peer: Workspace) -> None:
+        ws_with_peer.detach("peer")
+        assert frames(ws_with_peer.query()) == [1, 2, 3, 4, 5]
+
+    def test_direct_construction_is_validated_too(self, ws_with_peer: Workspace) -> None:
+        # Query is exported, so Workspace.query() is not the only way in and
+        # cannot be the only place the alias is checked.
+        query = Query(ws_with_peer, "nope")
+        with pytest.raises(WorkspaceAliasError, match="no workspace is attached as 'nope'"):
+            query.sql()
+        with pytest.raises(WorkspaceAliasError, match="no workspace is attached as 'nope'"):
+            list(query)
+
+    def test_reattaching_makes_the_query_work_again(self, ws_with_peer: Workspace) -> None:
+        peer_path = ws_with_peer.attachments["peer"]
+        query = ws_with_peer.query(alias="peer")
+        ws_with_peer.detach("peer")
+        with pytest.raises(WorkspaceAliasError):
+            list(query)
+        ws_with_peer.attach(peer_path, "peer")
+        assert frames(query) == [1, 2]

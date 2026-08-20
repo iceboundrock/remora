@@ -875,12 +875,18 @@ class Workspace:
         no connection between operations. :meth:`close` clears them.
 
         **What an attachment costs.** It takes a shared read lock on the
-        attached file for as long as it stays attached: another process cannot
-        write to it, and within this process it cannot be opened read-write at
-        all — so ``Workspace(peer, mode="rw")`` operations on an attached file
-        fail with DuckDB's ``Unique file handle conflict`` until it is detached.
-        Opening it ``mode="ro"`` is unaffected, as is :meth:`compact` on *this*
-        workspace, which replays no attachment and copies only its own database.
+        attached file for as long as it stays attached — which is for as long
+        as a connection carrying it is open. Another process cannot write to
+        the attached file meanwhile. Within *this* process the consequence
+        depends on this workspace's mode: in ``"ro"`` mode the connection is
+        held continuously, so the attached file cannot be opened read-write at
+        all (DuckDB's ``Unique file handle conflict``) until it is detached; in
+        ``"rw"`` mode the attachment — and its lock — exists only for the
+        duration of each :meth:`read` / :meth:`write` body, so between
+        operations ``Workspace(peer, mode="rw")`` opens fine. Opening the
+        attached file ``mode="ro"`` is unaffected either way, as is
+        :meth:`compact` on *this* workspace, which replays no attachment and
+        copies only its own database.
 
         Args:
             path: The workspace file to attach. Must exist, must be a workspace
@@ -946,6 +952,24 @@ class Workspace:
     def detach(self, alias: str) -> None:
         """Detach a workspace attached by :meth:`attach`.
 
+        What that takes is mode-dependent, because an attachment lives exactly
+        as long as a connection carrying it. In ``"ro"`` mode the held
+        connection is the one it was attached on, so the ``DETACH`` is issued
+        there **before** the record is dropped: a statement that fails leaves
+        the workspace exactly as it was, rather than reporting a failure for
+        something that already took effect. In ``"rw"`` mode there is no
+        connection between operations and therefore nothing attached, so this
+        is pure bookkeeping — dropping the record stops :meth:`read` and
+        :meth:`write` replaying the alias onto the connections they open, which
+        is the whole of what "attached" means there. No connection is opened
+        for it, so a :meth:`detach` cannot fail on a lock or on a
+        :meth:`compact` in flight.
+
+        The one rw-mode residual: a :meth:`detach` nested inside an enclosing
+        :meth:`read` or :meth:`write` body does not detach from that body's
+        live connection — the alias stays reachable through it until the body
+        ends, and is not replayed onto any later connection.
+
         Args:
             alias: The alias to detach.
 
@@ -959,9 +983,10 @@ class Workspace:
             raise WorkspaceAliasError(
                 f"no workspace is attached as {alias!r}; attached: {attached}"
             )
+        if self._mode == "ro":
+            with self.read() as con:
+                detach_database(con, alias)
         del self._attachments[alias]
-        with self.read() as con:
-            detach_database(con, alias)
 
     def compact(self) -> None:
         """Rewrite the workspace file to reclaim space.

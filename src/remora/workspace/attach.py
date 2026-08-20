@@ -31,15 +31,21 @@ same file read-only, and refused when it does not.
 What an attachment costs
 ------------------------
 A read-only attachment takes a **shared read lock** on the peer file for as
-long as it is attached. Three consequences, all measured rather than assumed:
+long as it is attached — that is, for as long as a connection carrying it is
+open. Three consequences, all measured rather than assumed:
 
 * Another *process* cannot write to an attached file (DuckDB's
   ``Could not set lock on file ...`` ``IOException``), and conversely attaching
   a file another process holds read-write fails the same way.
-* Within *this* process a ro-attached file cannot be opened read-write at all —
-  ``Unique file handle conflict`` — so ``Workspace(peer, mode="rw")`` operations
-  (``materialize``, ``build_streams``, ``compact``, any ``write()``) fail while
-  the peer is attached. ``Workspace(peer, mode="ro")`` is unaffected.
+* Within *this* process the reach of that depends on the attaching workspace's
+  mode. In ``"ro"`` mode, where the connection is held continuously, a
+  ro-attached file cannot be opened read-write at all — ``Unique file handle
+  conflict`` — so ``Workspace(peer, mode="rw")`` operations (``materialize``,
+  ``build_streams``, ``compact``, any ``write()``) fail while the peer is
+  attached. In ``"rw"`` mode the attachment — and its lock — exists only for
+  the duration of each ``read()``/``write()`` body, so between operations the
+  peer opens read-write fine. ``Workspace(peer, mode="ro")`` is unaffected
+  either way.
 * Compaction of the *primary* is unaffected: ``compact()`` opens its own
   connection and replays nothing, and ``COPY FROM DATABASE`` names the current
   database explicitly, so no attachment is ever copied into a compacted file.
