@@ -773,8 +773,8 @@ class Workspace:
                 batch_size=batch_size,
             )
 
-    def query(self) -> Query:
-        """Start a query over this workspace's materialized rows.
+    def query(self, *, alias: str | None = None) -> Query:
+        """Start a query over this workspace's, or an attached workspace's, rows.
 
         The cache-side counterpart of :class:`remora.Capture`: the same ``Expr``
         trees, compiled to a DuckDB predicate instead of a display filter, over
@@ -791,10 +791,27 @@ class Workspace:
         disagrees with the stored catalog, is refused by name before any
         generated SQL reaches DuckDB; see :mod:`remora.workspace.query`.
 
+        Args:
+            alias: Query a workspace attached with :meth:`attach` instead of
+                this one. The query then selects from ``alias.main.pkts`` and
+                validates every referenced field against *that* workspace's
+                ``meta.fields``, so a field materialized here but not there is
+                refused with the alias named. ``Query`` stays single-table; a
+                cross-capture *join* is ordinary SQL over the connection
+                :meth:`read` hands out.
+
         Returns:
-            A new :class:`~remora.workspace.query.Query` over this workspace.
+            A new :class:`~remora.workspace.query.Query`.
+
+        Raises:
+            WorkspaceAliasError: If ``alias`` names no attached workspace.
         """
-        return Query(self)
+        if alias is not None and alias not in self._attachments:
+            attached = ", ".join(self._attachments) or "none"
+            raise WorkspaceAliasError(
+                f"no workspace is attached as {alias!r}; attached: {attached}"
+            )
+        return Query(self, alias)
 
     def build_streams(self) -> StreamsResult:
         """Roll materialized packets up into ``streams`` in one transaction.

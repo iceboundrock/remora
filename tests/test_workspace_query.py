@@ -45,6 +45,7 @@ from remora.workspace import (
     register_fields,
     to_db_timestamp,
 )
+from remora.workspace.errors import WorkspaceAliasError
 from remora.workspace.naming import SKELETON_ABBREVS, SKELETON_COLUMNS, column_name
 
 pytest.importorskip("duckdb")
@@ -770,6 +771,91 @@ class TestReadPathOnly:
 
     def test_query_issues_no_ddl_or_dml(self, ws: Workspace) -> None:
         sql, _params = ws.query().filter(IP.src.present()).sql()
+        upper = sql.upper()
+        for verb in ("INSERT", "UPDATE", "DELETE", "CREATE", "ALTER", "DROP", "ATTACH"):
+            assert verb not in upper
+
+
+PEER_PACKETS: tuple[dict[str, tuple[str, ...]], ...] = (
+    {"ip.src": ("10.0.0.1",), "ip.dst": ("10.9.9.9",)},
+    {"ip.src": ("10.0.0.7",), "ip.dst": ("10.9.9.9",)},
+)
+
+
+@pytest.fixture
+def ws_with_peer(tmp_path: Path) -> Iterator[Workspace]:
+    """An rw workspace with a second workspace attached as 'peer'.
+
+    The primary holds ip.src + tcp.port; the peer holds ip.src + ip.dst, so
+    tcp.port is materialized in the primary and *not* in the peer, and ip.dst
+    the other way round.
+    """
+    peer_path = tmp_path / "peer.duckdb"
+    with Workspace(peer_path, mode="rw") as peer:
+        seed(peer, (IP.src, IP.dst), PEER_PACKETS)
+    with Workspace(tmp_path / "ws.duckdb", mode="rw") as workspace:
+        seed(workspace, (IP.src, TCP.port), PACKETS)
+        workspace.attach(peer_path, "peer")
+        yield workspace
+
+
+class TestAliasedQuery:
+    def test_selects_from_the_attached_pkts(self, ws_with_peer: Workspace) -> None:
+        assert frames(ws_with_peer.query(alias="peer")) == [1, 2]
+        assert frames(ws_with_peer.query()) == [1, 2, 3, 4, 5]
+
+    def test_sql_names_the_attached_table(self, ws_with_peer: Workspace) -> None:
+        sql, _params = ws_with_peer.query(alias="peer").sql()
+        assert 'FROM "peer".main.pkts' in sql
+        plain, _ = ws_with_peer.query().sql()
+        assert "FROM main.pkts" in plain
+
+    def test_filters_run_against_the_attached_rows(self, ws_with_peer: Workspace) -> None:
+        assert frames(ws_with_peer.query(alias="peer").filter(IP.src == "10.0.0.7")) == [2]
+        # The same filter over the primary picks a different frame set.
+        assert frames(ws_with_peer.query().filter(IP.src == "10.0.0.1")) == [1, 4]
+
+    def test_rows_decode_through_the_attached_catalog(self, ws_with_peer: Workspace) -> None:
+        rows = list(ws_with_peer.query(alias="peer").select(IP.dst))
+        assert [row.get(IP.dst) for row in rows] == [IPv4Address("10.9.9.9")] * 2
+        assert rows[0].frame_number == 1
+
+    def test_row_key_is_reachable_on_an_aliased_query(self, ws_with_peer: Workspace) -> None:
+        row = next(iter(ws_with_peer.query(alias="peer")))
+        assert row.get(FRAME_NUMBER) == 1
+
+    def test_a_field_the_peer_lacks_names_the_alias(self, ws_with_peer: Workspace) -> None:
+        # tcp.port IS materialized in the primary and is NOT in the peer.
+        assert frames(ws_with_peer.query().filter(TCP.port == 443)) == [1, 2]
+        with pytest.raises(FieldNotMaterializedError, match=re.escape("tcp.port")) as excinfo:
+            list(ws_with_peer.query(alias="peer").filter(TCP.port == 443))
+        message = str(excinfo.value)
+        assert "'peer'" in message
+        assert "is not materialized" in message
+
+    def test_a_field_the_primary_lacks_still_names_no_alias(self, ws_with_peer: Workspace) -> None:
+        with pytest.raises(FieldNotMaterializedError) as excinfo:
+            list(ws_with_peer.query().filter(IP.dst == "10.9.9.9"))
+        assert "peer" not in str(excinfo.value)
+
+    def test_select_of_a_missing_field_also_names_the_alias(self, ws_with_peer: Workspace) -> None:
+        with pytest.raises(FieldNotMaterializedError, match="'peer'"):
+            ws_with_peer.query(alias="peer").select(TCP.port).sql()
+
+    def test_unknown_alias_is_refused_at_construction(self, ws_with_peer: Workspace) -> None:
+        with pytest.raises(WorkspaceAliasError, match="no workspace is attached as 'nope'"):
+            ws_with_peer.query(alias="nope")
+
+    def test_chaining_keeps_the_alias(self, ws_with_peer: Workspace) -> None:
+        chained = ws_with_peer.query(alias="peer").filter(IP.src.present()).select(IP.dst)
+        sql, _ = chained.sql()
+        assert 'FROM "peer".main.pkts' in sql
+
+    def test_repr_names_the_alias(self, ws_with_peer: Workspace) -> None:
+        assert "peer" in repr(ws_with_peer.query(alias="peer"))
+
+    def test_aliased_query_issues_no_write(self, ws_with_peer: Workspace) -> None:
+        sql, _params = ws_with_peer.query(alias="peer").sql()
         upper = sql.upper()
         for verb in ("INSERT", "UPDATE", "DELETE", "CREATE", "ALTER", "DROP", "ATTACH"):
             assert verb not in upper
