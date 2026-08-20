@@ -402,7 +402,10 @@ _OP_SLUG: dict[str, str] = {
 #: One packet that satisfies each positive test, one that does not, and EMPTY.
 #: EMPTY is the whole point: every positive operator is False on an absent
 #: field, on every backend, whether the column stores NULL (scalar) or []
-#: (multi) — and every negated one is therefore True.
+#: (multi) — and every negated one is therefore True. Where these restate a case
+#: the base table above already covers (the four `null-*-scalar` ordering cases
+#: and `null-in-multi`) the overlap is intentional: the point is a complete grid
+#: over operator, multiplicity and polarity, not duplication to clean up.
 NULL_TRUTH_POSITIVE: tuple[Case, ...] = (
     Case(
         id="null-eq-scalar",

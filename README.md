@@ -178,6 +178,8 @@ This works as long as the *parent* of the output directory is on the import path
 
 For a worked end-to-end example (non-core protocol, `--multi` curation, imports), see the [codegen guide](docs/codegen.md).
 
+What an operator means when a field is absent, and which regex constructs survive all three backends, is documented in [docs/semantics.md](docs/semantics.md).
+
 ## Contributing: regenerating the committed protocols
 
 Protocol modules under `src/remora/proto/` (and the extras packages) are generated artifacts pinned to the tshark version in `codegen.toml`; CI re-checks byte equality on every pull request and every push to `main` (`uv run python -m remora.codegen check`). How to regenerate them, and what to do when the drift check fails, is covered in [docs/codegen.md](docs/codegen.md).
