@@ -9,6 +9,7 @@ __all__ = [
     "MaterializationMismatchError",
     "MissingStreamFieldsError",
     "SchemaVersionError",
+    "WorkspaceAliasError",
     "WorkspaceError",
     "WorkspaceModeError",
 ]
@@ -16,6 +17,17 @@ __all__ = [
 
 class WorkspaceError(Exception):
     """Base class for every workspace failure."""
+
+
+class WorkspaceAliasError(WorkspaceError):
+    """A workspace alias is invalid, already in use, or not attached.
+
+    Raised by :mod:`remora.workspace.attach` and the ``Workspace.attach`` /
+    ``Workspace.detach`` / ``Workspace.query`` entry points. It is deliberately
+    distinct from the file-level refusals (:class:`WorkspaceError`) and the
+    layout refusal (:class:`SchemaVersionError`): this one always means the
+    caller named the alias wrong, never that the file is unusable.
+    """
 
 
 class SchemaVersionError(WorkspaceError):
