@@ -7,8 +7,15 @@ queryable with plain SQL alongside them.
 
 Record shape
 ------------
-The layout's ``main.annotations`` table (#25) is used exactly as it stands —
-no column is added, renamed or retyped, so ``SCHEMA_VERSION`` stays 1:
+This API was built on the layout's ``main.annotations`` table (#25) exactly as
+it stood — it renamed and retyped nothing, and cost no ``SCHEMA_VERSION`` bump
+of its own. The one column it did not start with is ``protocol``, added by #33
+in the v2 layout: once ``main.streams`` was keyed by ``(protocol, stream_id)``
+a stream annotation had to name that same pair, so the column rides along with
+the streams change rather than paying for a bump of its own (see "Naming a
+stream" below).
+
+The v2 shape:
 
 ==================  ====================================================
 Column              Holds
@@ -16,6 +23,8 @@ Column              Holds
 ``annotation_id``   Row key, assigned by :func:`add_annotation`.
 ``scope``           ``'packet'`` or ``'stream'`` (:data:`ANNOTATION_SCOPES`).
 ``target_id``       ``pkts.frame_number`` or ``streams.stream_id``.
+``protocol``        ``'tcp'``/``'udp'`` for a stream annotation, ``NULL`` for
+                    a packet one. See "Naming a stream" below.
 ``key``             Short label, e.g. ``'verdict'``. Never empty.
 ``value``           Free-form body, or ``NULL`` for a bare tag.
 ``created_at``      When the annotation was written (naive UTC).
@@ -23,11 +32,11 @@ Column              Holds
 
 ``annotation_id`` comes from a monotonic high-water mark stored in
 ``meta.info`` under ``next_annotation_id`` — a row in the key/value catalog
-table every v1 workspace already has, so nothing about the layout changes and
-``SCHEMA_VERSION`` stays 1. A sequence would be the obvious allocator and is
-not available: ``create_schema`` is ``IF NOT EXISTS``-only and an opener runs
-it only on an empty database, so a workspace written before a sequence existed
-could never acquire one.
+table every workspace already has, so the *allocator* needed no layout change
+of its own. A sequence would be the obvious allocator and is not available:
+``create_schema`` is ``IF NOT EXISTS``-only and an opener runs it only on an
+empty database, so a workspace written before a sequence existed could never
+acquire one.
 
 The mark only ever moves forward, so **ids are never reused**. Deleting the
 highest-numbered annotation does not free its id, an id held across a deletion
@@ -47,10 +56,11 @@ exclusive file lock.
 A workspace written before this key existed has no mark, and what happens then
 depends on whether it holds annotations:
 
-* **Empty ``main.annotations``** — the only state a real upgraded file can be
-  in, since every ``SCHEMA_VERSION`` 1 file released remora ever wrote predates
-  this API — is seeded silently: the first :func:`add_annotation` writes the
-  mark and returns id 1, with no ceremony asked of the caller.
+* **Empty ``main.annotations``** — the state any real markless file is in, since
+  a file this library will open at all shares its layout version, and a
+  remora that wrote this layout without ever writing the mark also never
+  wrote an annotation — is seeded silently: the first :func:`add_annotation`
+  writes the mark and returns id 1, with no ceremony asked of the caller.
 * **Rows present but no mark** is refused with
   :exc:`~remora.workspace.errors.WorkspaceError`. The past high-water mark
   cannot be reconstructed from the surviving rows: an id that was issued and
@@ -75,6 +85,20 @@ where it stood. Deleting it by hand over an *empty* ``main.annotations`` is
 catalog corruption remora cannot detect — that state is indistinguishable from
 a fresh workspace, so the next :func:`add_annotation` re-seeds at 1 and the
 never-reused guarantee is void for every id issued before the deletion.
+
+Naming a stream
+---------------
+``main.streams`` is keyed by ``(protocol, stream_id)`` (#33): tcp and udp each
+number their conversations from zero, so ``stream_id`` alone names two rows.
+A stream annotation therefore carries the protocol too, and
+:func:`add_annotation` **requires** it for ``scope="stream"`` rather than
+defaulting or guessing. A bare id would be an annotation that cannot say which
+conversation it is about, and — worse — the orphan check would call it live
+whenever *either* protocol happened to have that id, so an annotation on a
+missing udp stream 0 would read as non-orphaned because a tcp stream 0 existed.
+
+Packet annotations take no protocol: ``frame_number`` is unique on its own, so
+supplying one is refused rather than stored and never matched.
 
 Capture identity
 ----------------
@@ -106,9 +130,10 @@ packets they point at. :func:`list_annotations` computes
 :attr:`AnnotationRecord.orphaned` at read time — true when no row in
 ``pkts`` (or ``streams``) carries the annotation's ``target_id`` — and
 :func:`delete_orphan_annotations` is the explicit cleanup a caller can run
-when it really does want them gone. ``main.streams`` is unpopulated until
-#33 lands stream semantics, so every stream annotation currently reads as
-``orphaned=True`` and :func:`delete_orphan_annotations` removes all of them.
+when it really does want them gone. ``main.streams`` is populated by
+:func:`remora.workspace.streams.build_streams` (#33) and empty until it is
+called, so in a workspace that has only been materialized every stream
+annotation reads as ``orphaned=True`` until the streams are built.
 
 Connections are supplied by the caller — this module never opens one, because
 connection and lock ownership belongs to ``Workspace`` (#28), whose
@@ -124,6 +149,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Final, Literal
 
 from remora.workspace.errors import WorkspaceError
+from remora.workspace.streams import STREAM_PROTOCOLS
 from remora.workspace.types import from_db_timestamp, to_db_timestamp
 
 if TYPE_CHECKING:
@@ -155,13 +181,22 @@ _NEXT_ID_KEY: Final[str] = "next_annotation_id"
 # annotation out into several rows if a frame number ever repeated. Both
 # references are schema-qualified within the current database, like every
 # other probe in this package.
+#
+# The stream branch matches the *pair*, because (protocol, stream_id) is what
+# main.streams is keyed by: tcp stream 0 and udp stream 0 are two different
+# conversations, and matching on the id alone let an annotation on a missing
+# udp stream 0 read as live because a tcp stream 0 happened to exist. A stream
+# annotation with a NULL protocol cannot name a stream at all, and
+# `s.protocol = NULL` is NULL, so it reads as orphaned — the conservative
+# answer, and unreachable through this API, which requires the protocol.
 _ORPHANED: Final[str] = """
     CASE a.scope
         WHEN 'packet' THEN NOT EXISTS (
             SELECT 1 FROM main.pkts AS p WHERE p.frame_number = a.target_id
         )
         WHEN 'stream' THEN NOT EXISTS (
-            SELECT 1 FROM main.streams AS s WHERE s.stream_id = a.target_id
+            SELECT 1 FROM main.streams AS s
+            WHERE s.stream_id = a.target_id AND s.protocol = a.protocol
         )
         ELSE FALSE
     END
@@ -176,6 +211,10 @@ class AnnotationRecord:
         annotation_id: Row key assigned by :func:`add_annotation`.
         scope: ``"packet"`` or ``"stream"``.
         target_id: ``pkts.frame_number`` or ``streams.stream_id``.
+        protocol: ``"tcp"``/``"udp"`` for a stream annotation, completing the
+            ``(protocol, stream_id)`` pair ``main.streams`` is keyed by;
+            ``None`` for a packet annotation, whose ``frame_number`` needs no
+            qualifier.
         key: Short label, e.g. ``"verdict"``.
         value: Free-form body, or ``None`` for a bare tag.
         created_at: When the annotation was written (aware, UTC).
@@ -192,6 +231,7 @@ class AnnotationRecord:
     value: str | None
     created_at: datetime
     orphaned: bool = False
+    protocol: str | None = None
 
 
 def _check_scope(scope: str) -> None:
@@ -207,8 +247,44 @@ def _as_scope(value: Any) -> AnnotationScope:
     return scope
 
 
+def _check_target_protocol(scope: AnnotationScope, protocol: str | None) -> None:
+    """Refuse a target that cannot name exactly one row of its table.
+
+    ``main.streams`` is keyed by ``(protocol, stream_id)``, so a stream
+    annotation must carry both halves: a bare id names a tcp *and* a udp
+    conversation, and the orphan check could not tell which one the analyst
+    meant. A packet annotation carries no protocol at all — ``frame_number``
+    is already unique on its own — so supplying one is refused rather than
+    silently stored and never matched.
+
+    Args:
+        scope: The annotation's scope, already validated.
+        protocol: The protocol qualifier as the caller supplied it.
+
+    Raises:
+        ValueError: If a stream annotation has no legal protocol, or a packet
+            annotation has one.
+    """
+    if scope == "stream":
+        if protocol not in STREAM_PROTOCOLS:
+            raise ValueError(
+                f"a stream annotation must name the protocol as well as the stream id: "
+                f"main.streams is keyed by (protocol, stream_id), so tcp stream 0 and "
+                f"udp stream 0 are different conversations and a bare id names neither. "
+                f"Pass protocol as one of {STREAM_PROTOCOLS}, not {protocol!r}"
+            )
+    elif protocol is not None:
+        raise ValueError(
+            f"a packet annotation takes no protocol (frame_number identifies a packet "
+            f"on its own); got protocol={protocol!r}"
+        )
+
+
 def _filters(
-    scope: AnnotationScope | None, target_id: int | None, key: str | None
+    scope: AnnotationScope | None,
+    target_id: int | None,
+    key: str | None,
+    protocol: str | None = None,
 ) -> tuple[str, list[Any]]:
     """Build the shared WHERE clause and its bound parameters.
 
@@ -216,6 +292,8 @@ def _filters(
         scope: Restrict to one scope, or ``None`` for both.
         target_id: Restrict to one frame number / stream id.
         key: Restrict to one label.
+        protocol: Restrict to one stream protocol. Only stream annotations
+            carry one, so this also excludes every packet annotation.
 
     Returns:
         The clause (empty string when unfiltered) and its parameters.
@@ -229,6 +307,9 @@ def _filters(
     if target_id is not None:
         clauses.append("a.target_id = ?")
         params.append(target_id)
+    if protocol is not None:
+        clauses.append("a.protocol = ?")
+        params.append(protocol)
     if key is not None:
         clauses.append('a."key" = ?')
         params.append(key)
@@ -296,6 +377,7 @@ def add_annotation(
     key: str,
     value: str | None = None,
     *,
+    protocol: str | None = None,
     created_at: datetime | None = None,
 ) -> int:
     """Attach an annotation to a packet or a stream.
@@ -303,6 +385,11 @@ def add_annotation(
     The target does not have to exist: annotating a frame that a later,
     narrower materialization removes is exactly the orphan case this module
     keeps and flags rather than refusing.
+
+    A **stream** annotation must name its protocol as well as its id, because
+    ``main.streams`` is keyed by ``(protocol, stream_id)`` — tcp stream 0 and
+    udp stream 0 are different conversations. A bare id is refused rather than
+    guessed at.
 
     Args:
         con: A read-write connection to the workspace, **inside a
@@ -318,6 +405,9 @@ def add_annotation(
         target_id: The frame number or stream id being annotated.
         key: Short label, e.g. ``"verdict"``. Must not be empty.
         value: Free-form body, or ``None`` for a bare tag.
+        protocol: Required for ``scope="stream"`` — ``"tcp"`` or ``"udp"``,
+            completing the ``(protocol, stream_id)`` pair. Must be omitted for
+            ``scope="packet"``, whose ``frame_number`` is unique on its own.
         created_at: When the annotation was made; defaults to now. A naive
             datetime is taken to be UTC already.
 
@@ -326,7 +416,9 @@ def add_annotation(
         in the module docstring: monotonic, and never reused.
 
     Raises:
-        ValueError: If ``scope`` is not a legal scope, or ``key`` is empty.
+        ValueError: If ``scope`` is not a legal scope, ``key`` is empty, a
+            stream annotation names no legal ``protocol``, or a packet
+            annotation names one.
         WorkspaceError: If the workspace holds annotation rows but no
             ``next_annotation_id`` mark. The deleted-id history is
             unrecoverable there, so no seed can honour the never-reused
@@ -340,15 +432,16 @@ def add_annotation(
             there the race is not detected and no error is raised.
     """
     _check_scope(scope)
+    _check_target_protocol(scope, protocol)
     if not key:
         raise ValueError("an annotation key must not be empty")
     stamp = datetime.now(timezone.utc) if created_at is None else created_at
     annotation_id = _allocate_annotation_id(con)
     con.execute(
         "INSERT INTO main.annotations "
-        '(annotation_id, scope, target_id, "key", value, created_at) '
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        [annotation_id, scope, target_id, key, value, to_db_timestamp(stamp)],
+        '(annotation_id, scope, target_id, protocol, "key", value, created_at) '
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [annotation_id, scope, target_id, protocol, key, value, to_db_timestamp(stamp)],
     )
     return annotation_id
 
@@ -359,6 +452,7 @@ def list_annotations(
     scope: AnnotationScope | None = None,
     target_id: int | None = None,
     key: str | None = None,
+    protocol: str | None = None,
 ) -> tuple[AnnotationRecord, ...]:
     """Read annotations, ascending by id, each flagged for orphanhood.
 
@@ -372,8 +466,11 @@ def list_annotations(
         target_id: Restrict to one frame number or stream id. Frame numbers
             and stream ids are separate namespaces that overlap, so ``None``
             scope with a given ``target_id`` matches annotations in both
-            scopes; pass ``scope`` to mean one.
+            scopes; pass ``scope`` to mean one. Stream ids overlap *between
+            protocols* too, so pair it with ``protocol`` to name one stream.
         key: Restrict to one label.
+        protocol: Restrict to one stream protocol. Only stream annotations
+            carry one, so this excludes every packet annotation.
 
     Returns:
         Matching annotations, ascending by ``annotation_id``.
@@ -382,10 +479,10 @@ def list_annotations(
         ValueError: If ``scope`` is not a legal scope, or a stored scope is
             not one this library knows.
     """
-    where, params = _filters(scope, target_id, key)
+    where, params = _filters(scope, target_id, key, protocol)
     rows = con.execute(
         'SELECT a.annotation_id, a.scope, a.target_id, a."key", a.value, a.created_at, '
-        f"{_ORPHANED} AS orphaned "
+        f"a.protocol, {_ORPHANED} AS orphaned "
         f"FROM main.annotations AS a{where} ORDER BY a.annotation_id",
         params,
     ).fetchall()
@@ -397,7 +494,8 @@ def list_annotations(
             key=row[3],
             value=row[4],
             created_at=from_db_timestamp(row[5]),
-            orphaned=bool(row[6]),
+            protocol=row[6],
+            orphaned=bool(row[7]),
         )
         for row in rows
     )
@@ -434,6 +532,7 @@ def remove_annotations(
     scope: AnnotationScope | None = None,
     target_id: int | None = None,
     key: str | None = None,
+    protocol: str | None = None,
 ) -> int:
     """Remove every annotation matching the given filters.
 
@@ -449,8 +548,11 @@ def remove_annotations(
             and stream ids are separate namespaces that overlap, so ``None``
             scope with a given ``target_id`` matches annotations in both
             scopes; pass ``scope`` to mean one. It matters most on this
-            destructive call.
+            destructive call — as does ``protocol``, since a bare stream id
+            matches the tcp and the udp conversation alike.
         key: Restrict to one label.
+        protocol: Restrict to one stream protocol. Only stream annotations
+            carry one, so this excludes every packet annotation.
 
     Returns:
         How many annotations were removed.
@@ -458,12 +560,12 @@ def remove_annotations(
     Raises:
         ValueError: If no filter is given, or ``scope`` is not a legal scope.
     """
-    if scope is None and target_id is None and key is None:
+    if scope is None and target_id is None and key is None and protocol is None:
         raise ValueError(
-            "remove_annotations needs at least one of scope, target_id or key; "
-            "removing every annotation must be spelled out in SQL"
+            "remove_annotations needs at least one of scope, target_id, key or "
+            "protocol; removing every annotation must be spelled out in SQL"
         )
-    where, params = _filters(scope, target_id, key)
+    where, params = _filters(scope, target_id, key, protocol)
     row = con.execute(f"DELETE FROM main.annotations AS a{where}", params).fetchone()
     return 0 if row is None else int(row[0])
 
@@ -474,9 +576,10 @@ def delete_orphan_annotations(con: DuckDBPyConnection) -> int:
     The explicit half of the kept-but-flagged policy: nothing deletes an
     orphan on its own, because a re-materialization under a wider filter can
     bring its target back. Call this when the current ``pkts``/``streams``
-    contents are the ones to keep. ``main.streams`` is unpopulated until #33
-    lands stream semantics, so every stream annotation currently reads as
-    orphaned and this call removes all of them.
+    contents are the ones to keep — including
+    :func:`remora.workspace.streams.build_streams` having been run, since
+    every stream annotation reads as orphaned while ``main.streams`` is
+    still empty.
 
     Args:
         con: A read-write connection to the workspace.

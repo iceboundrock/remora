@@ -7,6 +7,7 @@ __all__ = [
     "FieldDeclarationMismatchError",
     "FieldNotMaterializedError",
     "MaterializationMismatchError",
+    "MissingStreamFieldsError",
     "SchemaVersionError",
     "WorkspaceError",
     "WorkspaceModeError",
@@ -59,3 +60,19 @@ class FieldDeclarationMismatchError(WorkspaceError):
     otherwise leak out as a raw duckdb ``ConversionException`` /
     ``BinderException`` into a refusal naming both declarations.
     """
+
+
+class MissingStreamFieldsError(WorkspaceError):
+    """Sessionization needs fields this workspace never materialized.
+
+    Raised before any SQL runs over ``pkts``, so the message names the exact
+    abbrevs to add to ``materialize()``'s field set instead of surfacing as a
+    DuckDB "column not found".
+
+    Attributes:
+        missing: The required abbrevs absent from ``meta.fields``, sorted.
+    """
+
+    def __init__(self, message: str, missing: tuple[str, ...]) -> None:
+        super().__init__(message)
+        self.missing = missing
