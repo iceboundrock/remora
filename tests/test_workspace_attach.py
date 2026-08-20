@@ -18,8 +18,9 @@ from remora.workspace.attach import (
     detach_database,
     validate_alias,
 )
-from remora.workspace.errors import SchemaVersionError, WorkspaceAliasError
+from remora.workspace.errors import SchemaVersionError, WorkspaceAliasError, WorkspaceError
 from remora.workspace.schema import create_schema
+from remora.workspace.workspace import Mode, Workspace
 
 if TYPE_CHECKING:
     from duckdb import DuckDBPyConnection
@@ -156,3 +157,184 @@ class TestApplyAttachments:
         # Try to apply it as read-only via apply_attachments
         with pytest.raises(WorkspaceAliasError, match="read-write"):
             apply_attachments(con, [Attachment("w", peer_path)])
+
+
+def make_workspace(path: Path) -> Path:
+    """A real workspace file created through the public opener."""
+    with Workspace(path, mode="rw"):
+        pass
+    return path
+
+
+class TestWorkspaceAttach:
+    @pytest.mark.parametrize("mode", ["ro", "rw"])
+    def test_attaches_and_records(self, tmp_path: Path, mode: Mode) -> None:
+        peer = make_workspace(tmp_path / "peer.duckdb")
+        primary = make_workspace(tmp_path / "ws.duckdb")
+        with Workspace(primary, mode=mode) as ws:
+            ws.attach(peer, "peer")
+            assert dict(ws.attachments) == {"peer": Path(os.path.realpath(peer))}
+            with ws.read() as connection:
+                assert connection.execute('SELECT count(*) FROM "peer".main.pkts').fetchone() == (
+                    0,
+                )
+
+    @pytest.mark.parametrize("mode", ["ro", "rw"])
+    def test_attachment_is_read_only_in_either_mode(self, tmp_path: Path, mode: Mode) -> None:
+        peer = make_workspace(tmp_path / "peer.duckdb")
+        primary = make_workspace(tmp_path / "ws.duckdb")
+        with Workspace(primary, mode=mode) as ws:
+            ws.attach(peer, "peer")
+            with ws.read() as connection:
+                assert attached_databases(connection)["peer"][1] is True
+                with pytest.raises(duckdb.Error, match="read-only"):
+                    connection.execute('INSERT INTO "peer".main.pkts (frame_number) VALUES (1)')
+
+    def test_write_connection_also_carries_the_attachment(self, tmp_path: Path) -> None:
+        peer = make_workspace(tmp_path / "peer.duckdb")
+        with Workspace(make_workspace(tmp_path / "ws.duckdb"), mode="rw") as ws:
+            ws.attach(peer, "peer")
+            with ws.write() as connection:
+                assert connection.execute('SELECT count(*) FROM "peer".main.pkts').fetchone() == (
+                    0,
+                )
+                with pytest.raises(duckdb.Error, match="read-only"):
+                    connection.execute('INSERT INTO "peer".main.pkts (frame_number) VALUES (1)')
+
+    def test_replay_survives_rw_short_lived_connections(self, tmp_path: Path) -> None:
+        # rw mode holds no connection between operations, so the DuckDB instance
+        # (and its attachments) dies in between; only replay makes this pass.
+        peer = make_workspace(tmp_path / "peer.duckdb")
+        with Workspace(make_workspace(tmp_path / "ws.duckdb"), mode="rw") as ws:
+            ws.attach(peer, "peer")
+            for _ in range(3):
+                with ws.read() as connection:
+                    assert connection.execute(
+                        'SELECT count(*) FROM "peer".main.pkts'
+                    ).fetchone() == (0,)
+
+    def test_multiple_workspaces_attach(self, tmp_path: Path) -> None:
+        a = make_workspace(tmp_path / "a.duckdb")
+        b = make_workspace(tmp_path / "b.duckdb")
+        with Workspace(make_workspace(tmp_path / "ws.duckdb")) as ws:
+            ws.attach(a, "a")
+            ws.attach(b, "b")
+            assert list(ws.attachments) == ["a", "b"]
+            with ws.read() as connection:
+                assert set(attached_databases(connection)) == {"a", "b"}
+
+    def test_detach(self, tmp_path: Path) -> None:
+        peer = make_workspace(tmp_path / "peer.duckdb")
+        with Workspace(make_workspace(tmp_path / "ws.duckdb")) as ws:
+            ws.attach(peer, "peer")
+            ws.detach("peer")
+            assert dict(ws.attachments) == {}
+            with ws.read() as connection:
+                assert "peer" not in attached_databases(connection)
+
+    def test_detach_unknown_alias(self, tmp_path: Path) -> None:
+        primary = make_workspace(tmp_path / "ws.duckdb")
+        with (
+            Workspace(primary) as ws,
+            pytest.raises(WorkspaceAliasError, match="no workspace is attached as 'peer'"),
+        ):
+            ws.detach("peer")
+
+    def test_close_clears_attachments(self, tmp_path: Path) -> None:
+        peer = make_workspace(tmp_path / "peer.duckdb")
+        ws = Workspace(make_workspace(tmp_path / "ws.duckdb")).open()
+        ws.attach(peer, "peer")
+        ws.close()
+        assert dict(ws.attachments) == {}
+
+    def test_attach_requires_an_open_workspace(self, tmp_path: Path) -> None:
+        peer = make_workspace(tmp_path / "peer.duckdb")
+        ws = Workspace(make_workspace(tmp_path / "ws.duckdb"))
+        with pytest.raises(WorkspaceError, match="not open"):
+            ws.attach(peer, "peer")
+
+
+class TestWorkspaceAttachRefusals:
+    def test_duplicate_alias(self, tmp_path: Path) -> None:
+        a = make_workspace(tmp_path / "a.duckdb")
+        b = make_workspace(tmp_path / "b.duckdb")
+        with Workspace(make_workspace(tmp_path / "ws.duckdb")) as ws:
+            ws.attach(a, "peer")
+            with pytest.raises(WorkspaceAliasError, match="already attached"):
+                ws.attach(b, "peer")
+            assert dict(ws.attachments) == {"peer": Path(os.path.realpath(a))}
+
+    def test_invalid_alias(self, tmp_path: Path) -> None:
+        peer = make_workspace(tmp_path / "peer.duckdb")
+        primary = make_workspace(tmp_path / "ws.duckdb")
+        with (
+            Workspace(primary) as ws,
+            pytest.raises(WorkspaceAliasError, match="not a valid workspace alias"),
+        ):
+            ws.attach(peer, "my peer")
+
+    def test_reserved_alias(self, tmp_path: Path) -> None:
+        peer = make_workspace(tmp_path / "peer.duckdb")
+        primary = make_workspace(tmp_path / "ws.duckdb")
+        with Workspace(primary) as ws, pytest.raises(WorkspaceAliasError, match="reserved"):
+            ws.attach(peer, "main")
+
+    def test_alias_naming_the_primarys_own_database(self, tmp_path: Path) -> None:
+        peer = make_workspace(tmp_path / "peer.duckdb")
+        primary = make_workspace(tmp_path / "ws.duckdb")
+        with Workspace(primary) as ws, pytest.raises(WorkspaceAliasError, match="own database"):
+            ws.attach(peer, "ws")
+
+    def test_missing_file(self, tmp_path: Path) -> None:
+        with Workspace(make_workspace(tmp_path / "ws.duckdb")) as ws:
+            with pytest.raises(WorkspaceError, match="no workspace at"):
+                ws.attach(tmp_path / "absent.duckdb", "peer")
+            assert dict(ws.attachments) == {}
+
+    def test_incompatible_schema_version_names_the_path(self, tmp_path: Path) -> None:
+        stale = make_peer(tmp_path / "old.duckdb", version="1")
+        with Workspace(make_workspace(tmp_path / "ws.duckdb")) as ws:
+            with pytest.raises(SchemaVersionError, match="cannot attach") as excinfo:
+                ws.attach(stale, "old")
+            message = str(excinfo.value)
+            assert str(stale) in message
+            assert "'old'" in message
+            assert "older remora" in message
+            assert dict(ws.attachments) == {}
+
+    def test_foreign_file_names_the_path(self, tmp_path: Path) -> None:
+        junk = tmp_path / "junk.bin"
+        junk.write_bytes(b"not a duckdb database" * 8)
+        with Workspace(make_workspace(tmp_path / "ws.duckdb")) as ws:
+            with pytest.raises(WorkspaceError, match="cannot attach") as excinfo:
+                ws.attach(junk, "junk")
+            assert str(junk) in str(excinfo.value)
+            assert dict(ws.attachments) == {}
+
+    def test_attaching_the_workspaces_own_file(self, tmp_path: Path) -> None:
+        primary = make_workspace(tmp_path / "ws.duckdb")
+        with Workspace(primary) as ws, pytest.raises(WorkspaceError, match="own file"):
+            ws.attach(primary, "self")
+
+    def test_attaching_the_workspaces_own_file_through_a_symlink(self, tmp_path: Path) -> None:
+        primary = make_workspace(tmp_path / "ws.duckdb")
+        alias_path = tmp_path / "link.duckdb"
+        alias_path.symlink_to(primary)
+        with Workspace(primary) as ws, pytest.raises(WorkspaceError, match="own file"):
+            ws.attach(alias_path, "self")
+
+
+class TestCompactIsUnaffectedByAttachments:
+    def test_compact_copies_only_the_primary(self, tmp_path: Path) -> None:
+        peer = make_workspace(tmp_path / "peer.duckdb")
+        primary = make_workspace(tmp_path / "ws.duckdb")
+        with Workspace(primary, mode="rw") as ws:
+            ws.attach(peer, "peer")
+            ws.compact()
+            with ws.read() as connection:
+                # The compacted file is a workspace, and holds no trace of the peer.
+                assert connection.execute("SELECT count(*) FROM main.pkts").fetchone() == (0,)
+                names = connection.execute(
+                    "SELECT count(*) FROM duckdb_tables() WHERE database_name = current_database()"
+                ).fetchone()
+                assert names == (6,)

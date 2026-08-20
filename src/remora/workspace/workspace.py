@@ -44,7 +44,7 @@ from __future__ import annotations
 import os
 import stat
 import threading
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -57,7 +57,19 @@ from remora.fields import FieldRef
 from remora.reader.process import TsharkProcess
 from remora.workspace import annotations as _annotations
 from remora.workspace.annotations import AnnotationRecord, AnnotationScope
-from remora.workspace.errors import WorkspaceError, WorkspaceModeError
+from remora.workspace.attach import (
+    Attachment,
+    apply_attachments,
+    attach_database,
+    detach_database,
+    validate_alias,
+)
+from remora.workspace.errors import (
+    SchemaVersionError,
+    WorkspaceAliasError,
+    WorkspaceError,
+    WorkspaceModeError,
+)
 from remora.workspace.export import export_parquet as _export_parquet
 from remora.workspace.materialize import (
     MaterializeResult,
@@ -228,6 +240,10 @@ class Workspace:
         # Held only in ro mode; rw mode never keeps a connection open.
         self._con: DuckDBPyConnection | None = None
         self._opened = False
+        # Alias -> attachment, in the order attached. Replayed onto every
+        # connection this workspace opens, because a DuckDB ATTACH lives on the
+        # database instance and rw mode holds no connection between operations.
+        self._attachments: dict[str, Attachment] = {}
 
     @property
     def path(self) -> Path:
@@ -283,10 +299,16 @@ class Workspace:
         return self
 
     def close(self) -> None:
-        """Close the workspace. Idempotent."""
+        """Close the workspace, dropping any recorded attachments. Idempotent.
+
+        Attachments are per-``Workspace`` state, so closing forgets them: the
+        shared read lock each one held on its peer file is released, and
+        reopening this workspace starts with nothing attached.
+        """
         if self._con is not None:
             self._con.close()
             self._con = None
+        self._attachments.clear()
         self._opened = False
 
     def __enter__(self) -> Workspace:
@@ -317,10 +339,17 @@ class Workspace:
         connection; writes go through :meth:`write`, which owns the
         one-transaction discipline.
 
+        Every connection carries this workspace's :attr:`attachments`: the
+        rw-mode connection has them replayed onto it as it opens, and the
+        ro-mode held connection is the one they were attached on.
+
         Raises:
             WorkspaceError: In rw mode, if a :meth:`compact` on this file is
                 in progress anywhere in this process — mirroring the
                 fail-fast lock error a second process gets.
+            WorkspaceAliasError: If an alias this workspace recorded is
+                already attached to a different file, or writable, on the
+                connection's database instance.
         """
         self._require_open()
         if self._mode == "ro":
@@ -331,6 +360,7 @@ class Workspace:
         try:
             con = _connect(str(self._path), read_only=False)
             try:
+                apply_attachments(con, self._attachments.values())
                 yield con
             finally:
                 con.close()
@@ -345,12 +375,20 @@ class Workspace:
         the connection closes either way, releasing DuckDB's exclusive
         write lock promptly so other processes can read between writes.
 
+        This workspace's :attr:`attachments` are replayed onto the connection
+        before the transaction opens, so the write body can read across them —
+        read-only, as always. They stay attached even if the transaction rolls
+        back, which is why the replay happens outside it.
+
         Raises:
             WorkspaceModeError: In ro mode; reopen with
                 ``Workspace(path, mode='rw')`` to write.
             WorkspaceError: If a :meth:`compact` on this file is in progress
                 anywhere in this process — mirroring the fail-fast lock
                 error a second process gets.
+            WorkspaceAliasError: If an alias this workspace recorded is
+                already attached to a different file, or writable, on the
+                connection's database instance.
         """
         self._require_open()
         if self._mode == "ro":
@@ -362,6 +400,10 @@ class Workspace:
         try:
             con = _connect(str(self._path), read_only=False)
             try:
+                # Before BEGIN: a ROLLBACK undoes an ATTACH issued inside the
+                # transaction, so replaying there would lose the attachments
+                # exactly when an exception makes a caller want them least.
+                apply_attachments(con, self._attachments.values())
                 con.execute("BEGIN")
                 try:
                     yield con
@@ -784,6 +826,125 @@ class Workspace:
         """
         with self.write() as con:
             return build_streams(con)
+
+    @property
+    def attachments(self) -> Mapping[str, Path]:
+        """Workspaces attached to this one, alias to file, in attach order."""
+        return {alias: item.path for alias, item in self._attachments.items()}
+
+    def attach(self, path: str | os.PathLike[str], alias: str) -> None:
+        """Attach another workspace file read-only under ``alias``.
+
+        Cross-capture correlation is why the workspace is DuckDB-native: an
+        attached workspace's tables are reachable as ``alias.main.pkts`` and
+        ``alias.meta.fields`` from raw SQL on the connection :meth:`read` hands
+        out. Joining an attached ``pkts`` against this one is ordinary SQL::
+
+            with ws.read() as con:
+                con.execute(
+                    'SELECT p.ip_src FROM main.pkts p '
+                    'JOIN "peer".main.pkts q ON p.ip_src = q.ip_src'
+                ).fetchall()
+
+        **Read-only, in either mode.** The ATTACH always carries
+        ``(READ_ONLY)``, so DuckDB refuses every write against an attached
+        workspace whatever mode this one is open in. Cross-workspace writes are
+        out of scope, and this is what makes them impossible rather than merely
+        unattempted.
+
+        Attachments are recorded on this workspace and replayed onto every
+        connection it opens, because a DuckDB attachment belongs to the
+        *database instance* rather than the connection and ``"rw"`` mode holds
+        no connection between operations. :meth:`close` clears them.
+
+        **What an attachment costs.** It takes a shared read lock on the
+        attached file for as long as it stays attached: another process cannot
+        write to it, and within this process it cannot be opened read-write at
+        all — so ``Workspace(peer, mode="rw")`` operations on an attached file
+        fail with DuckDB's ``Unique file handle conflict`` until it is detached.
+        Opening it ``mode="ro"`` is unaffected, as is :meth:`compact` on *this*
+        workspace, which replays no attachment and copies only its own database.
+
+        Args:
+            path: The workspace file to attach. Must exist, must be a workspace
+                of this library's layout version, and must not be this
+                workspace's own file (under any spelling — the comparison is by
+                resolved path).
+            alias: Database name to reach it by. A bare SQL identifier
+                (``[A-Za-z_][A-Za-z0-9_]*``), not one of DuckDB's reserved
+                names ``main``/``temp``/``system``, not already attached here,
+                and not this workspace's own database name.
+
+        Raises:
+            WorkspaceAliasError: If the alias is invalid, reserved, already in
+                use here, or names this workspace's own database.
+            WorkspaceError: If the workspace is not open, if ``path`` does not
+                exist or is this workspace's own file, or if DuckDB refuses the
+                attach — a file that is not a DuckDB database, or one another
+                process holds read-write.
+            SchemaVersionError: If ``path`` is not a remora workspace, or its
+                layout version is not this library's. Nothing is recorded and
+                the alias is detached again, so a refused attach leaves no
+                trace.
+        """
+        self._require_open()
+        validate_alias(alias)
+        if alias in self._attachments:
+            raise WorkspaceAliasError(
+                f"alias {alias!r} is already attached to "
+                f"{self._attachments[alias].path}; detach it first or choose another"
+            )
+        resolved = Path(os.path.realpath(os.fspath(path)))
+        if resolved == Path(os.path.realpath(self._path)):
+            raise WorkspaceError(
+                f"{path} is this workspace's own file; its tables are already "
+                f"reachable as main.pkts"
+            )
+        if not resolved.exists():
+            raise WorkspaceError(
+                f"no workspace at {path} to attach as {alias!r}; create one by "
+                f"opening it with Workspace(path, mode='rw')"
+            )
+        attachment = Attachment(alias=alias, path=resolved)
+        with self.read() as con:
+            row = con.execute("SELECT current_database()").fetchone()
+            if row is not None and str(row[0]).lower() == alias.lower():
+                raise WorkspaceAliasError(
+                    f"alias {alias!r} is this workspace's own database name; choose another alias"
+                )
+            try:
+                attach_database(con, attachment)
+            except SchemaVersionError as exc:
+                raise SchemaVersionError(f"cannot attach {path} as {alias!r}: {exc}") from exc
+            except ImportError:
+                raise
+            except WorkspaceError:
+                raise
+            except Exception as exc:
+                raise WorkspaceError(f"cannot attach {path} as {alias!r}: {exc}") from exc
+        # Recorded only after the connection block, so a refused attach leaves
+        # nothing behind for the next connection to replay.
+        self._attachments[alias] = attachment
+
+    def detach(self, alias: str) -> None:
+        """Detach a workspace attached by :meth:`attach`.
+
+        Args:
+            alias: The alias to detach.
+
+        Raises:
+            WorkspaceAliasError: If nothing is attached under that alias.
+            WorkspaceError: If the workspace is not open.
+        """
+        self._require_open()
+        if alias not in self._attachments:
+            attached = ", ".join(self._attachments) or "none"
+            raise WorkspaceAliasError(
+                f"no workspace is attached as {alias!r}; attached: {attached}"
+            )
+        del self._attachments[alias]
+        with self.read() as con:
+            detach_database(con, alias)
 
     def compact(self) -> None:
         """Rewrite the workspace file to reclaim space.
