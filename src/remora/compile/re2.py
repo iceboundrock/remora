@@ -20,8 +20,9 @@ What RE2 refuses, measured against duckdb 1.5.5:
 - **Brace repeats above 1000** -> "invalid repetition size". The limit applies
   to each bounded count *and* to the product of bounded counts along a nesting
   path: ``(?:a{31}){31}`` (961) compiles, ``(?:a{32}){32}`` (1024) does not, and
-  ``(?:a{500}){3}`` (1500) does not. Unbounded repeats (``*``, ``+``, ``{m,}``)
-  contribute no factor -- ``(?:a+){1000}`` compiles.
+  ``(?:a{500}){3}`` (1500) does not. For ``{m,}`` (unbounded max), RE2 uses ``m``
+  as the factor; only ``*`` and ``+`` (min ≤ 1) contribute factor 1, and ``{0}``
+  or ``{0,}`` contribute factor 1.
 
 Everything else the ``Expr`` subset admits -- literals, ``.``, anchors,
 alternation, groups, character classes, the shared escapes, ``\xHH`` -- RE2
@@ -49,18 +50,15 @@ LOOKAROUND_PREFIXES: Final[tuple[str, ...]] = ("?=", "?!", "?<=", "?<!")
 _BRACE = re.compile(r"\{(\d+)(?:,(\d*))?\}")
 
 
-def _brace_bound(match: re.Match[str]) -> tuple[int, int | None]:
-    """Return ``(declared_count, bounded_max)`` for one brace quantifier.
+def _brace_bound(match: re.Match[str]) -> tuple[int, int]:
+    """Return ``(declared_count, bounded_factor)`` for one brace quantifier.
 
-    ``bounded_max`` is ``None`` for the open form ``{m,}``, which RE2 checks on
-    ``m`` but never expands, so it contributes no factor to a nested product.
+    ``bounded_factor`` is the smallest bound RE2 accounts for in nesting products;
+    ``{0}`` and ``{0,}`` contribute ``max(1, 0) = 1``, ``{m,}`` contributes ``m``.
     """
     low, high = match.group(1), match.group(2)
-    if high is None:  # {m}
-        return int(low), int(low)
-    if high == "":  # {m,}
-        return int(low), None
-    return int(high), int(high)
+    m = int(low) if high in (None, "") else int(high)
+    return max(int(low), m), max(1, m)
 
 
 def unportable_reason(pattern: str) -> str | None:
@@ -123,10 +121,7 @@ def unportable_reason(pattern: str) -> str | None:
                         f"repeat count {declared} at position {index} exceeds RE2's "
                         f"limit of {MAX_REPEAT}"
                     )
-                if bounded is None:
-                    merged = inner
-                else:
-                    merged = [size * bounded for size in inner] + [bounded]
+                merged = [size * bounded for size in inner] + [bounded]
                 index = match.end()
             else:
                 merged = inner
@@ -151,8 +146,7 @@ def unportable_reason(pattern: str) -> str | None:
                     f"repeat count {declared} at position {index} exceeds RE2's "
                     f"limit of {MAX_REPEAT}"
                 )
-            if bounded is not None:
-                stack[-1].append(bounded)
+            stack[-1].append(bounded)
             index = match.end()
             continue
         index += 1
