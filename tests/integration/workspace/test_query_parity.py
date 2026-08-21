@@ -4,9 +4,9 @@ The point of the cache path is that it answers the same question the pcap path
 answers. This suite materializes a capture into a workspace and then runs the
 *same* ``Expr`` through both surfaces — :class:`remora.Capture` over tshark and
 :class:`remora.workspace.Query` over DuckDB — comparing the selected frame
-numbers. It is a spot check by design: the exhaustive operator matrix is the M4
-integration-test issue's job, and the operator-level semantics are already
-pinned backend-to-backend in ``tests/test_sql_duckdb.py``.
+numbers. It is a spot check by design: the exhaustive operator matrix lives
+next door in ``test_parity_matrix.py`` (issue #38), and the operator-level
+semantics are already pinned backend-to-backend in ``tests/test_sql_duckdb.py``.
 
 One divergence used to be asserted rather than papered over: SQL is three-valued,
 so a negated comparison on a scalar column excluded rows where the field is
@@ -25,7 +25,11 @@ from pathlib import Path
 
 import pytest
 
-pytest.importorskip("duckdb")
+# duckdb ships as the optional remora[workspace] extra, so a checkout without
+# it skips cleanly, naming the install. In CI the skip is not allowed: the
+# REMORA_REQUIRE_DUCKDB guard in tests/conftest.py stops the run outright, the
+# mirror of the REMORA_REQUIRE_TSHARK escape hatch below.
+pytest.importorskip("duckdb", reason="duckdb not installed; pip install 'remora[workspace]'")
 
 from remora import DNS, IP, TCP, Capture
 from remora.expr import Expr
@@ -37,7 +41,7 @@ from remora.workspace import Query, Workspace
 # to: a hand-built ref carrying tshark's own -G fields declaration.
 FRAME_NUMBER = FieldRef[int]("frame.number", "FT_UINT32", False)
 
-FIXTURES_DIR = Path(__file__).resolve().parent.parent / "fixtures"
+FIXTURES_DIR = Path(__file__).resolve().parent.parent.parent / "fixtures"
 TCP_MIXED = FIXTURES_DIR / "tcp_mixed.pcap"
 DNS_MULTI = FIXTURES_DIR / "dns_multi.pcap"
 
