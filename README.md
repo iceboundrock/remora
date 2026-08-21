@@ -174,7 +174,7 @@ Three things to know before trusting one, all covered in the [workspace guide](d
 
 - **It is a cache, not an archive.** The file holds the columns you asked for and nothing else — no payloads, no field you did not project. Keep the original pcaps.
 - **Cache keys cover the tshark argv**, so `-X lua_script:`, `-d` and `-o` invalidate a workspace: they dissect identical bytes differently. A repeat `materialize()` is a hit, a backfill, or a loud refusal.
-- **`mode="ro"` is the default** because DuckDB allows one writer at a time and a long-lived read-write connection blocks every other process's reads. Writes are short transactions; `compact()` reclaims space and needs sole access.
+- **`mode="ro"` is the default** because DuckDB allows one writer at a time and a long-lived read-write connection blocks every other process's reads. Most writes are short transactions, but `materialize()` holds the exclusive lock for as long as tshark takes on the capture, and in `rw` mode a *read* holds it too; `compact()` reclaims space and needs sole access.
 
 ## Local generation (`psdsl gen`)
 

@@ -137,11 +137,16 @@ def test_the_stream_prerequisite_fence_lists_exactly_the_required_fields() -> No
 
 
 def test_the_doc_calls_out_the_easy_to_miss_cache_invalidators() -> None:
-    # Issue #39's acceptance criterion: the argv options that change dissection
-    # without changing the capture are the ones a reader has to be warned about.
-    text = DOC.read_text(encoding="utf-8")
+    """Issue #39's acceptance criterion, scoped to the section that makes the claim.
+
+    The argv options that change dissection without changing the capture are
+    what a reader has to be warned about, and a warning only counts where they
+    are looking it up — a document-wide search would stay green on an incidental
+    mention in some other section after the warning itself was deleted.
+    """
+    section = _section("Cache keys and what invalidates them")
     for option in ("-X lua_script:", "`-d`", "`-o`"):
-        assert option in text, option
+        assert option in section, option
 
 
 def test_the_doc_states_the_real_fingerprint_probe_size() -> None:

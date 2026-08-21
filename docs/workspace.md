@@ -216,7 +216,8 @@ whole API.
 | | `mode="ro"` (default) | `mode="rw"` |
 | --- | --- | --- |
 | Connection lifetime | One, held for the workspace's lifetime | **None** between operations |
-| Lock held | Shared read lock, continuously | Exclusive, only inside each `write()` |
+| Lock held | Shared read lock, continuously | Exclusive, for each `write()` **and each `read()`** body |
+| For how long | Your program's lifetime | The operation's — and `materialize()` lasts as long as tshark does |
 | Other processes | Readers unaffected; writers blocked | Free between operations |
 | Missing file | Error naming `mode="rw"` | Created, with the schema |
 | Write APIs | `WorkspaceModeError` | Work |
@@ -460,10 +461,12 @@ query's `.select()` left it out), and `FieldDeclarationMismatchError` (the
 reference's ftype or multiplicity disagrees with the stored catalog, which is
 version skew between a workspace and the protocol modules querying it). All three
 name the field, but they do not all fire at the same moment.
-`FieldNotMaterializedError` is a statement about *storage* and is raised while
-the query is being built, before any generated SQL reaches DuckDB, because every
-reference in the filter tree and the projection is checked against `meta.fields`
-first. `FieldNotProjectedError` is a statement about *this query*, and it is
+`FieldNotMaterializedError` is a statement about *storage*. A `Query` is lazy, so
+it is raised when the query is executed — from `sql()`, from iteration, or from
+`arrow()` — as the plan is built, and still before any generated SQL reaches
+DuckDB, because every reference in the filter tree and the projection is checked
+against `meta.fields` first. `.filter()` and `.select()` themselves never raise
+it; they only build. `FieldNotProjectedError` is a statement about *this query*, and it is
 raised at row-access time, from `row.get()`/`row.get_all()` while decoding a
 result the database has already returned: a projection is only wrong once you
 ask it for something it left out.
