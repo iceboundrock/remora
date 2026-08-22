@@ -29,3 +29,20 @@ samples (pcap + captured tshark output) owned by the reader unit tests.
 | 1 | UDP/DNS query `10.0.1.1:50001 → 10.0.1.53:53`, questions `alpha.example` A + `beta.example` AAAA | `dns.qry.name` occurs twice — multi-occurrence |
 | 2 | UDP/DNS query `10.0.1.2:50002 → 10.0.1.53:53`, question `gamma.example` A | |
 | 3 | TCP SYN `10.0.1.1:40000 → 10.0.1.53:80` | `dns.*` and `udp.*` absent |
+
+## ctrl_comments.pcapng
+
+Control characters in a string field value (issue #74). pcapng rather than
+pcap because a frame *comment* is the one place a capture can carry arbitrary
+bytes verbatim: every string field a dissector builds — `dns.qry.name`
+included — is already `format_text`-ed by the dissector and can never hold a
+raw control byte. All five frames are the same TCP SYN; only `frame.comment`
+differs.
+
+| # | `frame.comment` | `-T fields` prints | Notes |
+|---|-----------------|--------------------|-------|
+| 1 | `tab<0x09>here` | `tab\there` | C-escaped |
+| 2 | `vt<0x0b>here` | `vt\vhere` | 0x0b is also the reader's column separator, so this frame proves the separator cannot be forged by a value |
+| 3 | `back<0x5c>slash` | `back\\slash` | the backslash doubling that makes the escaping invertible |
+| 4 | `us<0x1f>here` | `us<0x1f>here` | passed through RAW; 0x1f was the column separator before #74 and used to split the column and abort the parse |
+| 5 | (none) | (empty column) | `frame.comment` absent |

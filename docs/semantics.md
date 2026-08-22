@@ -183,6 +183,56 @@ Enforced by `tests/test_sql_duckdb.py::TestPortableTextGuard` and by the
 comparing row sets; the pattern half is pinned by
 `tests/test_re2_portability.py`, against real RE2 wherever duckdb is installed.
 
+## Reader representation: `-T fields` escaping
+
+The three backends above agree on what an expression *means*; they can still
+fork on what the **value** is, because the two pcap readers see tshark's output
+in different representations. `-T ek` is JSON, so string decoding hands back the
+true value. `-T fields` is not: tshark runs value text through a C-style
+escaper on the way out, so a control byte arrives as two characters while the
+display-filter engine matched against the real one. Left uncorrected, that is a
+quiet row-set fork between a pushed-down `-Y` filter and a fields-mode residual
+predicate — the divergence issue #74 was filed for.
+
+`src/remora/reader/fields_reader.py` inverts the escaping, so a `RawPacket` from
+either reader carries the same value. The table is measured, not assumed: every
+byte `0x01`–`0x20`, `0x5c` and `0x7f` was probed through a pcapng frame comment
+(tshark 4.6.8) and exactly these eight are escaped.
+
+<!-- fields-escapes:start -->
+
+| byte | `-T fields` prints |
+| --- | --- |
+| `0x07` | `\a` |
+| `0x08` | `\b` |
+| `0x09` | `\t` |
+| `0x0a` | `\n` |
+| `0x0b` | `\v` |
+| `0x0c` | `\f` |
+| `0x0d` | `\r` |
+| `0x5c` | `\\` |
+
+<!-- fields-escapes:end -->
+
+Every other byte passes through raw — `0x01`–`0x06`, `0x0e`–`0x1f` and `0x7f`
+were each confirmed. (`0x00` is out of scope: it cannot be carried through the
+tooling that builds the fixture, and would truncate tshark's own C strings.)
+The mapping is injective, so the inverse is exact: a backslash in the output is
+always the first character of one of the eight escapes.
+
+That table is also why the reader's framing bytes are what they are. tshark
+writes the **column separator** to the stream raw, *after* escaping each
+column, so the separator must be a byte the escaper replaces (`0x0b`) — then no
+value can forge it. It splices the **occurrence aggregator** into the value text
+*before* escaping, so the aggregator must be a byte the escaper leaves alone
+(`0x1e`) — an escaped byte would arrive as its two-character escape and never
+split. Unescaping therefore happens strictly *after* splitting. The reader's
+module docstring carries the full argument; `tests/test_fields_reader.py` pins
+both invariants, and `tests/integration/test_control_chars.py` re-measures the
+table against whatever tshark is installed and asserts the three row sets
+(pushdown, fields residual, ek residual) are equal over
+`tests/fixtures/ctrl_comments.pcapng`.
+
 ## What is still divergent
 
 - **`matches` on non-string fields** is a `TypeError` on all three backends —
@@ -231,6 +281,11 @@ comparing row sets; the pattern half is pinned by
   checked-in fixture carries a populated `FT_DOUBLE` field.
 - **`contains` on a `BLOB` column** is `UnsupportedSqlExprError`: DuckDB's
   `contains()` takes `VARCHAR` or `LIST`, not `BLOB`. The pcap path runs it.
+- **A field value containing `0x1e`** forks into two occurrences in `-T fields`
+  mode. tshark escapes the joined string, so what comes back is a function of
+  the join alone and the boundaries are unrecoverable for *any* choice of
+  aggregator byte; only `-T ek` sees the truth. Pinned as a known trade-off by
+  `tests/test_fields_reader.py`, not papered over.
 - **Field text tshark could not decode as UTF-8** reaches the predicate backend
   as U+FFFD replacement characters, which cannot round-trip to the original
   bytes. Irreducible; noted in `predicate.py`.

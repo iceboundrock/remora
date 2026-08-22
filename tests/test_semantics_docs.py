@@ -17,6 +17,7 @@ from remora.compile.re2 import LOOKAROUND_PREFIXES, MAX_REPEAT
 # quotes is the SQL the backend emits, so the expected fragment is built by the
 # real builder rather than copied out of it.
 from remora.compile.sql import _guarded_match
+from remora.reader.fields_reader import ESCAPED_CHARS, OCC_SEP, UNIT_SEP
 from test_semantics_table import TRUTH_OPERATORS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -24,6 +25,9 @@ DOC = REPO_ROOT / "docs" / "semantics.md"
 
 TRUTH_START = "<!-- truth-table:start -->"
 TRUTH_END = "<!-- truth-table:end -->"
+
+ESCAPES_START = "<!-- fields-escapes:start -->"
+ESCAPES_END = "<!-- fields-escapes:end -->"
 
 
 def read_doc() -> str:
@@ -83,6 +87,39 @@ def test_the_portable_text_guard_section_states_both_halves() -> None:
     assert condition in text
 
 
+def escape_rows() -> dict[str, str]:
+    """Parse the marked `-T fields` escape table into byte -> escape letter."""
+    body = read_doc().split(ESCAPES_START, 1)[1].split(ESCAPES_END, 1)[0]
+    rows: dict[str, str] = {}
+    for raw in body.splitlines():
+        line = raw.strip()
+        if not line.startswith("|") or set(line) <= set("|-: "):
+            continue
+        cells = [cell.strip().strip("`") for cell in line.strip("|").split("|")]
+        if len(cells) != 2 or cells[0] == "byte":
+            continue
+        rows[cells[0]] = cells[1]
+    return rows
+
+
+def test_the_fields_escape_table_is_the_one_the_reader_implements() -> None:
+    # The reader inverts this table on every value it parses, so a doc that
+    # drifts from it is a doc that mis-describes the row sets remora returns.
+    assert escape_rows() == {
+        f"0x{ord(char):02x}": "\\" + letter for char, letter in ESCAPED_CHARS.items()
+    }
+
+
+def test_the_doc_states_which_side_of_the_escaper_each_separator_is_on() -> None:
+    # Getting either backwards is a silent corruption (#74), so the doc has to
+    # name both bytes, and they have to still be on the sides it claims.
+    text = read_doc()
+    assert f"(`0x{ord(UNIT_SEP):02x}`)" in text
+    assert f"(`0x{ord(OCC_SEP):02x}`)" in text
+    assert UNIT_SEP in ESCAPED_CHARS
+    assert OCC_SEP not in ESCAPED_CHARS
+
+
 def test_the_doc_names_where_each_rule_is_enforced() -> None:
     text = read_doc()
     for path in (
@@ -92,6 +129,10 @@ def test_the_doc_names_where_each_rule_is_enforced() -> None:
         "tests/test_dfilter.py",
         "tests/test_dfilter_validation.py",
         "src/remora/compile/re2.py",
+        "src/remora/reader/fields_reader.py",
+        "tests/test_fields_reader.py",
+        "tests/integration/test_control_chars.py",
+        "tests/fixtures/ctrl_comments.pcapng",
     ):
         assert path in text
         # Substring-only would leave the doc pointing at a renamed file.

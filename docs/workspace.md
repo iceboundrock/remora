@@ -140,6 +140,22 @@ another component already owns them:
 | `-Y <filter>` | not compared | the display filter |
 | everything else, `argv[0]` included | **verbatim** | nothing — it must match |
 
+### A reader change can invalidate every stored key
+
+`-E separator=` and `-E aggregator=` are part of the effective argv, and issue
+#74 changed the column separator from `0x1f` to `0x0b` so that a value carrying
+a control byte can no longer break the column framing. Because the whole argv is
+hashed, that changes the cache key of every projection: a workspace materialized
+by an earlier remora refuses reuse with `MaterializationMismatchError` naming
+the argv, and has to be re-materialized into a fresh workspace file.
+
+This was chosen deliberately over carving the separator arguments out of the
+key. The escaping and the framing are what turn tshark's bytes into the values
+that land in a column, so two remoras that frame differently do not necessarily
+store the same thing — exempting them would be the same class of mistake as
+ignoring `-d`. A loud refusal costs one rematerialization; a silent hit would
+cost trust in the cache.
+
 ### The fingerprint's blind spot
 
 Fingerprinting is `size + mtime_ns + 64 KiB from each end` because materializing
