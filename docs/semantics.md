@@ -190,6 +190,24 @@ comparing row sets; the pattern half is pinned by
 - **Time literals** (`datetime`/`timedelta`) are not pushed to display filters
   (M1 decision); the planner keeps them as residual Python predicates. The row
   set is unchanged; only the execution path differs.
+- **IEEE-754 NaN literals** reach the same row set three different ways, so this
+  is a mechanism difference rather than a semantic one. Python's comparisons
+  with NaN are all false, which is what `predicate.py` evaluates directly and
+  what `sql.py` compiles to the constant `FALSE`; `dfilter.py` **refuses** with
+  `UnsupportedExprError` and the planner falls back to that predicate. The
+  asymmetry is deliberate: SQL has a boolean constant to compile to and a
+  `DOUBLE` total order that has to be actively neutralized, with no fallback
+  engine to defer to, while a display filter has neither the constant nor the
+  need. Wireshark does lex `nan` as a literal — measured on tshark 4.6.8, a
+  float field rejects ordered comparisons against it while a relative-time
+  field orders it *below every value*, so `frame.time_delta > nan` selects every
+  frame carrying the field where Python selects none — which is why rendering it
+  is not self-protecting and refusal is the fix. `inf`/`-inf` are pushed down
+  unchanged everywhere, since all three engines order them identically.
+  Enforced by `tests/test_dfilter.py::TestNaNLiterals`, the four
+  `nan-literal-*`/`inf-literal-*` rows of `tests/test_semantics_table.py`, and
+  `tests/test_dfilter_validation.py::TestNaNIsARecognizedDfilterLiteral`, which
+  pins the tshark measurements the policy rests on.
 - **`contains` on a `BLOB` column** is `UnsupportedSqlExprError`: DuckDB's
   `contains()` takes `VARCHAR` or `LIST`, not `BLOB`. The pcap path runs it.
 - **Field text tshark could not decode as UTF-8** reaches the predicate backend

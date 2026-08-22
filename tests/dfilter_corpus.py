@@ -63,6 +63,14 @@ DELTA = StubField("frame.time_delta", "FT_RELATIVE_TIME")
 SYN = StubField("tcp.flags.syn", "FT_BOOLEAN")
 RESPTIME = StubField("icmp.resptime", "FT_DOUBLE")
 
+# Bound to names rather than written inline: `RESPTIME > float("inf")` reads to
+# ruff's SIM300 as a Yoda condition (an upper-case name compared against a call)
+# and its autofix would flip the operands, which for a field dispatches to the
+# LITERAL's operator instead of the field's — the same trap the ipv4-object
+# golden below carries a noqa for.
+INF = float("inf")
+NEG_INF = float("-inf")
+
 
 class GoldenCase(NamedTuple):
     """One golden pair: compile_dfilter(expr) must equal expected, and
@@ -88,6 +96,12 @@ GOLDEN: tuple[GoldenCase, ...] = (
     GoldenCase("float-int-widened", RESPTIME > 1, "icmp.resptime > 1.0"),
     GoldenCase("float-sci-small", RESPTIME > 1e-05, "icmp.resptime > 1e-05"),
     GoldenCase("float-sci-large", RESPTIME < 1e21, "icmp.resptime < 1e+21"),
+    # inf/-inf are pushed down unchanged (issue #90): Wireshark orders them the
+    # way Python does, unlike NaN, which the backend refuses. These goldens live
+    # here rather than inline so a real tshark keeps proving it parses them.
+    GoldenCase("float-inf", RESPTIME > INF, "icmp.resptime > inf"),
+    GoldenCase("float-neg-inf", RESPTIME > NEG_INF, "icmp.resptime > -inf"),
+    GoldenCase("float-inf-range", RESPTIME.in_([(NEG_INF, INF)]), "icmp.resptime in {-inf .. inf}"),
     # presence
     GoldenCase("presence", SRC.present(), "ip.src"),
     # boolean structure
