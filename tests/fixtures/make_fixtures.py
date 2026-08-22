@@ -19,7 +19,7 @@ dns_multi.pcap (3 packets) — multi-occurrence dns.qry.name:
 2. UDP/DNS  10.0.1.2:50002 -> 10.0.1.53:53  1 question: "gamma.example" A
 3. TCP SYN  10.0.1.1:40000 -> 10.0.1.53:80  dns.* and udp.* absent
 
-ctrl_comments.pcapng (5 packets) — control characters in a string value
+ctrl_comments.pcapng (6 packets) — control characters in a string value
 (issue #74). pcapng rather than pcap because a frame *comment* is the one
 place a capture can carry arbitrary bytes verbatim: every string field a
 dissector builds (``dns.qry.name`` included) is already ``format_text``-ed
@@ -33,7 +33,14 @@ same TCP SYN; only ``frame.comment`` differs:
    escaping invertible)
 4. ``us<0x1f>here``        — passed through RAW; 0x1f was the reader's column
    separator before #74 and used to split the column and abort the parse
-5. (no comment)            — ``frame.comment`` absent
+5. ``C:<0x5c>temp``        — the load-bearing collision: a literal backslash
+   immediately followed by ``t``. A build that doubles backslashes prints
+   ``C:\\temp`` and the value survives the round trip; one that does not
+   prints ``C:\temp``, which is byte-identical to what it prints for a value
+   holding a real TAB — so unescaping there would rewrite this into
+   ``C:<0x09>emp``. This is the frame that proves the version gate is
+   necessary rather than merely cautious.
+6. (no comment)            — ``frame.comment`` absent
 
 Regenerate with::
 
@@ -237,6 +244,7 @@ CTRL_COMMENTS: tuple[str | None, ...] = (
     "vt\vhere",
     "back\\slash",
     "us\x1fhere",
+    "C:\\temp",
     None,
 )
 
@@ -281,7 +289,7 @@ def pcapng_file(frames: list[tuple[bytes, str | None]], base_ts: int) -> bytes:
 
 
 def build_ctrl_comments() -> bytes:
-    """Five identical TCP SYNs distinguished only by their frame comments."""
+    """Six identical TCP SYNs distinguished only by their frame comments."""
     ip_a = bytes([10, 0, 2, 1])
     ip_b = bytes([10, 0, 2, 2])
     frames = [

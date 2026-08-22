@@ -9,64 +9,100 @@ text can hold tabs, commas and quotes:
 - :data:`OCC_SEP` (``0x1e``, record separator) between multiple occurrences
   of one field within a column (e.g. ``tcp.port`` dissects twice per packet).
 
-tshark C-escapes control bytes in values (issue #74)
------------------------------------------------------
+tshark C-escapes control bytes in values, and HOW changed in 4.4
+------------------------------------------------------------------
 ``-T fields`` does **not** print string field values verbatim: it runs them
-through a C-style escaper, while the display-filter engine and ``-T ek``
-both operate on the true value. Probing every byte from ``0x01`` to ``0x20``,
-``0x5c`` and ``0x7f`` through a pcapng frame comment (tshark 4.6.8,
-Homebrew/macOS) gives exactly this table and nothing else — see
-:data:`ESCAPED_CHARS`::
+through a C-style escaper, while the display-filter engine and ``-T ek`` both
+operate on the true value. That is the divergence issue #74 was filed for — a
+fields-mode residual predicate and a pushed-down ``-Y`` filter selecting
+different packets for the same expression.
 
-    0x07 -> \a   0x08 -> \b   0x09 -> \t   0x0a -> \n
-    0x0b -> \v   0x0c -> \f   0x0d -> \r   0x5c -> \\
+The escaper is **not stable across releases**. Probing every byte from
+``0x01`` to ``0x20`` plus ``0x5c`` and ``0x7f`` through a pcapng frame
+comment, on three builds (4.2.2 and 4.4.5 from the Ubuntu archives, 4.6.8
+from Homebrew)::
 
-Every other probed byte — ``0x01`` to ``0x06``, ``0x0e`` to ``0x1f``, and ``0x7f`` —
-passes through RAW. (``0x00`` is out of scope: it cannot be carried through
-``editcap``'s argv, so it was not probed; a NUL would in any case truncate
-the C strings tshark builds internally.) The mapping is injective, so
-:func:`unescape` inverts it exactly: a backslash in the output is always the
-first character of one of the eight escapes above.
+    byte        4.2.2       4.4.5 / 4.6.8
+    0x07        raw         \a
+    0x08        \b          \b
+    0x09        \t          \t
+    0x0a        \n          \n
+    0x0b        \v          \v
+    0x0c        \f          \f
+    0x0d        \r          \r
+    0x5c        raw         \\
+    all others  raw         raw
 
-Without that inverse, a fields-mode residual predicate and a pushed-down
-``-Y`` filter select different packets for the same expression — the
-divergence #74 was filed for. ``ek_reader`` needs no such treatment, since
-JSON string decoding already yields the true value.
+("all others" is ``0x01`` to ``0x06``, ``0x0e`` to ``0x1f``, and ``0x7f``. ``0x00``
+is out of scope: it cannot be carried through the tooling that builds the
+fixture, and would truncate the C strings tshark builds internally.)
 
-Why the separators are the bytes they are (load-bearing)
----------------------------------------------------------
-The two separators sit on **opposite sides** of that escaper, so their
-requirements are opposite and getting either backwards corrupts data
-silently:
+The ``0x5c`` row decides whether the escaping can be inverted at all. From
+4.4 a literal backslash is doubled, so a backslash in the output always
+begins one of the eight escapes and :func:`unescape` inverts the table
+exactly. On 4.2.2 it is **not** doubled and the mapping collapses: the value
+``C:\temp`` and the value ``C:`` + TAB + ``emp`` are *both* printed as
+``C:\temp`` (measured, not reasoned). Nothing in the output tells them apart,
+so unescaping on such a build would silently rewrite ``C:\temp`` into
+``C:<TAB>emp`` — and backslash-bearing values are everywhere in real traffic
+(SMB paths, Windows filenames). Corrupting a common value is strictly worse
+than the divergence #74 set out to fix.
+
+Unescaping is therefore **gated**: :func:`escaping_is_reversible` decides from
+the tshark version, :data:`UNESCAPE_MIN_VERSION` is the boundary, and
+:class:`FieldsReader` unescapes only when its caller passes
+``unescape_values=True``. The default is ``False``, which is also what an
+unknown or unparseable version yields — the safe direction in both cases. On
+a pre-4.4 build the reader keeps returning escaped text exactly as it did
+before #74: the divergence remains, documented, instead of becoming
+corruption. 4.3.x is a development series between the two measured releases
+and is treated as old for the same reason.
+
+``ek_reader`` needs no gate on any version — JSON string decoding already
+yields the true value — which is why it is the reference the parity tests in
+``tests/integration/test_control_chars.py`` compare against.
+
+Why the separators are the bytes they are (load-bearing, and version-proof)
+-----------------------------------------------------------------------------
+Framing, unlike unescaping, is fixed **unconditionally**: both choices below
+hold on all three builds measured above. The two separators sit on **opposite
+sides** of the escaper, so their requirements are opposite and getting either
+backwards corrupts data silently:
 
 - The **column separator** is written to the stream raw, *after* each
   column's text has been escaped. It must therefore be a byte the escaper
   replaces, so that no field value can ever forge it: a real ``0x0b`` inside
-  a value arrives as the two characters ``\v`` and the only raw ``0x0b`` on
-  the line is a column boundary. Column framing is thus unambiguous. The old
-  choice ``0x1f`` was *not* escaped, so a value carrying one split the column
-  and the reader raised ``expected N column(s) ... got N+1`` on a perfectly
-  valid capture.
-- The **occurrence aggregator** is spliced into the value text *before* it is
-  escaped (measured: ``aggregator=0x0c`` comes back as the two characters
-  ``\f``, and ``aggregator=0x5c`` as ``\\``). It must therefore be a byte the
-  escaper leaves alone, or it would arrive as its two-character escape and
-  never split at all. ``0x1e`` satisfies that.
+  a value arrives as the two characters ``\v``, and the only raw ``0x0b`` on
+  the line is a column boundary. ``0x0b`` is escaped on 4.2.2, 4.4.5 and
+  4.6.8 alike, so column framing is unambiguous everywhere. The old choice
+  ``0x1f`` was escaped by none of them, so a value carrying one split the
+  column and the reader aborted a perfectly valid capture with
+  ``expected N column(s) ... got N+1``.
+- The **occurrence aggregator** must be a byte the escaper leaves alone, and
+  ``0x1e`` is raw on every measured version. This side changed in 4.4 too,
+  in the *opposite* direction: 4.2.2 splices the aggregator in **after**
+  escaping (so ``aggregator=0x0c`` arrives as a raw ``0x0c``), while 4.4.5
+  and 4.6.8 splice it in **before** (so the same option arrives as the two
+  characters ``\f`` and never splits at all). An escaped byte is thus usable
+  as the aggregator on 4.2.2 and unusable on 4.4+, which is exactly why the
+  never-escaped ``0x1e`` — and not the escaped-byte trick that secures the
+  column separator — is the only choice that splits correctly on both.
 
 The aggregator's residual is inherent, and is stated rather than implied:
 what tshark hands back for a column is ``escape(occ1 + SEP + occ2)``, a
 function of the joined string alone, so the join positions are simply not
 recoverable — a value genuinely containing ``0x1e`` forks into two
-occurrences. No byte choice fixes that (an escaped byte collides on its
-escape form instead, which is strictly worse because it also stops splitting
-real occurrences); only a tshark-side change could, so the case is pinned as
-a known trade-off rather than papered over. Line framing has no such
-residual: ``0x0a`` is escaped to ``\n``, so a newline inside a value cannot
-break the line split.
+occurrences. No byte choice fixes that on 4.4+ (an escaped byte collides on
+its escape form instead, which is strictly worse because it also stops
+splitting real occurrences); only a tshark-side change could, so the case is
+pinned as a known trade-off rather than papered over. Line framing has no
+such residual: ``0x0a`` is escaped on every measured version, so a newline
+inside a value cannot break the line split.
 
-Unescaping happens **after** splitting, never before. Splitting first is what
-makes the column rule above sound — unescaping first would turn a value's
-``\v`` into a real ``0x0b`` that then framed a spurious column.
+Unescaping, when it runs at all, happens **after** splitting, never before.
+Splitting first is what makes the column rule above sound — unescaping first
+would turn a value's ``\v`` into a real ``0x0b`` that then framed a spurious
+column.
 
 Separator syntax (verified against tshark 4.6.7/4.6.8, Homebrew)
 ------------------------------------------------------------------
@@ -100,16 +136,18 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from types import MappingProxyType
-from typing import Any, TypeVar, cast
+from typing import Any, Final, TypeVar, cast
 
 from remora.fields import FieldNotProjectedError, FieldRef
 
 __all__ = [
     "ESCAPED_CHARS",
     "OCC_SEP",
+    "UNESCAPE_MIN_VERSION",
     "UNIT_SEP",
     "FieldsReader",
     "FieldsRow",
+    "escaping_is_reversible",
     "fields_argv",
     "unescape",
 ]
@@ -144,6 +182,42 @@ _UNESCAPE: Mapping[str, str] = MappingProxyType(
     {letter: char for char, letter in ESCAPED_CHARS.items()}
 )
 
+#: First tshark release whose ``-T fields`` escaping is invertible — i.e. the
+#: first that doubles a literal backslash. Below it the escaping is lossy and
+#: :func:`unescape` MUST NOT run (module docstring). 4.2.2 and 4.4.5 were
+#: measured either side of this line; the 4.3.x development series in between
+#: was not, and falls on the safe side.
+UNESCAPE_MIN_VERSION: Final = (4, 4)
+
+
+def escaping_is_reversible(tshark_version: str | None) -> bool:
+    """Whether *tshark_version* escapes ``-T fields`` values invertibly.
+
+    *tshark_version* is an ``X.Y.Z`` string as
+    :func:`remora.codegen.fingerprint.parse_tshark_version` returns it (a
+    bare ``X`` or ``X.Y`` is accepted too). ``True`` only from
+    :data:`UNESCAPE_MIN_VERSION` upward.
+
+    Anything unrecognizable — ``None``, empty, or not starting with numeric
+    components — is ``False``. That default is deliberate and is the whole
+    safety property: a caller that cannot establish the version gets the
+    pre-#74 behavior (escaped text, a known divergence) rather than a lossy
+    round trip that would corrupt every literal backslash.
+    """
+    if not tshark_version:
+        return False
+    parts = tshark_version.split(".")
+    try:
+        numbers = tuple(int(part) for part in parts[:2])
+    except ValueError:
+        return False
+    # A bare "4" is 4.0 — below the boundary either way, but spelled out so
+    # the comparison never comes down to tuple-length ordering.
+    if len(numbers) == 1:
+        numbers = (numbers[0], 0)
+    return numbers >= UNESCAPE_MIN_VERSION
+
+
 P = TypeVar("P")
 
 
@@ -173,6 +247,11 @@ def unescape(text: str) -> str:
             return "".join(out)
         out.append(_UNESCAPE.get(text[hit + 1], text[hit : hit + 2]))
         index = hit + 2
+
+
+def _identity(text: str) -> str:
+    """Leave a value exactly as tshark printed it (the pre-4.4 gate's branch)."""
+    return text
 
 
 def fields_argv(projection: Sequence[FieldRef[Any]]) -> list[str]:
@@ -236,11 +315,28 @@ class FieldsReader:
     :class:`remora.reader.process.TsharkProcess`); *projection* must be the
     same field refs, in the same order, that produced the argv via
     :func:`fields_argv`.
+
+    *unescape_values* inverts tshark's value escaping (:func:`unescape`). It
+    defaults to ``False`` because the escaping is only invertible from tshark
+    4.4 — below that, undoing it corrupts literal backslashes (module
+    docstring). Callers that know the binary's version pass
+    ``escaping_is_reversible(version)``; callers that do not get the safe
+    behavior by default. Column and occurrence framing is unaffected either
+    way, being version-proof by construction.
     """
 
-    def __init__(self, lines: Iterable[str], projection: Sequence[FieldRef[Any]]) -> None:
+    __slots__ = ("_lines", "_names", "_unescape")
+
+    def __init__(
+        self,
+        lines: Iterable[str],
+        projection: Sequence[FieldRef[Any]],
+        *,
+        unescape_values: bool = False,
+    ) -> None:
         self._lines = lines
         self._names = tuple(ref.name for ref in projection)
+        self._unescape = unescape_values
 
     def __iter__(self) -> Iterator[FieldsRow]:
         names = self._names
@@ -255,8 +351,9 @@ class FieldsReader:
             # Split all framing FIRST, then unescape each occurrence: the
             # column rule only holds while a value's escaped VT is still two
             # characters (module docstring).
+            decode = unescape if self._unescape else _identity
             columns = {
-                name: () if part == "" else tuple(unescape(occ) for occ in part.split(OCC_SEP))
+                name: () if part == "" else tuple(decode(occ) for occ in part.split(OCC_SEP))
                 for name, part in zip(names, parts, strict=True)
             }
             yield FieldsRow(columns)
