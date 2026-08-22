@@ -18,8 +18,17 @@ Three parts:
 3. Evidence: the measurements of tshark that a *policy* rests on, pinned so a
    Wireshark that changes them is caught here rather than silently invalidating
    the reasoning in the compiler's docstring. Today that is issue #90's
-   IEEE-754 finding — ``nan`` is lexed as a literal and ordered below every
-   value, while ``inf``/``-inf`` agree with Python.
+   IEEE-754 finding — ``nan`` is lexed as a real float literal (so rendering it
+   is not self-protecting), yet is never a comparison worth pushing down, while
+   ``inf``/``-inf`` are accepted and pushed down unchanged.
+
+   These assertions are deliberately written to hold on **every** tshark the
+   project is tested against, not just the newest. CI's ``checks`` job installs
+   Ubuntu's stock build (4.2.2), which differs from a current release (4.6.8)
+   on exactly this subject: 4.6.8 rejects an ordered NaN comparison outright
+   while 4.2.2 accepts it, and 4.6.8 accepts ``nan``/``inf`` on a *time* field
+   where 4.2.2 rejects them as "not a valid time". Anything measured on one
+   build alone belongs in a comment, not an assertion.
 
 Runs whenever tshark is installed; in CI, REMORA_REQUIRE_TSHARK=1 turns the
 "tshark missing" skip into a hard failure so the suite can never silently
@@ -38,7 +47,7 @@ import pytest
 
 from dfilter_corpus import CAPTURE_DFILTER_GOLDENS, GOLDEN, PLANNER_DFILTER_GOLDENS, RESPTIME
 from exprgen import gen_corpus
-from remora import DNS, IP, TCP, UDP
+from remora import DNS, IP, TCP, UDP, values
 from remora.compile.dfilter import UnsupportedExprError, compile_dfilter
 from remora.compile.predicate import compile_predicate
 from remora.expr import Expr
@@ -347,52 +356,99 @@ class TestNaNIsARecognizedDfilterLiteral:
     Wireshark that changes how it lexes or orders ``nan`` is caught here and the
     policy gets revisited, instead of the reasoning quietly going stale.
 
-    Measured on tshark 4.6.8 (Homebrew/macOS).
+    Everything asserted below is measured on **both** tshark versions this
+    project is tested against — CI's apt build (4.2.2) and a current release
+    (4.6.8) — and only on a **float** ftype, which is the only kind of field a
+    float literal can reach (``test_float_literals_only_reach_float_ftypes``).
+
+    Two observations are deliberately recorded here rather than asserted,
+    because they are version-specific trivia and not a remora contract:
+
+    * The treatment of an *ordered* NaN comparison flips between the two
+      builds. 4.6.8 rejects it outright (``NaN cannot be used in ordered
+      comparisons``); 4.2.2 accepts it. So there is no stable pushdown
+      behaviour to rely on even if the semantics happened to line up — which
+      is precisely why a "dfilter-native never-matches rendering" was rejected
+      as version-fragile.
+    * On a *time* ftype 4.6.8 does answer wrongly rather than loudly:
+      ``frame.time_delta > nan`` selects every frame carrying the field where
+      Python selects none. That is unreachable through the DSL — a float
+      literal cannot be coerced for ``FT_RELATIVE_TIME`` — and 4.2.2 rejects
+      the same filter as ``"nan" is not a valid time``. It motivated the
+      investigation; it is not something the suite should enforce.
     """
+
+    def test_float_literals_only_reach_float_ftypes(self) -> None:
+        # Pure Python, no tshark. This is what makes the float-ftype scoping of
+        # every tshark assertion below the right scoping: a NaN literal can
+        # never be aimed at a time field through the DSL in the first place.
+        assert values.coerce_literal("FT_DOUBLE", NAN) != values.coerce_literal("FT_DOUBLE", NAN)
+        for time_ftype in ("FT_RELATIVE_TIME", "FT_ABSOLUTE_TIME"):
+            with pytest.raises(TypeError):
+                values.coerce_literal(time_ftype, NAN)
 
     def test_nan_is_lexed_as_a_literal_while_near_misses_are_rejected(self) -> None:
         # The load-bearing fact: rendering `nan` is NOT self-protecting. If
         # tshark rejected it the way it rejects `nam`, a repr-rendered NaN would
         # be a loud failure and there would be nothing to fix.
-        assert _tshark_accepts(DNS_MULTI, "frame.time_delta == nan")
+        for spelling in ("nan", "NaN"):
+            assert _tshark_accepts(DNS_MULTI, f"{RESPTIME.name} == {spelling}"), spelling
         for near_miss in ("nam", "nan5", "zzz"):
-            assert not _tshark_accepts(DNS_MULTI, f"frame.time_delta == {near_miss}"), near_miss
+            assert not _tshark_accepts(DNS_MULTI, f"{RESPTIME.name} == {near_miss}"), near_miss
 
-    def test_ordered_comparisons_with_nan_diverge_from_python_on_a_time_field(self) -> None:
-        # Python's comparisons with NaN are all false, so the predicate backend
-        # selects NOTHING for every filter below. tshark orders `nan` beneath
-        # every value instead, so `>` and `>=` select every frame carrying the
-        # field: a silent wrong answer, not a loud failure.
-        present = _tshark_matching_frames(DNS_MULTI, "frame.time_delta")
-        assert present, "fixture must have frames carrying frame.time_delta"
-        assert _tshark_matching_frames(DNS_MULTI, "frame.time_delta > nan") == present
-        assert _tshark_matching_frames(DNS_MULTI, "frame.time_delta >= nan") == present
-        # The other three happen to agree with Python; only > and >= diverge.
-        assert _tshark_matching_frames(DNS_MULTI, "frame.time_delta < nan") == set()
-        assert _tshark_matching_frames(DNS_MULTI, "frame.time_delta <= nan") == set()
-        assert _tshark_matching_frames(DNS_MULTI, "frame.time_delta == nan") == set()
+    def test_ordered_nan_comparisons_are_never_a_filter_worth_pushing(self) -> None:
+        # Python compares false against NaN for every operator, so the
+        # predicate backend selects NOTHING. tshark gives us one of two
+        # unusable answers, and which one depends on the build:
+        #
+        #   rejected      -> emitting the filter aborts the whole tshark run
+        #   accepted      -> selects nothing, but only incidentally; the
+        #                    ordering it implements is not specified and
+        #                    flipped between 4.2.2 and 4.6.8
+        #
+        # Either way the conjunct belongs on the predicate backend. The
+        # assertion has teeth against the one outcome that would be a silent
+        # wrong answer: accepted AND matching rows.
+        #
+        # Caveat, stated rather than dressed up: no checked-in fixture carries
+        # a populated FT_DOUBLE field, so on a build that ACCEPTS these filters
+        # the row-set branch is witnessed vacuously. It still fails loudly if a
+        # future tshark starts returning rows here, which is the regression
+        # this test exists to catch.
+        for op in (">", ">=", "<", "<="):
+            dfilter = f"{RESPTIME.name} {op} nan"
+            if _tshark_accepts(DNS_MULTI, dfilter):
+                assert _tshark_matching_frames(DNS_MULTI, dfilter) == set(), dfilter
 
     def test_the_compiler_never_emits_any_of_those_filters(self) -> None:
         # The refusal is what keeps the divergence above off the pushdown path.
         # A float literal only reaches the renderer on a float ftype, so this is
-        # the same policy the row sets above are the motive for.
+        # the same policy the measurements above are the motive for.
         for expr in (RESPTIME > NAN, RESPTIME >= NAN, RESPTIME != NAN, RESPTIME.in_([NAN])):
             with pytest.raises(UnsupportedExprError, match="NaN"):
                 compile_dfilter(expr)
 
 
-class TestInfinityAgreesWithPython:
-    """``inf``/``-inf`` are pushed down unchanged, so their row sets have to be
-    Python's. Pinned beside the NaN evidence so nobody "completes" the NaN rule
-    by refusing them too (issue #90)."""
+class TestInfinityIsPushedDownUnchanged:
+    """``inf``/``-inf`` are pushed down unchanged. Pinned beside the NaN
+    evidence so nobody "completes" the NaN rule by refusing them too (#90).
 
-    def test_infinite_bounds_select_what_python_selects(self) -> None:
-        present = _tshark_matching_frames(DNS_MULTI, "frame.time_delta")
-        assert present, "fixture must have frames carrying frame.time_delta"
-        # Every frame carrying a finite value is < inf and > -inf; none is
-        # beyond either bound or equal to one. Exactly Python's answers.
-        assert _tshark_matching_frames(DNS_MULTI, "frame.time_delta < inf") == present
-        assert _tshark_matching_frames(DNS_MULTI, "frame.time_delta > -inf") == present
-        assert _tshark_matching_frames(DNS_MULTI, "frame.time_delta > inf") == set()
-        assert _tshark_matching_frames(DNS_MULTI, "frame.time_delta < -inf") == set()
-        assert _tshark_matching_frames(DNS_MULTI, "frame.time_delta == inf") == set()
+    Acceptance is the claim worth pinning here, and it holds on both 4.2.2 and
+    4.6.8: an infinite bound reaches tshark as a real float literal and does
+    not abort the run, which is exactly what NaN fails to do. The *row sets*
+    are covered where they can be witnessed non-vacuously — the corpus goldens
+    in :data:`dfilter_corpus.GOLDEN` go through
+    :class:`TestGoldenCorpusValidates`, and the semantics table exercises the
+    predicate backend on the same expressions.
+    """
+
+    def test_infinite_literals_are_accepted_by_tshark(self) -> None:
+        for dfilter in (
+            f"{RESPTIME.name} < inf",
+            f"{RESPTIME.name} > inf",
+            f"{RESPTIME.name} == inf",
+            f"{RESPTIME.name} > -inf",
+            f"{RESPTIME.name} < -inf",
+            f"{RESPTIME.name} in {{-inf .. inf}}",
+        ):
+            assert _tshark_accepts(DNS_MULTI, dfilter), dfilter
