@@ -26,7 +26,7 @@ import threading
 from collections import deque
 from collections.abc import Iterator, Sequence
 
-__all__ = ["TsharkError", "TsharkNotFoundError", "TsharkProcess"]
+__all__ = ["TsharkError", "TsharkNotFoundError", "TsharkProcess", "probe_tshark_version"]
 
 #: Number of trailing stderr lines retained for diagnostics.
 _STDERR_TAIL_LINES = 256
@@ -36,6 +36,43 @@ _TERMINATE_TIMEOUT = 3.0
 
 #: Seconds to wait for the stderr drain thread to finish.
 _THREAD_JOIN_TIMEOUT = 3.0
+
+#: Seconds allowed for the ``--version`` probe. A binary that cannot answer
+#: that fast is broken, and the reader must not hang waiting to find out.
+_VERSION_PROBE_TIMEOUT = 10.0
+
+
+def probe_tshark_version(tshark: str) -> str | None:
+    """Best-effort ``X.Y.Z`` version of the *tshark* binary; ``None`` if unknown.
+
+    This deliberately never raises, which is what separates it from
+    :func:`remora.workspace.materialize.detect_tshark_version`: that one is a
+    cache-key component and must fail loudly about which binary produced a
+    materialization, whereas this one only picks a *conservative default* for
+    :func:`remora.reader.fields_reader.escaping_is_reversible`, where "cannot
+    tell" and "too old to trust" want exactly the same answer. A binary that
+    is genuinely missing or broken surfaces a moment later from the real run,
+    with a better message than a version probe could give.
+    """
+    # Imported in the function body, not at module scope: remora.codegen is
+    # the code generator, and importing the reader must not drag it in for a
+    # parse that only this probe performs.
+    from remora.codegen.fingerprint import parse_tshark_version
+
+    try:
+        output = subprocess.run(
+            [tshark, "--version"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=_VERSION_PROBE_TIMEOUT,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    try:
+        return parse_tshark_version(output)
+    except ValueError:
+        return None
 
 
 class TsharkError(RuntimeError):

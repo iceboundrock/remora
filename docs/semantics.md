@@ -194,10 +194,12 @@ display-filter engine matched against the real one. Left uncorrected, that is a
 quiet row-set fork between a pushed-down `-Y` filter and a fields-mode residual
 predicate — the divergence issue #74 was filed for.
 
-`src/remora/reader/fields_reader.py` inverts the escaping, so a `RawPacket` from
-either reader carries the same value. The table is measured, not assumed: every
-byte `0x01`–`0x20`, `0x5c` and `0x7f` was probed through a pcapng frame comment
-(tshark 4.6.8) and exactly these eight are escaped.
+`src/remora/reader/fields_reader.py` inverts the escaping **when it can**, so a
+`RawPacket` from either reader carries the same value. The table is measured,
+not assumed: every byte `0x01`–`0x20`, `0x5c` and `0x7f` was probed through a
+pcapng frame comment on three builds — 4.2.2 and 4.4.5 from the Ubuntu
+archives, 4.6.8 from Homebrew. On 4.4 and later exactly these eight are
+escaped.
 
 <!-- fields-escapes:start -->
 
@@ -217,20 +219,53 @@ byte `0x01`–`0x20`, `0x5c` and `0x7f` was probed through a pcapng frame commen
 Every other byte passes through raw — `0x01`–`0x06`, `0x0e`–`0x1f` and `0x7f`
 were each confirmed. (`0x00` is out of scope: it cannot be carried through the
 tooling that builds the fixture, and would truncate tshark's own C strings.)
-The mapping is injective, so the inverse is exact: a backslash in the output is
-always the first character of one of the eight escapes.
+From 4.4 the mapping is injective, so the inverse is exact: a backslash in the
+output is always the first character of one of the eight escapes.
 
-That table is also why the reader's framing bytes are what they are. tshark
-writes the **column separator** to the stream raw, *after* escaping each
-column, so the separator must be a byte the escaper replaces (`0x0b`) — then no
-value can forge it. It splices the **occurrence aggregator** into the value text
-*before* escaping, so the aggregator must be a byte the escaper leaves alone
-(`0x1e`) — an escaped byte would arrive as its two-character escape and never
-split. Unescaping therefore happens strictly *after* splitting. The reader's
+### The escaping is only invertible from tshark 4.4
+
+**tshark 4.2.x does not double a literal backslash** (and leaves `0x07` raw),
+which destroys injectivity: the value `C:\temp` and the value `C:` + TAB +
+`emp` are *both* printed `C:\temp`, so nothing in the output tells them apart.
+Unescaping on such a build would silently rewrite `C:\temp` into `C:<TAB>emp`,
+and backslash-bearing values are ordinary traffic (SMB paths, Windows
+filenames). Corrupting a common value is strictly worse than the divergence
+this fixes.
+
+So unescaping is **gated on the tshark version**, and only unescaping is:
+
+| | tshark < 4.4 | tshark >= 4.4 |
+| --- | --- | --- |
+| column/occurrence framing | fixed | fixed |
+| control bytes recovered in `-T fields` | no — text stays escaped | yes |
+| pushdown / fields / ek row sets agree | only where nothing was escaped | always |
+
+Below 4.4 the reader returns tshark's text unchanged, which is exactly the
+pre-#74 behavior: the divergence remains, documented, instead of becoming
+corruption. `escaping_is_reversible()` decides, an unknown or unparseable
+version counts as old, and 4.3.x — a development series between the two
+measured releases — is treated as old for the same reason. `-T ek` is correct
+on every version and needs no gate. Ubuntu 24.04 LTS ships 4.2.2, so this is
+the common case, not a corner: **control-character fidelity in `-T fields`
+requires tshark >= 4.4.**
+
+That table is also why the reader's framing bytes are what they are — and
+unlike unescaping, **framing is fixed on every version**, because both choices
+hold on all three builds measured. tshark writes the **column separator** to
+the stream raw, *after* escaping each column, so the separator must be a byte
+the escaper replaces (`0x0b`) — then no value can forge it. The **occurrence
+aggregator** must be a byte the escaper leaves alone (`0x1e`). Which side of
+the escaper the aggregator sits on itself changed in 4.4, in the opposite
+direction: 4.2.2 splices it in *after* escaping, 4.4+ *before*. So an escaped
+byte works as an aggregator on 4.2.2 and silently stops splitting on 4.4+,
+which is precisely why the never-escaped `0x1e` — and not the escaped-byte
+trick that secures the column separator — is the only choice correct on both.
+Unescaping, when it runs, happens strictly *after* splitting. The reader's
 module docstring carries the full argument; `tests/test_fields_reader.py` pins
-both invariants, and `tests/integration/test_control_chars.py` re-measures the
-table against whatever tshark is installed and asserts the three row sets
-(pushdown, fields residual, ek residual) are equal over
+both invariants and the version gate, and
+`tests/integration/test_control_chars.py` re-measures against whatever tshark
+is installed, asserting the three row sets (pushdown, fields residual, ek
+residual) equal on >= 4.4 and pinning the documented divergence below it, over
 `tests/fixtures/ctrl_comments.pcapng`.
 
 ## What is still divergent
@@ -242,6 +277,12 @@ table against whatever tshark is installed and asserts the three row sets
   set is unchanged; only the execution path differs.
 - **`contains` on a `BLOB` column** is `UnsupportedSqlExprError`: DuckDB's
   `contains()` takes `VARCHAR` or `LIST`, not `BLOB`. The pcap path runs it.
+- **Control bytes in `-T fields` values on tshark < 4.4** stay escaped: that
+  build's escaping is not invertible (see above), so the reader refuses to
+  guess and the fields-mode residual keeps diverging from the pushdown and ek
+  paths for any value tshark escaped. Loud in the sense that matters — the
+  behavior is version-determined and pinned by tests on both sides, not
+  data-dependent. Fixed by installing tshark >= 4.4.
 - **A field value containing `0x1e`** forks into two occurrences in `-T fields`
   mode. tshark escapes the joined string, so what comes back is a function of
   the join alone and the boundaries are unrecoverable for *any* choice of

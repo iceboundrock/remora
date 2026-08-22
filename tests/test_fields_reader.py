@@ -25,9 +25,11 @@ from remora.fields import FieldNotProjectedError, FieldRef, RawPacket
 from remora.reader.fields_reader import (
     ESCAPED_CHARS,
     OCC_SEP,
+    UNESCAPE_MIN_VERSION,
     UNIT_SEP,
     FieldsReader,
     FieldsRow,
+    escaping_is_reversible,
     fields_argv,
     unescape,
 )
@@ -71,8 +73,19 @@ def sample_lines(text: str) -> list[str]:
     return text.rstrip("\n").split("\n")
 
 
-def parse(lines: list[str], projection: Sequence[FieldRef[Any]] | None = None) -> list[FieldsRow]:
-    return list(FieldsReader(lines, SAMPLE_PROJECTION if projection is None else projection))
+def parse(
+    lines: list[str],
+    projection: Sequence[FieldRef[Any]] | None = None,
+    *,
+    unescape_values: bool = False,
+) -> list[FieldsRow]:
+    return list(
+        FieldsReader(
+            lines,
+            SAMPLE_PROJECTION if projection is None else projection,
+            unescape_values=unescape_values,
+        )
+    )
 
 
 def row_dict(row: FieldsRow) -> dict[str, tuple[str, ...]]:
@@ -208,14 +221,15 @@ class TestParseRules:
         assert row.get_raw("dns.qry.name") == ('comma,quote"',)
 
     def test_each_occurrence_is_unescaped_after_the_split(self) -> None:
+        # unescape_values=True: only a >= 4.4 tshark escapes invertibly.
         line = f"1{UNIT_SEP}{UNIT_SEP}{UNIT_SEP}" + r"a\tb" + OCC_SEP + r"c\\d"
-        (row,) = parse([line])
+        (row,) = parse([line], unescape_values=True)
         assert row.get_raw("dns.qry.name") == ("a\tb", "c\\d")
 
     def test_a_value_containing_the_column_separator_cannot_split_a_column(self) -> None:
         """tshark escapes a VT inside a value, so only the raw byte frames."""
         line = f"1{UNIT_SEP}{UNIT_SEP}{UNIT_SEP}" + r"a\vb"
-        (row,) = parse([line])
+        (row,) = parse([line], unescape_values=True)
         assert row.get_raw("dns.qry.name") == ("a\vb",)
 
     def test_bytes_tshark_leaves_raw_are_carried_as_data(self) -> None:
@@ -297,3 +311,67 @@ class TestIntegration:
         assert any(OCC_SEP in line for line in raw_lines)
         rows = list(FieldsReader(raw_lines, SAMPLE_PROJECTION))
         assert [row_dict(row) for row in rows] == SAMPLE_ROWS
+
+
+class TestUnescapeIsGatedOnTsharkVersion:
+    r"""tshark's ``-T fields`` escaper only became invertible in 4.4.
+
+    Measured on three builds through a pcapng frame comment: 4.4.5 and 4.6.8
+    double a literal backslash, 4.2.2 does not. On 4.2.2 the value
+    ``C:\temp`` and the value ``C:`` + TAB + ``emp`` are *both* printed
+    ``C:\temp``, so unescaping there would rewrite the first into the second.
+    The reader must therefore leave values alone below 4.4.
+    """
+
+    @pytest.mark.parametrize(
+        "version",
+        ["4.4", "4.4.0", "4.4.5", "4.6.8", "5.0.0", "10.0.1"],
+    )
+    def test_versions_at_or_above_the_boundary_are_reversible(self, version: str) -> None:
+        assert escaping_is_reversible(version) is True
+
+    @pytest.mark.parametrize(
+        "version",
+        ["4.2.2", "4.2", "4.0.0", "3.6.2", "4.3.0", "4"],
+    )
+    def test_versions_below_the_boundary_are_not(self, version: str) -> None:
+        # 4.3.x is a development series between 4.2 and 4.4 and was never
+        # measured; treating it as old is the safe direction.
+        assert escaping_is_reversible(version) is False
+
+    @pytest.mark.parametrize("version", [None, "", "not-a-version", "x.y.z", "4.x"])
+    def test_an_unknown_version_is_not_reversible(self, version: str | None) -> None:
+        """The default must be the safe one: leave the value alone."""
+        assert escaping_is_reversible(version) is False
+
+    def test_the_boundary_constant_is_the_one_measured(self) -> None:
+        assert UNESCAPE_MIN_VERSION == (4, 4)
+
+    def test_reader_defaults_to_not_unescaping(self) -> None:
+        r"""An unspecified version must not corrupt a literal backslash."""
+        line = f"1{UNIT_SEP}{UNIT_SEP}{UNIT_SEP}" + r"C:\temp"
+        (row,) = parse([line])
+        assert row.get_raw("dns.qry.name") == (r"C:\temp",)
+
+    def test_reader_unescapes_when_told_to(self) -> None:
+        line = f"1{UNIT_SEP}{UNIT_SEP}{UNIT_SEP}" + r"C:\\temp"
+        (row,) = parse([line], unescape_values=True)
+        assert row.get_raw("dns.qry.name") == (r"C:\temp",)
+
+    def test_the_pre_44_collision_is_left_untouched_rather_than_guessed(self) -> None:
+        r"""The load-bearing case: on 4.2.2 both the value ``C:\temp`` and the
+        value ``C:`` + TAB + ``emp`` are printed ``C:\temp``. Unescaping would
+        turn the first into the second; the gate keeps the escaped-but-honest
+        text instead."""
+        line = f"1{UNIT_SEP}{UNIT_SEP}{UNIT_SEP}" + r"C:\temp"
+        (row,) = parse([line])
+        assert row.get_raw("dns.qry.name") == (r"C:\temp",)
+        # ...and this is exactly the corruption the gate is avoiding.
+        assert unescape(r"C:\temp") == "C:\temp"
+
+    def test_framing_is_not_gated(self) -> None:
+        """Column framing is fixed on every version, unescaping or not."""
+        line = f"1{UNIT_SEP}{UNIT_SEP}a{OCC_SEP}b{UNIT_SEP}"
+        for flag in (False, True):
+            (row,) = parse([line], unescape_values=flag)
+            assert row.get_raw("tcp.port") == ("a", "b")

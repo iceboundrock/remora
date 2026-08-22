@@ -36,13 +36,14 @@ Control characters in a string field value (issue #74). pcapng rather than
 pcap because a frame *comment* is the one place a capture can carry arbitrary
 bytes verbatim: every string field a dissector builds — `dns.qry.name`
 included — is already `format_text`-ed by the dissector and can never hold a
-raw control byte. All five frames are the same TCP SYN; only `frame.comment`
+raw control byte. All six frames are the same TCP SYN; only `frame.comment`
 differs.
 
 | # | `frame.comment` | `-T fields` prints | Notes |
 |---|-----------------|--------------------|-------|
 | 1 | `tab<0x09>here` | `tab\there` | C-escaped |
 | 2 | `vt<0x0b>here` | `vt\vhere` | 0x0b is also the reader's column separator, so this frame proves the separator cannot be forged by a value |
-| 3 | `back<0x5c>slash` | `back\\slash` | the backslash doubling that makes the escaping invertible |
+| 3 | `back<0x5c>slash` | `back\\slash` (>= 4.4) | the backslash doubling that makes the escaping invertible; 4.2.x prints `back\slash` |
 | 4 | `us<0x1f>here` | `us<0x1f>here` | passed through RAW; 0x1f was the column separator before #74 and used to split the column and abort the parse |
-| 5 | (none) | (empty column) | `frame.comment` absent |
+| 5 | `C:<0x5c>temp` | `C:\\temp` (>= 4.4) | the collision that forces the version gate: 4.2.x prints `C:\temp`, byte-identical to what it prints for a value holding a real TAB, so unescaping there would rewrite this into `C:<0x09>emp` |
+| 6 | (none) | (empty column) | `frame.comment` absent |
