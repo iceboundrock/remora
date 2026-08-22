@@ -1,4 +1,4 @@
-"""Regenerate the checked-in integration-test pcap fixtures (issue #20).
+r"""Regenerate the checked-in integration-test pcap fixtures (issue #20).
 
 Pure struct packing — no capture libraries, fixed timestamps, no randomness —
 so regeneration is byte-for-byte deterministic (pinned by
@@ -18,6 +18,22 @@ dns_multi.pcap (3 packets) — multi-occurrence dns.qry.name:
    "beta.example" AAAA -> dns.qry.name occurs twice
 2. UDP/DNS  10.0.1.2:50002 -> 10.0.1.53:53  1 question: "gamma.example" A
 3. TCP SYN  10.0.1.1:40000 -> 10.0.1.53:80  dns.* and udp.* absent
+
+ctrl_comments.pcapng (5 packets) — control characters in a string value
+(issue #74). pcapng rather than pcap because a frame *comment* is the one
+place a capture can carry arbitrary bytes verbatim: every string field a
+dissector builds (``dns.qry.name`` included) is already ``format_text``-ed
+by the dissector, so it can never hold a raw control byte. Each frame is the
+same TCP SYN; only ``frame.comment`` differs:
+
+1. ``tab<0x09>here``       — escaped by ``-T fields`` as ``\t``
+2. ``vt<0x0b>here``        — escaped as ``\v``; 0x0b is also the reader's
+   column separator, so this frame proves the separator cannot be forged
+3. ``back<0x5c>slash``     — escaped as ``\\`` (the doubling that makes the
+   escaping invertible)
+4. ``us<0x1f>here``        — passed through RAW; 0x1f was the reader's column
+   separator before #74 and used to split the column and abort the parse
+5. (no comment)            — ``frame.comment`` absent
 
 Regenerate with::
 
@@ -213,6 +229,76 @@ def build_dns_multi() -> bytes:
     return pcap_file([two_questions, one_question, plain_tcp], base_ts=1700000200)
 
 
+#: Frame comments carried by ctrl_comments.pcapng, in frame order; ``None``
+#: means the frame carries no comment option at all. See the module docstring
+#: for what each one exercises.
+CTRL_COMMENTS: tuple[str | None, ...] = (
+    "tab\there",
+    "vt\vhere",
+    "back\\slash",
+    "us\x1fhere",
+    None,
+)
+
+
+def pcapng_option(code: int, value: bytes) -> bytes:
+    """One pcapng option, padded to the 4-byte boundary the format requires."""
+    return struct.pack("<HH", code, len(value)) + value + b"\x00" * (-len(value) % 4)
+
+
+#: opt_endofopt — terminates an option list.
+PCAPNG_OPT_END: bytes = struct.pack("<HH", 0, 0)
+
+
+def pcapng_block(block_type: int, body: bytes) -> bytes:
+    """Wrap an already 4-byte-aligned *body* in a pcapng block frame."""
+    total = 12 + len(body)
+    return struct.pack("<II", block_type, total) + body + struct.pack("<I", total)
+
+
+def pcapng_file(frames: list[tuple[bytes, str | None]], base_ts: int) -> bytes:
+    """A single-section, single-interface pcapng of ``(frame, comment)`` pairs.
+
+    Little-endian, LINKTYPE_ETHERNET, section length -1 (unspecified) and the
+    default ``if_tsresol`` of 6, so timestamps are microseconds since the
+    epoch. A ``None`` comment emits no option list at all, which is how the
+    fixture gets a frame whose ``frame.comment`` is absent rather than empty.
+    """
+    shb = pcapng_block(0x0A0D0D0A, struct.pack("<IHHq", 0x1A2B3C4D, 1, 0, -1) + PCAPNG_OPT_END)
+    idb = pcapng_block(0x00000001, struct.pack("<HHI", 1, 0, 65535) + PCAPNG_OPT_END)
+    out = [shb, idb]
+    for index, (frame, comment) in enumerate(frames):
+        stamp = (base_ts + index) * 1_000_000
+        body = (
+            struct.pack("<IIIII", 0, stamp >> 32, stamp & 0xFFFFFFFF, len(frame), len(frame))
+            + frame
+        )
+        body += b"\x00" * (-len(frame) % 4)
+        if comment is not None:
+            body += pcapng_option(1, comment.encode("utf-8")) + PCAPNG_OPT_END
+        out.append(pcapng_block(0x00000006, body))
+    return b"".join(out)
+
+
+def build_ctrl_comments() -> bytes:
+    """Five identical TCP SYNs distinguished only by their frame comments."""
+    ip_a = bytes([10, 0, 2, 1])
+    ip_b = bytes([10, 0, 2, 2])
+    frames = [
+        (
+            ether(
+                MAC_B,
+                MAC_A,
+                0x0800,
+                ipv4(ip_a, ip_b, 6, tcp(ip_a, ip_b, 40000 + index, 443, 1000 + index, 0, 0x02)),
+            ),
+            comment,
+        )
+        for index, comment in enumerate(CTRL_COMMENTS)
+    ]
+    return pcapng_file(frames, base_ts=1700000300)
+
+
 # Destination ports and source hosts build_bulk_tcp cycles through, in order.
 # Ten hosts and four ports, so a host selects a tenth of the capture, a port a
 # quarter, and a (host, port) conjunction a twentieth — known fractions the
@@ -252,7 +338,11 @@ def build_bulk_tcp(packet_count: int, base_ts: int = 1700001000) -> bytes:
 
 
 def main() -> None:
-    for name, build in [("tcp_mixed.pcap", build_tcp_mixed), ("dns_multi.pcap", build_dns_multi)]:
+    for name, build in [
+        ("tcp_mixed.pcap", build_tcp_mixed),
+        ("dns_multi.pcap", build_dns_multi),
+        ("ctrl_comments.pcapng", build_ctrl_comments),
+    ]:
         path = FIXTURES_DIR / name
         data = build()
         path.write_bytes(data)
