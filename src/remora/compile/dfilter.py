@@ -32,9 +32,9 @@ Literal rendering
 Literals are first normalized with :func:`remora.values.coerce_literal` (so
 ``IP.src == "10.0.0.1"`` compares an :class:`~ipaddress.IPv4Address`, and
 garbage like ``"not-an-ip"`` is rejected), then rendered by the resulting
-Python type: bools as ``1``/``0``, ints as decimal, floats via ``repr``,
-strings double-quoted with backslash escapes, IP addresses bare, bytes as
-colon-hex (``aa:bb:cc``).
+Python type: bools as ``1``/``0``, ints as decimal, floats via ``repr`` —
+except NaN, which is refused (see below) — strings double-quoted with
+backslash escapes, IP addresses bare, bytes as colon-hex (``aa:bb:cc``).
 
 Time literals (M1 design decision)
 ----------------------------------
@@ -42,18 +42,55 @@ Time literals (M1 design decision)
 absolute/relative-time comparisons are not pushed down to the display filter
 in M1; the planner keeps them as residual Python predicates.
 
+IEEE-754 specials (issue #90)
+-----------------------------
+A float **NaN** literal raises :class:`UnsupportedExprError`; ``inf`` and
+``-inf`` render normally.
+
+Python's comparisons with NaN are all false, so ``x > nan`` selects nothing and
+``x != nan`` — which is ``Not(Comparison(EQ, ...))`` — selects everything. That
+is what :mod:`remora.compile.predicate` implements, and Wireshark's engine does
+not agree. What it does instead is both ftype- and version-dependent (measured
+on tshark 4.6.8): on a float field, ordered comparisons are rejected outright
+(``NaN cannot be used in ordered comparisons``) while ``==`` and ``in {nan}``
+are accepted; on a relative-time field, ``nan`` parses as a time offset ordered
+*below every value*, so ``frame.time_delta > nan`` silently selects every frame
+carrying the field where Python selects none. ``nan`` is genuinely lexed as a
+literal rather than misparsed — ``nam``, ``nan5`` and ``zzz`` all fail hard —
+so rendering it is not self-protecting.
+
+Refusal is the whole fix, and it costs nothing but pushdown: the planner
+catches :class:`UnsupportedExprError` and evaluates the conjunct as a Python
+predicate, which already has the correct never-matches semantics. Rendering
+some dfilter-native never-matches form instead was considered and rejected as a
+version-fragile hack, for a predicate that selects nothing anyway.
+
+This is deliberately **asymmetric with the SQL backend**, which compiles a NaN
+literal to the constant ``FALSE`` rather than refusing: SQL *has* a boolean
+constant to compile to, and DuckDB gives ``DOUBLE`` a total order that has to
+be actively neutralized because a workspace query has no fallback engine to
+defer to. A display filter has neither the constant nor the need — the fallback
+exists and is already correct — so refusal is the cheaper and safer
+equivalent. Both backends reach the same observable row set.
+
+``inf``/``-inf`` need nothing, exactly as in the SQL backend: Wireshark orders
+them the way Python does (``< inf`` selects every frame carrying the field,
+``> inf`` none, ``> -inf`` every one, ``< -inf`` none), so they are pushed down
+unchanged. Do not sweep them into the NaN rule.
+
 Error policy
 ------------
 :class:`UnsupportedExprError` means "this backend legitimately cannot render
 the expression; the planner should fall back to the Python predicate backend"
-(time literals, empty bytes, unknown future Expr nodes). User errors —
-malformed literals such as ``IP.src == "not-an-ip"`` — surface as the
-``ValueError``/``TypeError`` that :func:`remora.values.coerce_literal` raises
-and are deliberately *not* converted into :class:`UnsupportedExprError`.
+(time literals, float NaN literals, empty bytes, unknown future Expr nodes).
+User errors — malformed literals such as ``IP.src == "not-an-ip"`` — surface as
+the ``ValueError``/``TypeError`` that :func:`remora.values.coerce_literal`
+raises and are deliberately *not* converted into :class:`UnsupportedExprError`.
 """
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timedelta
 from ipaddress import IPv4Address, IPv6Address
 from typing import Any
@@ -115,6 +152,15 @@ def compile_dfilter(expr: Expr) -> str:
     )
 
 
+#: Refusal message for a float NaN literal, shared by the two places one can
+#: reach the renderer (a plain literal, and a membership range endpoint).
+_NAN_REFUSAL = (
+    "NaN literals are not pushed down to display filters; Wireshark does not "
+    "give them Python's never-matches semantics, so the planner evaluates them "
+    "as Python predicates instead"
+)
+
+
 def _render_literal(value: object) -> str:
     """Render a *normalized* literal (output of ``coerce_literal``) as dfilter text."""
     # bool before int: bool subclasses int.
@@ -123,6 +169,10 @@ def _render_literal(value: object) -> str:
     if isinstance(value, int):
         return str(value)
     if isinstance(value, float):
+        # inf/-inf pass through: Wireshark orders them as Python does. NaN does
+        # not — see the module docstring's IEEE-754 section.
+        if math.isnan(value):
+            raise UnsupportedExprError(_NAN_REFUSAL)
         return repr(value)
     if isinstance(value, str):
         return _render_str(value)
@@ -163,10 +213,26 @@ def _render_set_item(ftype: str, item: MembershipItem) -> str:
     if isinstance(item, ValueRange):
         lo: Any = values.coerce_literal(ftype, item.lo)
         hi: Any = values.coerce_literal(ftype, item.hi)
+        # Before the inversion check, not after: every comparison with NaN is
+        # false, so `hi < lo` can never fire on a NaN endpoint. Refusing here
+        # keeps the NaN policy a property of this renderer rather than an
+        # accident of which endpoint _render_literal happens to reach first.
+        if _is_nan(lo) or _is_nan(hi):
+            raise UnsupportedExprError(_NAN_REFUSAL)
         if hi < lo:
             raise ValueError(f"inverted membership range: {item.lo!r}..{item.hi!r}")
         return f"{_render_literal(lo)} .. {_render_literal(hi)}"
     return _render_literal(values.coerce_literal(ftype, item))
+
+
+def _is_nan(value: object) -> bool:
+    """Is this coerced literal a float NaN, which no Python comparison matches?
+
+    Guarded on ``float`` so ``math.isnan`` never sees an address or a string;
+    ``bool`` cannot reach here as a float, so no bool-before-int dance is
+    needed (that ordering lives in :func:`_render_literal`).
+    """
+    return isinstance(value, float) and math.isnan(value)
 
 
 def _render_needle(ftype: str, needle: str | bytes) -> str:

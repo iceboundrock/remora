@@ -1,6 +1,6 @@
 """Validate compiled display filters against a real tshark (issue #18).
 
-Two halves:
+Three parts:
 
 1. Syntax: every golden dfilter string the test suite asserts anywhere —
    dfilter_corpus.GOLDEN, the semantics table's per-case goldens, and the
@@ -14,6 +14,12 @@ Two halves:
 2. Semantics: the row set tshark returns for ``!(x == v)`` must match the
    predicate backend's row set for the DSL's ``!=`` on the fixture pcaps —
    including the multi-value (tcp.port) and absent-field (ARP frame) cases.
+
+3. Evidence: the measurements of tshark that a *policy* rests on, pinned so a
+   Wireshark that changes them is caught here rather than silently invalidating
+   the reasoning in the compiler's docstring. Today that is issue #90's
+   IEEE-754 finding — ``nan`` is lexed as a literal and ordered below every
+   value, while ``inf``/``-inf`` agree with Python.
 
 Runs whenever tshark is installed; in CI, REMORA_REQUIRE_TSHARK=1 turns the
 "tshark missing" skip into a hard failure so the suite can never silently
@@ -30,10 +36,10 @@ from pathlib import Path
 
 import pytest
 
-from dfilter_corpus import CAPTURE_DFILTER_GOLDENS, GOLDEN, PLANNER_DFILTER_GOLDENS
+from dfilter_corpus import CAPTURE_DFILTER_GOLDENS, GOLDEN, PLANNER_DFILTER_GOLDENS, RESPTIME
 from exprgen import gen_corpus
 from remora import DNS, IP, TCP, UDP
-from remora.compile.dfilter import compile_dfilter
+from remora.compile.dfilter import UnsupportedExprError, compile_dfilter
 from remora.compile.predicate import compile_predicate
 from remora.expr import Expr
 from remora.proto.http import HTTP
@@ -43,6 +49,8 @@ from test_semantics_table import CASES
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 TCP_MIXED = FIXTURES_DIR / "tcp_mixed.pcap"
 DNS_MULTI = FIXTURES_DIR / "dns_multi.pcap"
+
+NAN = float("nan")
 
 # Same skip contract as tests/integration/: skipped with a clear message when
 # tshark is absent locally; REMORA_REQUIRE_TSHARK (set in CI) turns a missing
@@ -144,7 +152,7 @@ class TestGoldenCorpusValidates:
         # Size guard, exact so silent shrinkage is impossible: dropping a
         # golden case must fail here rather than quietly validate less.
         # Update deliberately when cases are added.
-        assert len(GOLDEN) == 44
+        assert len(GOLDEN) == 47
         cases: list[tuple[str, str]] = []
         for case in GOLDEN:
             # Validate what the compiler emits, not just the literal golden
@@ -161,10 +169,10 @@ class TestSemanticsTableGoldensValidate:
     def test_every_semantics_golden_is_accepted_by_tshark(self) -> None:
         dfilters = [case.dfilter for case in CASES if case.dfilter is not None]
         # Exact count: a case losing its golden string must fail loudly here.
-        # Update deliberately when the table grows. 26 base cases plus the 36
+        # Update deliberately when the table grows. 27 base cases plus the 36
         # absent-field truth-table cases (nine operators x scalar/multi x
         # positive/negated), every one of which carries a golden.
-        assert len(dfilters) == 62
+        assert len(dfilters) == 63
         _assert_all_valid(
             [
                 (f"semantics[{case.id}]: {case.expr!r}", case.dfilter)
@@ -310,3 +318,81 @@ class TestMatchesSemanticsParity:
         dfilter = compile_dfilter(expr)
         assert " matches " in dfilter
         assert _tshark_matching_frames(pcap, dfilter) == _predicate_matching_frames(pcap, expr)
+
+
+def _tshark_accepts(pcap: Path, dfilter: str) -> bool:
+    """Does tshark's display-filter parser accept *dfilter* at all?
+
+    Acceptance, not the row set: used below to separate "tshark lexed this as a
+    literal" from "tshark rejected the text outright".
+    """
+    argv = [_TSHARK, "-n", "-r", str(pcap), "-Y", dfilter]
+    result = subprocess.run(
+        argv,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+        timeout=_TSHARK_TIMEOUT,
+    )
+    return result.returncode == 0
+
+
+class TestNaNIsARecognizedDfilterLiteral:
+    """Why the dfilter backend refuses NaN literals (issue #90).
+
+    These tests measure tshark rather than remora: they are the evidence behind
+    the policy in ``dfilter.py``'s IEEE-754 section, pinned so a future
+    Wireshark that changes how it lexes or orders ``nan`` is caught here and the
+    policy gets revisited, instead of the reasoning quietly going stale.
+
+    Measured on tshark 4.6.8 (Homebrew/macOS).
+    """
+
+    def test_nan_is_lexed_as_a_literal_while_near_misses_are_rejected(self) -> None:
+        # The load-bearing fact: rendering `nan` is NOT self-protecting. If
+        # tshark rejected it the way it rejects `nam`, a repr-rendered NaN would
+        # be a loud failure and there would be nothing to fix.
+        assert _tshark_accepts(DNS_MULTI, "frame.time_delta == nan")
+        for near_miss in ("nam", "nan5", "zzz"):
+            assert not _tshark_accepts(DNS_MULTI, f"frame.time_delta == {near_miss}"), near_miss
+
+    def test_ordered_comparisons_with_nan_diverge_from_python_on_a_time_field(self) -> None:
+        # Python's comparisons with NaN are all false, so the predicate backend
+        # selects NOTHING for every filter below. tshark orders `nan` beneath
+        # every value instead, so `>` and `>=` select every frame carrying the
+        # field: a silent wrong answer, not a loud failure.
+        present = _tshark_matching_frames(DNS_MULTI, "frame.time_delta")
+        assert present, "fixture must have frames carrying frame.time_delta"
+        assert _tshark_matching_frames(DNS_MULTI, "frame.time_delta > nan") == present
+        assert _tshark_matching_frames(DNS_MULTI, "frame.time_delta >= nan") == present
+        # The other three happen to agree with Python; only > and >= diverge.
+        assert _tshark_matching_frames(DNS_MULTI, "frame.time_delta < nan") == set()
+        assert _tshark_matching_frames(DNS_MULTI, "frame.time_delta <= nan") == set()
+        assert _tshark_matching_frames(DNS_MULTI, "frame.time_delta == nan") == set()
+
+    def test_the_compiler_never_emits_any_of_those_filters(self) -> None:
+        # The refusal is what keeps the divergence above off the pushdown path.
+        # A float literal only reaches the renderer on a float ftype, so this is
+        # the same policy the row sets above are the motive for.
+        for expr in (RESPTIME > NAN, RESPTIME >= NAN, RESPTIME != NAN, RESPTIME.in_([NAN])):
+            with pytest.raises(UnsupportedExprError, match="NaN"):
+                compile_dfilter(expr)
+
+
+class TestInfinityAgreesWithPython:
+    """``inf``/``-inf`` are pushed down unchanged, so their row sets have to be
+    Python's. Pinned beside the NaN evidence so nobody "completes" the NaN rule
+    by refusing them too (issue #90)."""
+
+    def test_infinite_bounds_select_what_python_selects(self) -> None:
+        present = _tshark_matching_frames(DNS_MULTI, "frame.time_delta")
+        assert present, "fixture must have frames carrying frame.time_delta"
+        # Every frame carrying a finite value is < inf and > -inf; none is
+        # beyond either bound or equal to one. Exactly Python's answers.
+        assert _tshark_matching_frames(DNS_MULTI, "frame.time_delta < inf") == present
+        assert _tshark_matching_frames(DNS_MULTI, "frame.time_delta > -inf") == present
+        assert _tshark_matching_frames(DNS_MULTI, "frame.time_delta > inf") == set()
+        assert _tshark_matching_frames(DNS_MULTI, "frame.time_delta < -inf") == set()
+        assert _tshark_matching_frames(DNS_MULTI, "frame.time_delta == inf") == set()

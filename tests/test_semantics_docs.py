@@ -89,6 +89,8 @@ def test_the_doc_names_where_each_rule_is_enforced() -> None:
         "tests/test_semantics_table.py",
         "tests/test_sql_duckdb.py",
         "tests/test_re2_portability.py",
+        "tests/test_dfilter.py",
+        "tests/test_dfilter_validation.py",
         "src/remora/compile/re2.py",
     ):
         assert path in text
