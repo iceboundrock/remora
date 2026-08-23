@@ -260,6 +260,26 @@ CASES: tuple[Case, ...] = (
         ),
     ),
     Case(
+        # The mirror image of the nan-literal rows above: there the NaN is the
+        # literal, here it is the *stored value* and the comparison is an
+        # ordinary pushdown. This is the row that makes the table
+        # self-contained about NaN, and the three engines reach the same answer
+        # by three different routes: Python because every comparison against
+        # NaN is False, the display filter because the value never satisfies an
+        # ordered comparison, and DuckDB only because sql.py adds the
+        # `NOT isnan(...)` guard -- its DOUBLE order sorts NaN greatest, so an
+        # unguarded `> 1.0` would wrongly match it.
+        id="stored-nan-gt",
+        expr=RESP > 1.0,
+        dfilter="icmp.resptime > 1.0",
+        rows=(
+            (FakePacket({"icmp.resptime": ("nan",)}), False),
+            (FakePacket({"icmp.resptime": ("2.5",)}), True),
+            (FakePacket({"icmp.resptime": ("0.25",)}), False),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
         id="string-escaping",
         expr=HOST == 'say "hi"',
         dfilter='http.host == "say \\"hi\\""',

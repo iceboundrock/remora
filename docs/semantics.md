@@ -202,14 +202,24 @@ comparing row sets; the pattern half is pinned by
   is why rendering it is not self-protecting and refusal is the fix. What
   tshark does with it *afterwards* is ftype- and version-dependent, and that
   instability is itself the argument against a dfilter-native rendering: on a
-  float field tshark 4.6.8 rejects ordered comparisons against it while CI's
-  4.2.2 accepts them and matches nothing; on a relative-time field 4.6.8 orders
+  float field a current tshark release rejects ordered comparisons against it
+  while Ubuntu noble's stock build — what CI's `checks` leg installs — accepts
+  them and matches nothing; on a relative-time field the current release orders
   `nan` below every value, so `frame.time_delta > nan` selects every frame
-  carrying the field where Python selects none, while 4.2.2 rejects that filter
-  outright. `inf`/`-inf` are pushed down unchanged everywhere, since all three
-  engines order them identically. Enforced by
+  carrying the field where Python selects none, while the stock build rejects
+  that filter outright. (Measured on 4.6.8 and 4.2.2 respectively; the builds
+  are named rather than the versions because the apt one moves with the runner
+  image, while the assertions below are build-agnostic by construction.)
+  `inf`/`-inf` are pushed down unchanged everywhere, since all three engines
+  order them identically. Enforced by
   `tests/test_dfilter.py::TestNaNLiterals` and the four
-  `nan-literal-*`/`inf-literal-*` rows of `tests/test_semantics_table.py`.
+  `nan-literal-*`/`inf-literal-*` rows of `tests/test_semantics_table.py`. A
+  fifth row, `stored-nan-gt`, covers the mirror case — the NaN in the stored
+  *value* rather than the literal, under an ordinary pushable `>` — so the
+  table is self-contained about NaN from both sides. All three engines exclude
+  such a packet, but only DuckDB needs help doing it: its `DOUBLE` order sorts
+  NaN greatest, so that row fails if `sql.py`'s `NOT isnan(...)` guard ever
+  regresses.
   `tests/test_dfilter_validation.py::TestNaNIsARecognizedDfilterLiteral`/
   `TestInfinityIsPushedDownUnchanged` add a live-binary check, but assert only
   what holds on **both** tested builds: that `nan` lexes where `nam`/`nan5`/`zzz`
