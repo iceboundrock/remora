@@ -36,8 +36,12 @@ HOST = FieldRef[str]("http.host", "FT_STRING", False)
 TIME = FieldRef[datetime]("frame.time", "FT_ABSOLUTE_TIME", False)
 QNAME = FieldRef[str]("dns.qry.name", "FT_STRING", True)
 PAYLOAD = FieldRef[bytes]("tcp.payload", "FT_BYTES", False)
+RESP = FieldRef[float]("icmp.resptime", "FT_DOUBLE", False)
 
 EMPTY = FakePacket({})
+
+NAN = float("nan")
+INF = float("inf")
 
 
 @dataclass(frozen=True)
@@ -206,6 +210,72 @@ CASES: tuple[Case, ...] = (
         rows=(
             (FakePacket({"frame.time": ("1625097600.123456",)}), True),
             (FakePacket({"frame.time": ("1625097599.999999",)}), False),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
+        # IEEE-754 NaN (issue #90). Same row set on all three backends, reached
+        # three different ways: the dfilter backend REFUSES (Wireshark does not
+        # give NaN Python's semantics, so the planner falls back to the Python
+        # predicate, which does), the SQL backend compiles the constant FALSE
+        # (issue #88), and the predicate backend just evaluates Python.
+        id="nan-literal-gt",
+        expr=RESP > NAN,
+        dfilter=None,
+        rows=(
+            (FakePacket({"icmp.resptime": ("0.25",)}), False),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
+        # The negated twin: `!=` is Not(Comparison(EQ, ...)), so `not False` is
+        # True for every packet, the absent one included.
+        id="nan-literal-ne",
+        expr=RESP != NAN,
+        dfilter=None,
+        rows=(
+            (FakePacket({"icmp.resptime": ("0.25",)}), True),
+            (EMPTY, True),
+        ),
+    ),
+    Case(
+        id="nan-literal-membership",
+        expr=RESP.in_([NAN]),
+        dfilter=None,
+        rows=(
+            (FakePacket({"icmp.resptime": ("0.25",)}), False),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
+        # inf is NOT refused anywhere: all three engines order it identically,
+        # so it stays a pushdown. Here so the NaN rows above cannot be widened
+        # to cover it without this row failing.
+        id="inf-literal-lt",
+        expr=RESP < INF,
+        dfilter="icmp.resptime < inf",
+        rows=(
+            (FakePacket({"icmp.resptime": ("0.25",)}), True),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
+        # The mirror image of the nan-literal rows above: there the NaN is the
+        # literal, here it is the *stored value* and the comparison is an
+        # ordinary pushdown. This is the row that makes the table
+        # self-contained about NaN, and the three engines reach the same answer
+        # by three different routes: Python because every comparison against
+        # NaN is False, the display filter because the value never satisfies an
+        # ordered comparison, and DuckDB only because sql.py adds the
+        # `NOT isnan(...)` guard -- its DOUBLE order sorts NaN greatest, so an
+        # unguarded `> 1.0` would wrongly match it.
+        id="stored-nan-gt",
+        expr=RESP > 1.0,
+        dfilter="icmp.resptime > 1.0",
+        rows=(
+            (FakePacket({"icmp.resptime": ("nan",)}), False),
+            (FakePacket({"icmp.resptime": ("2.5",)}), True),
+            (FakePacket({"icmp.resptime": ("0.25",)}), False),
             (EMPTY, False),
         ),
     ),

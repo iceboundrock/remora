@@ -190,6 +190,45 @@ comparing row sets; the pattern half is pinned by
 - **Time literals** (`datetime`/`timedelta`) are not pushed to display filters
   (M1 decision); the planner keeps them as residual Python predicates. The row
   set is unchanged; only the execution path differs.
+- **IEEE-754 NaN literals** reach the same row set three different ways, so this
+  is a mechanism difference rather than a semantic one. Python's comparisons
+  with NaN are all false, which is what `predicate.py` evaluates directly and
+  what `sql.py` compiles to the constant `FALSE`; `dfilter.py` **refuses** with
+  `UnsupportedExprError` and the planner falls back to that predicate. The
+  asymmetry is deliberate: SQL has a boolean constant to compile to and a
+  `DOUBLE` total order that has to be actively neutralized, with no fallback
+  engine to defer to, while a display filter has neither the constant nor the
+  need. Wireshark does lex `nan` as a literal rather than rejecting it, which
+  is why rendering it is not self-protecting and refusal is the fix. What
+  tshark does with it *afterwards* is ftype- and version-dependent, and that
+  instability is itself the argument against a dfilter-native rendering: on a
+  float field a current tshark release rejects ordered comparisons against it
+  while Ubuntu noble's stock build — what CI's `checks` leg installs — accepts
+  them and matches nothing; on a relative-time field the current release orders
+  `nan` below every value, so `frame.time_delta > nan` selects every frame
+  carrying the field where Python selects none, while the stock build rejects
+  that filter outright. (Measured on 4.6.8 and 4.2.2 respectively; the builds
+  are named rather than the versions because the apt one moves with the runner
+  image, while the assertions below are build-agnostic by construction.)
+  `inf`/`-inf` are pushed down unchanged everywhere, since all three engines
+  order them identically. Enforced by
+  `tests/test_dfilter.py::TestNaNLiterals` and the four
+  `nan-literal-*`/`inf-literal-*` rows of `tests/test_semantics_table.py`. A
+  fifth row, `stored-nan-gt`, covers the mirror case — the NaN in the stored
+  *value* rather than the literal, under an ordinary pushable `>` — so the
+  table is self-contained about NaN from both sides. All three engines exclude
+  such a packet, but only DuckDB needs help doing it: its `DOUBLE` order sorts
+  NaN greatest, so that row fails if `sql.py`'s `NOT isnan(...)` guard ever
+  regresses.
+  `tests/test_dfilter_validation.py::TestNaNIsARecognizedDfilterLiteral`/
+  `TestInfinityIsPushedDownUnchanged` add a live-binary check, but assert only
+  what holds on **both** tested builds: that `nan` lexes where `nam`/`nan5`/`zzz`
+  do not, that an ordered NaN comparison is never accepted-and-matching, and
+  that infinities are accepted. The per-build divergences above are *recorded*
+  in those test docstrings rather than asserted — one build's behavior is
+  evidence for the policy, not a contract — and on a build that accepts the
+  ordered comparisons the row-set half is witnessed vacuously, since no
+  checked-in fixture carries a populated `FT_DOUBLE` field.
 - **`contains` on a `BLOB` column** is `UnsupportedSqlExprError`: DuckDB's
   `contains()` takes `VARCHAR` or `LIST`, not `BLOB`. The pcap path runs it.
 - **Field text tshark could not decode as UTF-8** reaches the predicate backend

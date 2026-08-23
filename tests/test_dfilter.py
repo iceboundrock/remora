@@ -12,9 +12,23 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from dfilter_corpus import DELTA, GOLDEN, HOST, PAYLOAD, PORT, SRC, TIME, GoldenCase, StubField
+from dfilter_corpus import (
+    DELTA,
+    GOLDEN,
+    HOST,
+    PAYLOAD,
+    PORT,
+    RESPTIME,
+    SRC,
+    TIME,
+    GoldenCase,
+    StubField,
+)
 from remora.compile.dfilter import UnsupportedExprError, compile_dfilter
 from remora.expr import Expr
+
+NAN = float("nan")
+INF = float("inf")
 
 # Deliberately fake: exercises the unknown-ftype fallback. Its golden string
 # can never validate against a real tshark, so it is excluded from GOLDEN.
@@ -110,3 +124,95 @@ class TestExtendedOperatorErrors:
         moment = datetime(2026, 1, 1, tzinfo=timezone.utc)
         with pytest.raises(UnsupportedExprError, match="time comparisons"):
             compile_dfilter(TIME.in_([moment]))
+
+
+class TestNaNLiterals:
+    """IEEE-754 NaN is refused (issue #90), everywhere a float literal can reach
+    the renderer.
+
+    Python's comparisons with NaN are all false, so the predicate backend the
+    planner falls back to already has the right answer; Wireshark's engine does
+    not agree, and what it does instead is ftype- and version-dependent (see
+    tests/test_dfilter_validation.py::TestNaNIsARecognizedDfilterLiteral).
+    """
+
+    @pytest.mark.parametrize(
+        "expr",
+        [
+            RESPTIME == NAN,
+            RESPTIME < NAN,
+            RESPTIME <= NAN,
+            RESPTIME > NAN,
+            RESPTIME >= NAN,
+        ],
+        ids=["eq", "lt", "le", "gt", "ge"],
+    )
+    def test_every_comparison_operator_refuses_nan(self, expr: Expr) -> None:
+        with pytest.raises(UnsupportedExprError, match="NaN"):
+            compile_dfilter(expr)
+
+    def test_ne_refuses_nan(self) -> None:
+        # The DSL's != is Not(Comparison(EQ, ...)); the refusal has to survive
+        # the wrapper rather than rendering `!(icmp.resptime == nan)`.
+        with pytest.raises(UnsupportedExprError, match="NaN"):
+            compile_dfilter(RESPTIME != NAN)
+
+    @pytest.mark.parametrize("text", ["nan", "NaN", "-nan"], ids=["lower", "mixed", "signed"])
+    def test_string_literal_parsed_to_nan_is_refused(self, text: str) -> None:
+        # coerce_literal parses a str with float(), so "nan" arrives as a NaN
+        # float: the check has to be on the COERCED value, not on the input.
+        with pytest.raises(UnsupportedExprError, match="NaN"):
+            compile_dfilter(RESPTIME == text)  # noqa: SIM300
+
+    def test_membership_element_refuses_nan(self) -> None:
+        with pytest.raises(UnsupportedExprError, match="NaN"):
+            compile_dfilter(RESPTIME.in_([NAN]))
+
+    def test_membership_refuses_nan_beside_a_good_element(self) -> None:
+        with pytest.raises(UnsupportedExprError, match="NaN"):
+            compile_dfilter(RESPTIME.in_([0.25, NAN]))
+
+    @pytest.mark.parametrize(
+        "bounds",
+        [(NAN, 1.0), (1.0, NAN), (NAN, NAN)],
+        ids=["nan-lo", "nan-hi", "both"],
+    )
+    def test_range_endpoint_refuses_nan(self, bounds: tuple[float, float]) -> None:
+        # Checked before the inverted-range test: `hi < lo` is false for a NaN
+        # endpoint, so the inversion check can never fire on one and the
+        # refusal must not depend on it.
+        with pytest.raises(UnsupportedExprError, match="NaN"):
+            compile_dfilter(RESPTIME.in_([bounds]))
+
+    def test_nan_nested_in_boolean_structure_refuses(self) -> None:
+        with pytest.raises(UnsupportedExprError, match="NaN"):
+            compile_dfilter((SRC == "10.0.0.1") & (RESPTIME > NAN))
+
+    def test_refusal_names_the_python_predicate_fallback(self) -> None:
+        with pytest.raises(UnsupportedExprError, match="Python predicate"):
+            compile_dfilter(RESPTIME > NAN)
+
+
+class TestInfinityLiterals:
+    """``inf``/``-inf`` are deliberately NOT refused: Wireshark orders them the
+    way Python does, so the pushdown is sound. Pinned so nobody "completes" the
+    NaN rule by sweeping them in — a real tshark accepts every string below
+    (tests/test_dfilter_validation.py)."""
+
+    def test_gt_infinity_renders(self) -> None:
+        assert compile_dfilter(RESPTIME > INF) == "icmp.resptime > inf"
+
+    def test_lt_negative_infinity_renders(self) -> None:
+        assert compile_dfilter(RESPTIME < -INF) == "icmp.resptime < -inf"
+
+    def test_eq_infinity_renders(self) -> None:
+        assert compile_dfilter(RESPTIME == INF) == "icmp.resptime == inf"
+
+    def test_ne_infinity_renders(self) -> None:
+        assert compile_dfilter(RESPTIME != INF) == "!(icmp.resptime == inf)"
+
+    def test_infinite_range_endpoint_renders(self) -> None:
+        assert compile_dfilter(RESPTIME.in_([(-INF, INF)])) == "icmp.resptime in {-inf .. inf}"
+
+    def test_string_literal_parsed_to_infinity_renders(self) -> None:
+        assert compile_dfilter(RESPTIME == "inf") == "icmp.resptime == inf"
