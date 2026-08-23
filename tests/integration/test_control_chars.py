@@ -35,6 +35,7 @@ unconditionally.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 from functools import cache
 from pathlib import Path
@@ -497,3 +498,66 @@ class TestPredicateContractIsUnchanged:
     def test_rows_satisfy_the_raw_packet_contract(self) -> None:
         rows = list(FieldsReader(run(*fields_argv(PROJECTION)), PROJECTION))
         assert all(isinstance(row, RawPacket) for row in rows)
+
+
+#: The frame whose comment carries a real 0x0b, and a pattern that can only
+#: match it through a Perl class the three engines do not define identically.
+VT_FRAME = 2
+VT_PATTERN = r"vt\shere"
+
+
+class TestTheVerticalTabPerlClassDivergence:
+    r"""The `\s` claim in docs/semantics.md, measured on all three engines.
+
+    The portable-text guard refuses VERTICAL TAB because RE2 defines ``\s`` as
+    ``[\t\n\f\r ]`` while Python ``re`` and PCRE2 also count U+000B — a
+    mismatch in the *definition* of a class rather than in how the engines run
+    it, so no construct check can see it and only a value-side refusal closes
+    it. Two thirds of that were already measured
+    (``tests/test_sql_duckdb.py::TestPortableTextGuard`` runs Python ``re`` and
+    RE2 side by side); the PCRE2 third was verified by hand and asserted in a
+    code comment, which is what issue #102 asked for a fixture for. Frame 2's
+    comment carries a genuine 0x0b, so tshark can answer for itself.
+    """
+
+    def test_pcre2_counts_the_vertical_tab_as_whitespace(self) -> None:
+        """Wireshark's own engine, on the true value — the missing third."""
+        assert pushdown_rows(COMMENT.matches(VT_PATTERN)) == {VT_FRAME}
+
+    def test_a_literal_space_matches_nothing(self) -> None:
+        """The control: frame 2 matches through the class, not through text."""
+        assert pushdown_rows(COMMENT.matches("vt here")) == set()
+
+    def test_python_re_agrees_with_pcre2(self) -> None:
+        expr = COMMENT.matches(VT_PATTERN)
+        # ek decodes JSON and is right on every version — the reference.
+        assert ek_rows(expr) == {VT_FRAME}
+        if survives_the_round_trip(VT_FRAME):
+            assert fields_rows(expr) == {VT_FRAME}
+        else:
+            # Pre-4.4 the 0x0b arrives as the two characters "\v" and the
+            # reader cannot invert it, so there is no whitespace to match.
+            assert fields_rows(expr) == set()
+
+    def test_re2_is_the_odd_one_out(self) -> None:
+        """The divergence itself, over the bytes this fixture really holds.
+
+        Taken from ``-T ek`` rather than written as a literal, so the three
+        engines are compared against one measured value. What the SQL backend
+        does about it — refuse the value rather than fork the row set — is
+        pinned by ``tests/test_sql_duckdb.py::TestPortableTextGuard``.
+        """
+        duckdb = pytest.importorskip("duckdb")
+        packets = list(EkReader(run(*ek_argv())))
+        (value,) = packets[VT_FRAME - 1].get_raw("frame.comment")
+        assert "\v" in value, "the fixture lost its vertical tab"
+        connection = duckdb.connect(":memory:")
+        try:
+            row = connection.execute(
+                "SELECT regexp_matches(?, ?, 'i')", [value, VT_PATTERN]
+            ).fetchone()
+        finally:
+            connection.close()
+        assert row is not None
+        assert row[0] is False
+        assert re.search(VT_PATTERN.encode(), value.encode()) is not None

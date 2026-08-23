@@ -120,28 +120,73 @@ def test_the_doc_states_which_side_of_the_escaper_each_separator_is_on() -> None
     assert OCC_SEP not in ESCAPED_CHARS
 
 
-def test_the_doc_names_where_each_rule_is_enforced() -> None:
-    text = read_doc()
-    for path in (
+#: Suffixes that make a backticked token a repository path rather than prose.
+_PATH_SUFFIXES = (".py", ".pyi", ".md", ".toml", ".pcap", ".pcapng", ".txt")
+
+#: A floor under the derivation below. Listing every path is what this test
+#: stopped doing (issue #102), but a regex that quietly matches nothing would
+#: turn the existence check into a no-op, so these four — the doc cannot be
+#: this document without citing them — have to keep coming out of it.
+_ANCHOR_PATHS = frozenset(
+    {
+        "src/remora/compile/re2.py",
+        "src/remora/compile/sql.py",
         "tests/test_semantics_table.py",
         "tests/test_sql_duckdb.py",
-        "tests/test_re2_portability.py",
-        "tests/test_dfilter.py",
-        "tests/test_dfilter_validation.py",
-        "src/remora/compile/re2.py",
-        "src/remora/reader/fields_reader.py",
-        "tests/test_fields_reader.py",
-        "tests/integration/test_control_chars.py",
-        "tests/fixtures/ctrl_comments.pcapng",
-    ):
-        assert path in text
-        # Substring-only would leave the doc pointing at a renamed file.
+    }
+)
+
+
+def named_paths() -> frozenset[str]:
+    """Every repository path the doc names inside a code span.
+
+    Derived from the doc rather than restated here (issue #102): a hand-kept
+    list covers only the paths somebody remembered to add, and this one had
+    fallen three behind. A ``file.py::Class`` citation contributes the file.
+    """
+    paths: set[str] = set()
+    for span in re.findall(r"`([^`\n]+)`", read_doc()):
+        head = span.split("::", 1)[0].strip()
+        # A glob is a pattern, not an enforcement site: docs/*.md names no file.
+        if "/" in head and "*" not in head and head.endswith(_PATH_SUFFIXES):
+            paths.add(head)
+    return frozenset(paths)
+
+
+def test_the_doc_names_where_each_rule_is_enforced() -> None:
+    named = named_paths()
+    assert named >= _ANCHOR_PATHS, "the path derivation stopped seeing the doc's own citations"
+    for path in sorted(named):
+        # Naming a path is not enough: a renamed file would leave the doc
+        # pointing at nothing, and the citation is the enforcement claim.
         assert (REPO_ROOT / path).is_file(), path
 
 
-def test_no_python_fence_is_mistagged_as_pyi() -> None:
-    # ruff format rewrites ```python fences in docs/*.md; a .pyi example tagged
-    # ```python would be reformatted as a .py file and silently corrupted.
-    text = read_doc()
-    for fence in re.findall(r"```python\n(.*?)```", text, re.S):
-        assert "..." not in fence.split("\n")[0], "stub example must use a ```pyi fence"
+def code_fences() -> tuple[tuple[str, str], ...]:
+    """Every fenced block in the doc, as ``(info string, body)`` pairs."""
+    return tuple(
+        (match.group(1).strip(), match.group(2))
+        for match in re.finditer(r"^```(.*)\n(.*?)^```", read_doc(), re.M | re.S)
+    )
+
+
+def test_the_fence_inventory_the_mistag_guard_runs_over() -> None:
+    """Self-reporting vacuity (issue #102).
+
+    The guard below iterates the fences this doc carries, and today it carries
+    none — so it asserts nothing, and reads as coverage it is not providing.
+    Asserting the inventory it depends on says so out loud: the first fence
+    added to this document fails here, which is exactly when someone should
+    check that the guard below is saying what that fence needs.
+    """
+    assert code_fences() == ()
+
+
+def test_no_fenced_stub_example_is_tagged_for_the_python_formatter() -> None:
+    # ruff format rewrites ```python fences in docs/*.md, so a .pyi example
+    # tagged ```python is reformatted as a .py file and silently corrupted.
+    # Checked over EVERY fence rather than only the ```python ones: an untagged
+    # or ```py-tagged stub is the same mistake, and the tag is what has to move.
+    for tag, body in code_fences():
+        if "..." in body.split("\n", 1)[0]:
+            assert tag == "pyi", f"stub example must use a ```pyi fence, not ```{tag}"

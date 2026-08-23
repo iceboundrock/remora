@@ -55,7 +55,9 @@ so the negated cells of the `==` and `matches` rows — scalar and multi-value
 alike, since a multi-value parity case alone would leave the scalar cell
 unmeasured — are confirmed against Wireshark itself.
 `tests/test_semantics_docs.py` checks this table against the operator list the
-suite enumerates.
+suite enumerates. The grid is read out of the `Expr` each case carries, not out
+of its label, so a case whose id names an operator or a multiplicity its
+expression does not have fails rather than filling a cell it never tested.
 
 ### How SQL gets there
 
@@ -180,8 +182,20 @@ precondition scan in `Query` — future work, not a gap this document hides.
 Enforced by `tests/test_sql_duckdb.py::TestPortableTextGuard` and by the
 `matches-byte-oriented` case in `tests/test_semantics_table.py`, which carries a
 `sql_guard_rows` marker so the shared suite asserts the guard fires rather than
-comparing row sets; the pattern half is pinned by
-`tests/test_re2_portability.py`, against real RE2 wherever duckdb is installed.
+comparing row sets. The marker names *which* rows: each listed one is seeded
+alone and must raise, and the rest are seeded together and must return the
+shared row set, so an index pointing at a portable row — or omitting an
+unportable one — fails the suite rather than exempting the case wholesale. The
+pattern half is pinned by `tests/test_re2_portability.py`, against real RE2
+wherever duckdb is installed.
+
+The vertical-tab row of the table above is measured on all three engines rather
+than on the two this repo can run in-process:
+`tests/integration/test_control_chars.py::TestTheVerticalTabPerlClassDivergence`
+puts `vt\shere` to a live tshark over frame 2 of
+`tests/fixtures/ctrl_comments.pcapng`, whose comment carries a genuine `0x0b`,
+and compares Wireshark's PCRE2 against Python `re` and RE2 over the same
+measured value.
 
 ## Reader representation: `-T fields` escaping
 

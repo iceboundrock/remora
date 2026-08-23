@@ -18,6 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from ipaddress import IPv4Address, IPv6Address
+from typing import TypeAlias
 
 import pytest
 
@@ -25,7 +26,18 @@ from conftest import FakePacket
 from remora import values
 from remora.compile.dfilter import UnsupportedExprError, compile_dfilter
 from remora.compile.predicate import compile_predicate
-from remora.expr import CompareOp, Comparison, Expr, LiteralValue
+from remora.expr import (
+    CompareOp,
+    Comparison,
+    Contains,
+    Expr,
+    FieldLike,
+    LiteralValue,
+    Matches,
+    Membership,
+    Not,
+    Presence,
+)
 from remora.fields import FieldRef
 
 SRC = FieldRef[IPv4Address]("ip.src", "FT_IPv4", False)
@@ -66,7 +78,11 @@ class Case:
     None means compile_sql must succeed."""
     sql_guard_rows: frozenset[int] = frozenset()
     """Row indices whose stored text trips the SQL backend's portable-text
-    guard, so the DuckDB run raises instead of returning rows."""
+    guard, so the DuckDB run raises instead of returning rows.
+
+    The indices are asserted, not decorative: ``tests/test_sql_duckdb.py``
+    seeds each one alone and requires a raise, then seeds all the others
+    together and requires the shared row set (issue #102)."""
 
 
 _MOMENT = datetime(2021, 7, 1, tzinfo=timezone.utc)  # epoch 1625097600
@@ -698,18 +714,84 @@ NULL_TRUTH_CASES: tuple[Case, ...] = NULL_TRUTH_POSITIVE + tuple(
 CASES = CASES + NULL_TRUTH_CASES
 
 
+#: The inverse of :data:`_OP_SLUG`, for reading an id back into an operator.
+_SLUG_OP: dict[str, str] = {slug: op for op, slug in _OP_SLUG.items()}
+
+#: The multiplicity words an id and a signature share.
+_MULTIPLICITIES: tuple[str, ...] = ("scalar", "multi")
+
+#: A grid coordinate: operator label, multiplicity word, ``""``/``"not-"``.
+TruthSignature: TypeAlias = tuple[str, str, str]
+
+
+def truth_signature(expr: Expr) -> TruthSignature:
+    """The grid coordinate an expression *actually* occupies.
+
+    Read from the IR, never from a label: an id is a comment until something
+    checks it against the tree it names, and a case labelled ``null-gt-multi``
+    carrying ``TTL < 64`` used to satisfy every test in the suite (issue #102).
+    """
+    if isinstance(expr, Not):
+        operator, multiplicity, polarity = truth_signature(expr.operand)
+        if polarity:
+            raise ValueError("the absent-field grid has no doubly negated case")
+        return operator, multiplicity, "not-"
+    field: FieldLike
+    if isinstance(expr, Comparison):
+        operator, field = expr.op.value, expr.field
+    elif isinstance(expr, Membership):
+        operator, field = "in", expr.field
+    elif isinstance(expr, Contains):
+        operator, field = "contains", expr.field
+    elif isinstance(expr, Matches):
+        operator, field = "matches", expr.field
+    elif isinstance(expr, Presence):
+        operator, field = "present", expr.field
+    else:
+        raise ValueError(f"not an absent-field grid shape: {type(expr).__name__}")
+    return operator, ("multi" if field.multi else "scalar"), ""
+
+
+def truth_id_signature(case_id: str) -> TruthSignature:
+    """The grid coordinate an id *claims*, parsed back out of the label."""
+    polarity, rest = "", case_id
+    if rest.startswith("not-"):
+        polarity, rest = "not-", rest.removeprefix("not-")
+    head, _, tail = rest.partition("-")
+    if head != "null" or not tail:
+        raise ValueError(f"not a truth-grid id: {case_id!r}")
+    slug, _, multiplicity = tail.rpartition("-")
+    if slug not in _SLUG_OP or multiplicity not in _MULTIPLICITIES:
+        raise ValueError(f"not a truth-grid id: {case_id!r}")
+    return _SLUG_OP[slug], multiplicity, polarity
+
+
 class TestTruthTableCompleteness:
     """The absent-field truth table is complete and matches its own claim."""
 
     def test_every_operator_multiplicity_polarity_triple_is_covered(self) -> None:
-        expected = {
+        expected_ids = {
             f"{prefix}null-{_OP_SLUG[op]}-{multi}"
             for op in TRUTH_OPERATORS
-            for multi in ("scalar", "multi")
+            for multi in _MULTIPLICITIES
             for prefix in ("", "not-")
         }
-        assert {case.id for case in NULL_TRUTH_CASES} == expected
-        assert len(expected) == len(TRUTH_OPERATORS) * 2 * 2
+        assert {case.id for case in NULL_TRUTH_CASES} == expected_ids
+        assert len(expected_ids) == len(TRUTH_OPERATORS) * 2 * 2
+        # ...and the same grid read out of the expressions, so a duplicated or
+        # missing coordinate cannot hide behind a well-formed set of labels.
+        expected = {
+            (op, multi, prefix)
+            for op in TRUTH_OPERATORS
+            for multi in _MULTIPLICITIES
+            for prefix in ("", "not-")
+        }
+        assert {truth_signature(case.expr) for case in NULL_TRUTH_CASES} == expected
+
+    def test_every_id_names_the_expression_the_case_carries(self) -> None:
+        """The id↔expr correspondence the grid above cannot see (issue #102)."""
+        for case in NULL_TRUTH_CASES:
+            assert truth_signature(case.expr) == truth_id_signature(case.id), case.id
 
     def test_every_positive_case_is_false_on_the_absent_packet(self) -> None:
         for case in NULL_TRUTH_POSITIVE:

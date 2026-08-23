@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterator
+from contextlib import contextmanager
 from ipaddress import IPv4Address, IPv6Address
 from typing import TYPE_CHECKING, Any
 
@@ -334,12 +335,18 @@ class TestPortableTextGuard:
         assert re.search(b"^.{5}$", "café".encode()) is not None
 
 
-def seed_case(connection: DuckDBPyConnection, case: Case) -> None:
+def seed_case(
+    connection: DuckDBPyConnection, case: Case, *, only: frozenset[int] | None = None
+) -> None:
     """Materialize one semantics case's packets as pkts rows.
 
     Every field the expression mentions becomes a column through the real
     #25/#26 path — column_spec for the name/type/codec, add_field_column for the
     ALTER — except the skeleton columns pkts is born with (frame.time is one).
+
+    ``only`` restricts the seeding to those row indices, keeping each row's
+    ``frame_number`` — that is what lets :func:`assert_guard_rows_are_exact`
+    ask which individual rows trip the portable-text guard.
     """
     specs: dict[str, ColumnSpec] = {}
     for ref in field_refs(case.expr):
@@ -351,12 +358,52 @@ def seed_case(connection: DuckDBPyConnection, case: Case) -> None:
     columns = ", ".join(f'"{spec.column_name}"' for spec in specs.values())
     placeholders = ", ".join("?" for _ in specs)
     for index, (packet, _expected) in enumerate(case.rows):
+        if only is not None and index not in only:
+            continue
         row: list[Any] = [index]
         row.extend(spec.encode_raw(packet.get_raw(spec.abbrev)) for spec in specs.values())
         connection.execute(
             f'INSERT INTO main.pkts ("frame_number", {columns}) VALUES (?, {placeholders})',
             row,
         )
+
+
+@contextmanager
+def fresh_connection() -> Iterator[DuckDBPyConnection]:
+    """A second in-memory workspace, for seeding one subset of a case's rows."""
+    connection: DuckDBPyConnection = duckdb.connect(":memory:")
+    create_schema(connection)
+    try:
+        yield connection
+    finally:
+        connection.close()
+
+
+def assert_guard_rows_are_exact(case: Case) -> None:
+    """``sql_guard_rows`` names *which* rows trip the guard, so check which.
+
+    Testing the frozenset for truthiness (what this did before issue #102) let
+    ``frozenset({99})`` pass while asserting nothing: any listed index at all
+    turned the case into "expect a raise". Here each listed row is seeded alone
+    and must raise, and every unlisted row is seeded together and must return
+    the shared expectation cleanly — so an index that is out of range, points
+    at a portable row, or omits an unportable one fails.
+    """
+    indices = frozenset(range(len(case.rows)))
+    assert case.sql_guard_rows <= indices, (
+        f"{case.id}: sql_guard_rows {sorted(case.sql_guard_rows - indices)} "
+        f"index rows the case does not have"
+    )
+    for index in sorted(case.sql_guard_rows):
+        with fresh_connection() as connection:
+            seed_case(connection, case, only=frozenset({index}))
+            with pytest.raises(duckdb.Error, match="pure-ASCII"):
+                select(connection, case.expr)
+    portable = indices - case.sql_guard_rows
+    with fresh_connection() as connection:
+        seed_case(connection, case, only=portable)
+        expected = {index for index in portable if case.rows[index][1]}
+        assert select(connection, case.expr) == expected
 
 
 def _case_id(case: Case) -> str:
@@ -370,8 +417,8 @@ def test_sql_backend_matches_the_other_two(con: DuckDBPyConnection, case: Case) 
     Rows are seeded through the real materialization codecs, so an absent scalar
     lands as NULL and an absent multi-value field as []. A backend is allowed to
     differ from the shared expectation only by refusing to compile
-    (``sql_refusal``) or by raising the portable-text guard
-    (``sql_guard_rows``) — never by returning a different row set.
+    (``sql_refusal``) or by raising the portable-text guard on the rows
+    ``sql_guard_rows`` names — never by returning a different row set.
     """
     if case.sql_refusal is not None:
         with pytest.raises(UnsupportedSqlExprError, match=case.sql_refusal):
@@ -381,6 +428,9 @@ def test_sql_backend_matches_the_other_two(con: DuckDBPyConnection, case: Case) 
     if case.sql_guard_rows:
         with pytest.raises(duckdb.Error, match="pure-ASCII"):
             select(con, case.expr)
+        # ...and the indices are the claim, not just the fact that there are
+        # some: which rows trip the guard is asserted row by row (issue #102).
+        assert_guard_rows_are_exact(case)
         return
     expected = {index for index, (_packet, hit) in enumerate(case.rows) if hit}
     assert select(con, case.expr) == expected
