@@ -40,6 +40,38 @@ jobs:
           REMORA_REQUIRE_TSHARK: "1"
           REMORA_REQUIRE_DUCKDB: "1"
 
+  # The `checks` legs above install Ubuntu's stock tshark (4.2.2 on noble),
+  # which does NOT double backslashes in `-T fields` values — so the reader
+  # refuses to unescape there and every control-character assertion takes the
+  # divergence-pinning branch. Without this job the >= 4.4 unescape path, which
+  # is the actual fix in #74, would never meet a real tshark anywhere in CI.
+  # One Python version is enough: what varies here is the tshark build.
+  tshark-ppa:
+    name: tests against pinned tshark (>= 4.4 unescape path)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.0.0
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: uv sync
+      - name: Install pinned tshark (ppa:wireshark-dev/stable)
+        run: |
+          sudo add-apt-repository -y ppa:wireshark-dev/stable
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tshark
+          tshark --version | head -n 1
+      # The whole suite, not just `-m integration`: the same command the
+      # `checks` leg runs, so the two differ in exactly one variable — the
+      # tshark build — and no marker drift can quietly drop a live-tshark
+      # test out of this leg's coverage.
+      - name: Test
+        run: uv run pytest
+        env:
+          REMORA_REQUIRE_TSHARK: "1"
+          REMORA_REQUIRE_DUCKDB: "1"
+
   codegen-drift:
     runs-on: ubuntu-latest
     steps:

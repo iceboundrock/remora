@@ -53,6 +53,20 @@ def probe_tshark_version(tshark: str) -> str | None:
     tell" and "too old to trust" want exactly the same answer. A binary that
     is genuinely missing or broken surfaces a moment later from the real run,
     with a better message than a version probe could give.
+
+    It uses :func:`subprocess.run` directly rather than :class:`TsharkProcess`
+    even though both live here, because the two want opposite things.
+    ``TsharkProcess`` is built for a long-lived dissecting run: it streams
+    stdout lazily so a multi-gigabyte capture never lands in memory, drains
+    stderr on a background thread to avoid a pipe deadlock, has no timeout
+    because a legitimate run may take hours, and raises
+    :class:`TsharkError` on a nonzero exit. ``tshark --version`` is the exact
+    inverse — two lines of output, bounded and wanted in full, no deadlock to
+    avoid, and a hang that must be cut short (``_VERSION_PROBE_TIMEOUT``)
+    rather than waited out, since the caller only needs a default. Routing it
+    through ``TsharkProcess`` would mean adding a timeout and a
+    do-not-raise mode to the streaming path to serve the one caller that
+    wants neither streaming nor errors.
     """
     # Imported in the function body, not at module scope: remora.codegen is
     # the code generator, and importing the reader must not drag it in for a

@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import os
 import shutil
+from functools import cache
 from pathlib import Path
 from typing import Any
 
@@ -71,10 +72,27 @@ pytestmark = [
     ),
 ]
 
-#: Whether the tshark on PATH escapes invertibly (>= 4.4). Everything below
-#: that branches on this rather than assuming the developer's build.
-TSHARK_VERSION = probe_tshark_version(os.environ.get("TSHARK") or "tshark")
-REVERSIBLE = escaping_is_reversible(TSHARK_VERSION)
+
+@cache
+def tshark_version() -> str | None:
+    """The version of the tshark on PATH, probed once per session.
+
+    Cached rather than computed at module scope: a module-level probe spawns
+    a process during *collection*, so ``--collect-only`` and a run that skips
+    this whole suite would both pay for it.
+    """
+    return probe_tshark_version(os.environ.get("TSHARK") or "tshark")
+
+
+@cache
+def reversible() -> bool:
+    """Whether the tshark on PATH escapes invertibly (>= 4.4).
+
+    Everything below branches on this rather than assuming the developer's
+    build.
+    """
+    return escaping_is_reversible(tshark_version())
+
 
 FRAME_NUMBER = FieldRef[int]("frame.number", "FT_FRAMENUM", False)
 #: pcapng allows several comments per frame, so the field is multi-valued.
@@ -94,6 +112,25 @@ COMMENTS = {
     # The collision that forces the version gate: a literal backslash
     # immediately followed by "t" (see make_fixtures.py).
     5: "C:\\temp",
+}
+
+#: A ``matches`` pattern per frame, each written so it can only match that
+#: frame's TRUE comment. Issue #74 names ``matches`` alongside ``==`` and
+#: ``contains``, and it is the operator where the two regex engines could fork
+#: as well as the two representations, so it gets its own row set.
+#:
+#: The patterns are constrained twice over. :class:`remora.expr.Matches`
+#: accepts only the Python-re/PCRE2 common subset, which is why frame 2's
+#: VERTICAL TAB is written ``\x0b`` rather than ``\v`` — ``\v`` is
+#: dialect-specific and rejected at construction. And a backslash in the
+#: subject has to be written ``\\``, so frames 3 and 5 exercise exactly the
+#: doubling that decides the version gate.
+MATCHES_PATTERNS = {
+    1: r"tab\there",
+    2: r"vt\x0bhere",
+    3: r"back\\slash",
+    4: r"us\x1fhere",
+    5: r"C:\\temp",
 }
 
 
@@ -117,7 +154,7 @@ def pushdown_rows(expr: Expr) -> set[int]:
 def fields_rows(expr: Expr) -> set[int]:
     """Frame numbers the compiled predicate selects over ``-T fields`` rows."""
     predicate = compile_predicate(expr)
-    rows = FieldsReader(run(*fields_argv(PROJECTION)), PROJECTION, unescape_values=REVERSIBLE)
+    rows = FieldsReader(run(*fields_argv(PROJECTION)), PROJECTION, unescape_values=reversible())
     return {int(row.get_raw("frame.number")[0]) for row in rows if predicate(row)}
 
 
@@ -133,7 +170,7 @@ def survives_the_round_trip(frame: int) -> bool:
     nothing at all in this particular value — a raw ``0x1f`` reaches us intact
     on every build, so those frames agree even on 4.2.2.
     """
-    return REVERSIBLE or emitted_comment(frame) == COMMENTS[frame]
+    return reversible() or emitted_comment(frame) == COMMENTS[frame]
 
 
 def ek_rows(expr: Expr) -> set[int]:
@@ -186,13 +223,34 @@ class TestRowSetsAgreeAcrossThePaths:
         else:
             assert fields_rows(expr) == set()
 
+    @pytest.mark.parametrize("frame", sorted(COMMENTS))
+    def test_matches_on_a_control_bearing_value(self, frame: int) -> None:
+        r"""The third operator #74 names, pinned like the other two.
+
+        Every pattern is anchored on the control byte itself (a regex ``\t``
+        or ``\xHH``, never the two characters tshark prints for it), so a
+        match proves the path recovered the true value rather than the
+        escaped text. Frames 3 and 5 carry a literal backslash instead, which
+        is the subject the version gate turns on.
+        """
+        expr = COMMENT.matches(MATCHES_PATTERNS[frame])
+        pushed = pushdown_rows(expr)
+        assert pushed == {frame}
+        # PCRE2 (pushdown) and Python re (residual) agree on this subset, so
+        # any disagreement below is the representation, not the dialect.
+        assert ek_rows(expr) == pushed
+        if survives_the_round_trip(frame):
+            assert fields_rows(expr) == pushed
+        else:
+            assert fields_rows(expr) == set()
+
 
 class TestColumnFramingSurvivesTheSeparatorBytes:
     def test_a_value_holding_the_old_separator_no_longer_aborts_the_parse(self) -> None:
         # Frame 4's comment carries a raw 0x1f, the pre-#74 column separator.
         # Parsing used to raise "expected 2 column(s) ... got 3".
         rows = list(
-            FieldsReader(run(*fields_argv(PROJECTION)), PROJECTION, unescape_values=REVERSIBLE)
+            FieldsReader(run(*fields_argv(PROJECTION)), PROJECTION, unescape_values=reversible())
         )
         assert len(rows) == 6
         # 0x1f is escaped by no measured version and carries no backslash, so
@@ -207,10 +265,10 @@ class TestColumnFramingSurvivesTheSeparatorBytes:
         line = run(*fields_argv(PROJECTION))[1]
         assert UNIT_SEP not in line.split(UNIT_SEP, 1)[1]
         rows = list(
-            FieldsReader(run(*fields_argv(PROJECTION)), PROJECTION, unescape_values=REVERSIBLE)
+            FieldsReader(run(*fields_argv(PROJECTION)), PROJECTION, unescape_values=reversible())
         )
         # Recovering the true 0x0b from that "\v" is the gated half.
-        expected = "vt\vhere" if REVERSIBLE else "vt" + "\\" + ESCAPED_CHARS["\v"] + "here"
+        expected = "vt\vhere" if reversible() else "vt" + "\\" + ESCAPED_CHARS["\v"] + "here"
         assert rows[1].get_raw("frame.comment") == (expected,)
 
 
@@ -224,14 +282,15 @@ class TestEscapeTableIsWhatTsharkDoes:
     """
 
     def test_the_version_gate_matches_the_binary_on_path(self) -> None:
-        assert TSHARK_VERSION is not None, "tshark is installed but reported no version"
-        assert escaping_is_reversible(TSHARK_VERSION) == REVERSIBLE
+        version = tshark_version()
+        assert version is not None, "tshark is installed but reported no version"
+        assert escaping_is_reversible(version) == reversible()
 
     @pytest.mark.parametrize("frame", sorted(COMMENTS))
     def test_unescaping_recovers_the_true_value_when_the_gate_is_open(self, frame: int) -> None:
         """The contract in one line: on >= 4.4, unescape inverts what tshark did."""
-        if not REVERSIBLE:
-            pytest.skip(f"tshark {TSHARK_VERSION} does not escape invertibly")
+        if not reversible():
+            pytest.skip(f"tshark {tshark_version()} does not escape invertibly")
         assert unescape(emitted_comment(frame)) == COMMENTS[frame]
 
     def test_a_pre_44_build_really_is_non_invertible(self) -> None:
@@ -243,8 +302,8 @@ class TestEscapeTableIsWhatTsharkDoes:
         for a value holding a real TAB. Unescaping there does not merely fail
         to help: it rewrites this value into ``C:<TAB>emp``.
         """
-        if REVERSIBLE:
-            pytest.skip(f"tshark {TSHARK_VERSION} doubles backslashes")
+        if reversible():
+            pytest.skip(f"tshark {tshark_version()} doubles backslashes")
         assert emitted_comment(5) == COMMENTS[5]  # NOT doubled
         corrupted = unescape(emitted_comment(5))
         assert corrupted != COMMENTS[5]
@@ -253,9 +312,9 @@ class TestEscapeTableIsWhatTsharkDoes:
     def test_the_backslash_row_is_what_decides_the_gate(self) -> None:
         """Doubling and invertibility are the same fact, whichever build this is."""
         doubled = emitted_comment(3) == "back" + "\\" + ESCAPED_CHARS["\\"] + "slash"
-        assert doubled is REVERSIBLE
+        assert doubled is reversible()
         # ...and the collision frame agrees with it.
-        assert (emitted_comment(5) != COMMENTS[5]) is REVERSIBLE
+        assert (emitted_comment(5) != COMMENTS[5]) is reversible()
 
     def test_the_bytes_this_build_escapes_are_a_subset_of_the_table(self) -> None:
         """The reader may know escapes a build never emits (4.2.2 leaves 0x07
@@ -266,7 +325,7 @@ class TestEscapeTableIsWhatTsharkDoes:
                 if char in emitted:  # arrived raw
                     continue
                 assert char in ESCAPED_CHARS, (
-                    f"frame {frame}: tshark {TSHARK_VERSION} escaped {char!r}, "
+                    f"frame {frame}: tshark {tshark_version()} escaped {char!r}, "
                     f"which ESCAPED_CHARS does not name"
                 )
                 assert "\\" + ESCAPED_CHARS[char] in emitted
@@ -301,7 +360,7 @@ class TestEscapeTableIsWhatTsharkDoes:
             lines = [line for line in proc if line]
         assert lines, "dns_multi.pcap must yield rows"
         assert any(OCC_SEP in line for line in lines), (
-            f"tshark {TSHARK_VERSION} did not split occurrences on OCC_SEP"
+            f"tshark {tshark_version()} did not split occurrences on OCC_SEP"
         )
 
 
@@ -318,12 +377,12 @@ class TestPredicateContractIsUnchanged:
         """The two readers agree only where the escaping is invertible; ek is
         the reference, so below 4.4 this is a known, pinned divergence."""
         rows = list(
-            FieldsReader(run(*fields_argv(PROJECTION)), PROJECTION, unescape_values=REVERSIBLE)
+            FieldsReader(run(*fields_argv(PROJECTION)), PROJECTION, unescape_values=reversible())
         )
         packets = list(EkReader(run(*ek_argv())))
         from_rows = [row.get_raw("frame.comment") for row in rows]
         from_packets = [pkt.get_raw("frame.comment") for pkt in packets]
-        if REVERSIBLE:
+        if reversible():
             assert from_rows == from_packets
         else:
             assert from_rows != from_packets
@@ -335,7 +394,7 @@ class TestPredicateContractIsUnchanged:
     def test_rows_are_never_silently_wrong_about_framing(self) -> None:
         """Framing is fixed on every version: six frames, five with a comment."""
         rows = list(
-            FieldsReader(run(*fields_argv(PROJECTION)), PROJECTION, unescape_values=REVERSIBLE)
+            FieldsReader(run(*fields_argv(PROJECTION)), PROJECTION, unescape_values=reversible())
         )
         assert len(rows) == 6
         assert [len(row.get_raw("frame.comment")) for row in rows] == [1, 1, 1, 1, 1, 0]
