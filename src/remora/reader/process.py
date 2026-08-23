@@ -39,6 +39,14 @@ _THREAD_JOIN_TIMEOUT = 3.0
 
 #: Seconds allowed for the ``--version`` probe. A binary that cannot answer
 #: that fast is broken, and the reader must not hang waiting to find out.
+#:
+#: Deliberately tighter than the 30s in
+#: ``remora.workspace.materialize._VERSION_PROBE_TIMEOUT``, and the reason is
+#: the failure mode rather than the caller: this probe degrades gracefully —
+#: giving up yields ``None``, which the reader reads as "assume the escaping
+#: is not invertible", a correct if conservative answer — so waiting longer
+#: buys nothing. Over there the version is a cache-key component and a
+#: timeout fails the whole materialization, so being patient is worth it.
 _VERSION_PROBE_TIMEOUT = 10.0
 
 

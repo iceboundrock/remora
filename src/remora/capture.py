@@ -66,6 +66,20 @@ class Capture:
     original is unchanged), so partial queries can be shared and extended.
     Iteration executes the query: each ``for`` loop spawns a fresh tshark
     subprocess and yields packets supporting ``pkt[IP].src`` typed access.
+
+    "Immutable" is about the *query*: the terms, the path and the binary
+    never change after construction. The one mutable field is a memo —
+    :meth:`_resolved_tshark_version` caches the `tshark --version` probe on
+    first fields-mode use, so a `Capture` reused across loops probes once
+    rather than per iteration. It is unobservable through the public API (the
+    probe is deterministic for a given binary, and an explicit
+    ``tshark_version=`` skips it entirely), which is why it does not make the
+    object stateful in any sense a caller has to reason about.
+
+    Not thread-safe, and no more so because of that memo: two threads racing
+    the first iteration may both probe, then store the same answer. Nothing
+    else here is synchronized either, so share a `Capture` across threads
+    only if you would have anyway.
     """
 
     __slots__ = ("_path", "_terms", "_tshark", "_tshark_version", "_version_known")
@@ -98,7 +112,14 @@ class Capture:
         return clone
 
     def _resolved_tshark_version(self) -> str | None:
-        """The binary's version, probed at most once per ``Capture``."""
+        """The binary's version, probed at most once per ``Capture``.
+
+        This is the memo the class docstring carves out of "immutable": it
+        writes ``_tshark_version``/``_version_known`` on first call. The
+        probe never raises (see :func:`probe_tshark_version`), so a failure
+        memoizes ``None`` — the conservative answer — rather than retrying
+        a broken binary on every iteration.
+        """
         if not self._version_known:
             self._tshark_version = probe_tshark_version(self._tshark)
             self._version_known = True

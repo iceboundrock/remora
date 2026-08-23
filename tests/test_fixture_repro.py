@@ -47,5 +47,13 @@ def test_ctrl_comments_really_carries_raw_control_bytes() -> None:
     comparing the three evaluation paths would pass vacuously.
     """
     raw = (FIXTURES_DIR / "ctrl_comments.pcapng").read_bytes()
-    for expected in (b"tab\there", b"vt\vhere", b"back\\slash", b"us\x1fhere"):
+    for expected in (
+        b"tab\there",
+        b"vt\vhere",
+        b"back\\slash",
+        b"us\x1fhere",
+        # Frame 7: the OCC_SEP byte itself, which is what makes the
+        # occurrence fork witnessable end to end (#74's accepted residual).
+        b"rs\x1ehere",
+    ):
         assert expected in raw

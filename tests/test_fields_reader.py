@@ -344,6 +344,39 @@ class TestUnescapeIsGatedOnTsharkVersion:
         """The default must be the safe one: leave the value alone."""
         assert escaping_is_reversible(version) is False
 
+    def test_a_double_digit_minor_compares_numerically_not_lexically(self) -> None:
+        """4.10 is above 4.4; a string compare would put it below."""
+        assert escaping_is_reversible("4.10.0") is True
+
+    @pytest.mark.parametrize(
+        ("version", "expected"),
+        [
+            # A suffix on one of the first two components makes that
+            # component unparseable, so the gate closes — the safe direction.
+            ("4.4rc1", False),
+            # A suffix further right does not: the first two components are
+            # numeric, so 4.4.0rc1 reads as 4.4 and the gate opens. That is
+            # also the CORRECT answer (4.4.0rc1 does double backslashes), so
+            # the asymmetry costs nothing either way.
+            ("4.4.0rc1", True),
+            ("4.4.0-rc1", True),
+            # Wireshark git builds carry a fourth component; extra components
+            # are ignored rather than refused.
+            ("4.4.0.1", True),
+        ],
+    )
+    def test_release_candidate_and_git_spellings(self, version: str, expected: bool) -> None:
+        """Only reachable via an explicit ``tshark_version=``.
+
+        :func:`remora.codegen.fingerprint.parse_tshark_version` normalizes
+        real ``tshark --version`` output down to ``X.Y.Z`` — it maps
+        ``TShark (Wireshark) 4.4.0rc1 (...)`` to ``4.4.0`` — so a probed
+        version never carries a suffix. These spellings reach the gate only
+        when a caller passes one in by hand, and every answer above is either
+        correct or conservative.
+        """
+        assert escaping_is_reversible(version) is expected
+
     def test_the_boundary_constant_is_the_one_measured(self) -> None:
         assert UNESCAPE_MIN_VERSION == (4, 4)
 

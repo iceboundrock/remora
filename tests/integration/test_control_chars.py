@@ -114,6 +114,20 @@ COMMENTS = {
     5: "C:\\temp",
 }
 
+#: Frame 7 and its true comment, kept OUT of :data:`COMMENTS` on purpose.
+#: Every test parametrized over ``COMMENTS`` asserts the fields path recovers
+#: the value, and frame 7 is the one frame where it provably cannot: its
+#: comment carries :data:`OCC_SEP` itself, which tshark escapes on no version,
+#: so the column forks into two occurrences. Folding it into ``COMMENTS``
+#: would turn an accepted residual into a stream of failures; it gets
+#: :class:`TestTheOccurrenceForkIsTheAcceptedResidual` instead.
+RS_FRAME = 7
+RS_COMMENT = "rs\x1ehere"
+
+#: What the fields path yields for :data:`RS_FRAME` instead of the true value:
+#: the join positions are unrecoverable, so the one value arrives as two.
+RS_FORKED = ("rs", "here")
+
 #: A ``matches`` pattern per frame, each written so it can only match that
 #: frame's TRUE comment. Issue #74 names ``matches`` alongside ``==`` and
 #: ``contains``, and it is the operator where the two regex engines could fork
@@ -189,7 +203,10 @@ class TestFixtureCarriesRealControlBytes:
         comments = {
             index: pkt.get_raw("frame.comment") for index, pkt in enumerate(packets, start=1)
         }
-        assert comments == {n: (text,) for n, text in COMMENTS.items()} | {6: ()}
+        assert comments == {n: (text,) for n, text in COMMENTS.items()} | {
+            6: (),
+            RS_FRAME: (RS_COMMENT,),
+        }
 
 
 class TestRowSetsAgreeAcrossThePaths:
@@ -252,7 +269,7 @@ class TestColumnFramingSurvivesTheSeparatorBytes:
         rows = list(
             FieldsReader(run(*fields_argv(PROJECTION)), PROJECTION, unescape_values=reversible())
         )
-        assert len(rows) == 6
+        assert len(rows) == 7
         # 0x1f is escaped by no measured version and carries no backslash, so
         # this value is identical on both sides of the gate.
         assert rows[3].get_raw("frame.comment") == ("us\x1fhere",)
@@ -364,6 +381,70 @@ class TestEscapeTableIsWhatTsharkDoes:
         )
 
 
+class TestTheOccurrenceForkIsTheAcceptedResidual:
+    r"""Frame 7 witnesses, end to end, the one thing #74 does NOT fix.
+
+    ``OCC_SEP`` (0x1e) is escaped by no measured tshark, so a value that
+    genuinely holds one is indistinguishable from two occurrences joined by
+    it. That is not a choice of separator that could be made better: tshark
+    returns ``escape(occ1 + SEP + occ2)``, a function of the joined string
+    alone, so the join positions are gone before the reader sees anything.
+    Any *escaped* byte never arrives raw and so would never split at all
+    (measured: on 4.4+ the aggregator is spliced in before the escaper, so
+    ``aggregator=0x0c`` comes back as the two characters ``\f``); any
+    *unescaped* byte is forgeable by the value, which is this frame.
+
+    These tests pin the fork as expected behaviour. If a future tshark starts
+    escaping 0x1e they will fail, which is the correct alarm: the residual
+    would then be closable and the docs would be wrong.
+
+    The premise this rests on — ``OCC_SEP not in ESCAPED_CHARS`` — is
+    asserted by
+    :meth:`TestEscapeTableIsWhatTsharkDoes.test_the_separator_is_raw_and_the_aggregator_is_never_forgeable`
+    and deliberately not repeated here.
+    """
+
+    def test_ek_reports_the_one_true_value(self) -> None:
+        """The ek path is unaffected — JSON needs no in-band separator."""
+        packets = list(EkReader(run(*ek_argv())))
+        assert packets[RS_FRAME - 1].get_raw("frame.comment") == (RS_COMMENT,)
+
+    def test_the_fields_path_forks_it_into_two_occurrences(self) -> None:
+        """...where the fields path reports two, on every version.
+
+        Unconditional: 0x1e carries no backslash and is escaped nowhere, so
+        the gate does not enter into it.
+        """
+        rows = list(
+            FieldsReader(run(*fields_argv(PROJECTION)), PROJECTION, unescape_values=reversible())
+        )
+        assert rows[RS_FRAME - 1].get_raw("frame.comment") == RS_FORKED
+
+    def test_the_two_paths_disagree_and_that_is_the_documented_residual(self) -> None:
+        """State the divergence directly rather than leaving it implied."""
+        packets = list(EkReader(run(*ek_argv())))
+        rows = list(
+            FieldsReader(run(*fields_argv(PROJECTION)), PROJECTION, unescape_values=reversible())
+        )
+        from_ek = packets[RS_FRAME - 1].get_raw("frame.comment")
+        from_fields = rows[RS_FRAME - 1].get_raw("frame.comment")
+        assert from_ek != from_fields
+        assert len(from_ek) == 1 and len(from_fields) == 2
+        # The bytes are all still there; only the join position is lost.
+        assert OCC_SEP.join(from_fields) == from_ek[0]
+
+    def test_a_predicate_therefore_disagrees_across_the_two_paths(self) -> None:
+        """The consequence a user would actually hit.
+
+        Equality against the true value selects frame 7 over ek and misses it
+        over a -T fields projection. Pinned so the blast radius of the
+        residual is recorded, not just its mechanism.
+        """
+        expr = COMMENT == RS_COMMENT
+        assert RS_FRAME in ek_rows(expr)
+        assert RS_FRAME not in fields_rows(expr)
+
+
 class TestPredicateContractIsUnchanged:
     def test_a_frame_without_a_comment_never_matches(self) -> None:
         # SIM300 ("Yoda condition") suppressed throughout: swapping the
@@ -371,7 +452,9 @@ class TestPredicateContractIsUnchanged:
         # backwards. Version-independent: absence is absence on any build.
         for text in COMMENTS.values():
             assert 6 not in fields_rows(COMMENT == text)  # noqa: SIM300
-        assert fields_rows(COMMENT.present()) == {1, 2, 3, 4, 5}
+        # Frame 7 IS present — the fork loses the join position, not the
+        # field — so presence covers every frame but the commentless one.
+        assert fields_rows(COMMENT.present()) == {1, 2, 3, 4, 5, RS_FRAME}
 
     def test_row_and_packet_read_the_same_value(self) -> None:
         """The two readers agree only where the escaping is invertible; ek is
@@ -382,6 +465,11 @@ class TestPredicateContractIsUnchanged:
         packets = list(EkReader(run(*ek_argv())))
         from_rows = [row.get_raw("frame.comment") for row in rows]
         from_packets = [pkt.get_raw("frame.comment") for pkt in packets]
+        # Frame 7 is excluded by name, not by loosening the comparison: it
+        # diverges for a different reason (the occurrence fork, which no
+        # version fixes) and TestTheOccurrenceForkIsTheAcceptedResidual owns
+        # it. Dropping it here keeps this test about the ESCAPING only.
+        del from_rows[RS_FRAME - 1], from_packets[RS_FRAME - 1]
         if reversible():
             assert from_rows == from_packets
         else:
@@ -392,12 +480,19 @@ class TestPredicateContractIsUnchanged:
                     assert from_rows[index] == from_packets[index]
 
     def test_rows_are_never_silently_wrong_about_framing(self) -> None:
-        """Framing is fixed on every version: six frames, five with a comment."""
+        """Column framing is fixed on every version: seven rows, one per frame.
+
+        The occurrence counts are the honest census: five frames carry one
+        comment, frame 6 carries none, and frame 7 reports **two** because its
+        value holds :data:`OCC_SEP`. That last count is the accepted residual,
+        not a framing failure — the row itself is intact and in the right
+        place, which is what this test is about.
+        """
         rows = list(
             FieldsReader(run(*fields_argv(PROJECTION)), PROJECTION, unescape_values=reversible())
         )
-        assert len(rows) == 6
-        assert [len(row.get_raw("frame.comment")) for row in rows] == [1, 1, 1, 1, 1, 0]
+        assert len(rows) == 7
+        assert [len(row.get_raw("frame.comment")) for row in rows] == [1, 1, 1, 1, 1, 0, 2]
 
     def test_rows_satisfy_the_raw_packet_contract(self) -> None:
         rows = list(FieldsReader(run(*fields_argv(PROJECTION)), PROJECTION))

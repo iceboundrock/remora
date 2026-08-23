@@ -19,7 +19,7 @@ dns_multi.pcap (3 packets) — multi-occurrence dns.qry.name:
 2. UDP/DNS  10.0.1.2:50002 -> 10.0.1.53:53  1 question: "gamma.example" A
 3. TCP SYN  10.0.1.1:40000 -> 10.0.1.53:80  dns.* and udp.* absent
 
-ctrl_comments.pcapng (6 packets) — control characters in a string value
+ctrl_comments.pcapng (7 packets) — control characters in a string value
 (issue #74). pcapng rather than pcap because a frame *comment* is the one
 place a capture can carry arbitrary bytes verbatim: every string field a
 dissector builds (``dns.qry.name`` included) is already ``format_text``-ed
@@ -41,6 +41,14 @@ same TCP SYN; only ``frame.comment`` differs:
    ``C:<0x09>emp``. This is the frame that proves the version gate is
    necessary rather than merely cautious.
 6. (no comment)            — ``frame.comment`` absent
+7. ``rs<0x1e>here``        — passed through RAW like 0x1f, but 0x1e is the
+   reader's *occurrence* separator, so this frame forks into two occurrences
+   (``("rs", "here")``) where ``-T ek`` reports the one true value. That is
+   the residual #74 accepts rather than fixes: tshark returns
+   ``escape(occ1 + SEP + occ2)``, a function of the joined string alone, so
+   no single-byte aggregator can recover the join positions — an escaped
+   byte never arrives raw to split on, and an unescaped one is forgeable by
+   the value. This frame witnesses that end to end.
 
 Regenerate with::
 
@@ -246,6 +254,14 @@ CTRL_COMMENTS: tuple[str | None, ...] = (
     "us\x1fhere",
     "C:\\temp",
     None,
+    # Appended after the no-comment frame on purpose: frames 1-6 keep the
+    # numbers the integration suite already pins, so adding this one moves
+    # no existing expectation. It carries the OCC_SEP byte itself, which
+    # tshark escapes on no version, so the -T fields path forks it into two
+    # occurrences where ek reports one value. That fork is the residual #74
+    # accepts (no single-byte aggregator can survive it) and this frame is
+    # what witnesses it end to end.
+    "rs\x1ehere",
 )
 
 

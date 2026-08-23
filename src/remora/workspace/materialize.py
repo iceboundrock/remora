@@ -248,10 +248,19 @@ TsharkRunner: TypeAlias = Callable[[Sequence[str]], TsharkRun]
 _ARGV_OPTIONS_OWNED_ELSEWHERE: Final[frozenset[str]] = frozenset({"-e", "-r", "-Y"})
 
 
-#: Wall-clock ceiling on the ``tshark --version`` probe. Generous, because it
-#: only has to bound a hung binary: the probe can run while
-#: ``Workspace.materialize`` holds the exclusive write lock, so a tshark that
-#: never returns would otherwise lock the workspace file forever.
+#: Wall-clock ceiling on the ``tshark --version`` probe. It exists because the
+#: probe can run while ``Workspace.materialize`` holds the exclusive write
+#: lock, so a tshark that never returns would otherwise lock the workspace
+#: file forever.
+#:
+#: Generous — three times ``remora.reader.process._VERSION_PROBE_TIMEOUT``,
+#: which bounds the same command — because the two differ in what giving up
+#: costs, not in what they run. There the answer only picks an unescaping
+#: policy and ``None`` is a safe default, so a short bound is free. Here the
+#: version is a cache-key component that ``detect_tshark_version`` must
+#: establish or raise, so an early timeout turns a loaded machine into a
+#: failed materialization. The lock argues for having a ceiling at all; the
+#: failure mode is what sets it this high.
 _VERSION_PROBE_TIMEOUT: Final[float] = 30.0
 
 _FRAME_NUMBER_SPEC: Final[ColumnSpec] = ColumnSpec(

@@ -36,8 +36,8 @@ Control characters in a string field value (issue #74). pcapng rather than
 pcap because a frame *comment* is the one place a capture can carry arbitrary
 bytes verbatim: every string field a dissector builds — `dns.qry.name`
 included — is already `format_text`-ed by the dissector and can never hold a
-raw control byte. All six frames are the same TCP SYN; only `frame.comment`
-differs.
+raw control byte. All seven frames are the same TCP SYN; only
+`frame.comment` differs.
 
 | # | `frame.comment` | `-T fields` prints | Notes |
 |---|-----------------|--------------------|-------|
@@ -47,3 +47,4 @@ differs.
 | 4 | `us<0x1f>here` | `us<0x1f>here` | passed through RAW; 0x1f was the column separator before #74 and used to split the column and abort the parse |
 | 5 | `C:<0x5c>temp` | `C:\\temp` (>= 4.4) | the collision that forces the version gate: 4.2.x prints `C:\temp`, byte-identical to what it prints for a value holding a real TAB, so unescaping there would rewrite this into `C:<0x09>emp` |
 | 6 | (none) | (empty column) | `frame.comment` absent |
+| 7 | `rs<0x1e>here` | `rs<0x1e>here` | passed through RAW like 0x1f, but 0x1e is the *occurrence* separator, so the fields path reports two occurrences (`("rs", "here")`) where `-T ek` reports the one true value. This is the residual #74 accepts rather than fixes — tshark returns `escape(occ1 + SEP + occ2)`, so no single-byte aggregator can recover the join positions. Appended after frame 6 so frames 1-6 keep the numbers the suite already pins |
