@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+import remora.workspace.attach as attach_module
 import remora.workspace.workspace as workspace_module
 from remora.workspace.attach import (
     RESERVED_ALIASES,
@@ -17,6 +18,8 @@ from remora.workspace.attach import (
     attach_database,
     attached_databases,
     detach_database,
+    file_stamp,
+    is_duplicate_database_error,
     validate_alias,
 )
 from remora.workspace.errors import SchemaVersionError, WorkspaceAliasError, WorkspaceError
@@ -397,6 +400,238 @@ class TestWorkspaceAttachRefusals:
             assert dict(ws.attachments) == {}
 
 
+class TestReplayFailuresAreTyped:
+    """#100 M1: a failed replay must not escape read()/write() as a duckdb error.
+
+    ``read()``/``write()`` replay recorded attachments onto every connection they
+    open, so an attachment DuckDB can no longer honour — a peer deleted, or held
+    read-write by another process — fails *every* operation, including ones that
+    have nothing to do with the attachment. Measured before the fix: deleting an
+    attached peer made ``write()`` raise a bare ``_duckdb.IOException`` reading
+    ``IO Error: Cannot open database "…" in read-only mode: database does not
+    exist``, which names neither the alias nor what to do about it.
+    """
+
+    def test_write_wraps_a_replay_failure(self, tmp_path: Path) -> None:
+        peer = make_workspace(tmp_path / "peer.duckdb")
+        with Workspace(make_workspace(tmp_path / "ws.duckdb"), mode="rw") as ws:
+            ws.attach(peer, "peer")
+            peer.unlink()
+            with pytest.raises(WorkspaceError) as caught, ws.write():
+                pass  # pragma: no cover - the body is never reached
+        message = str(caught.value)
+        assert "peer" in message
+        assert str(Path(os.path.realpath(peer))) in message
+        assert "detach it to continue" in message
+        assert not isinstance(caught.value, duckdb.Error)
+
+    def test_read_wraps_a_replay_failure(self, tmp_path: Path) -> None:
+        peer = make_workspace(tmp_path / "peer.duckdb")
+        with Workspace(make_workspace(tmp_path / "ws.duckdb"), mode="rw") as ws:
+            ws.attach(peer, "peer")
+            peer.unlink()
+            with pytest.raises(WorkspaceError, match="cannot re-attach 'peer'"), ws.read():
+                pass  # pragma: no cover - the body is never reached
+
+    def test_an_operation_unrelated_to_the_attachment_is_wrapped_too(self, tmp_path: Path) -> None:
+        # The whole point: replay runs on every connection, so an annotation
+        # write that never mentions the peer fails on it as well.
+        peer = make_workspace(tmp_path / "peer.duckdb")
+        with Workspace(make_workspace(tmp_path / "ws.duckdb"), mode="rw") as ws:
+            ws.attach(peer, "peer")
+            peer.unlink()
+            with pytest.raises(WorkspaceError, match="detach it to continue"):
+                ws.add_annotation(scope="packet", target_id=1, key="k", value="v")
+
+    def test_a_typed_refusal_is_not_rewrapped(self, tmp_path: Path) -> None:
+        # The translation is for failures that have no name of their own; an
+        # alias the instance holds pointing somewhere else already reads as a
+        # WorkspaceAliasError and must keep that type through the wrapper.
+        a = make_workspace(tmp_path / "a.duckdb")
+        b = make_workspace(tmp_path / "b.duckdb")
+        primary = make_workspace(tmp_path / "ws.duckdb")
+        with Workspace(primary, mode="rw") as ws:
+            ws.attach(a, "peer")
+            # A caller's own connection keeps the instance alive and plants the
+            # alias on it, pointing at the other file, read-write.
+            outside = duckdb.connect(str(primary))
+            try:
+                outside.execute(f"ATTACH '{b}' AS peer")
+                with pytest.raises(WorkspaceAliasError, match="already attached to"), ws.read():
+                    pass  # pragma: no cover - the body is never reached
+            finally:
+                outside.close()
+
+    def test_detaching_restores_the_workspace(self, tmp_path: Path) -> None:
+        # The remedy the message names actually works.
+        peer = make_workspace(tmp_path / "peer.duckdb")
+        with Workspace(make_workspace(tmp_path / "ws.duckdb"), mode="rw") as ws:
+            ws.attach(peer, "peer")
+            peer.unlink()
+            ws.detach("peer")
+            with ws.write() as connection:
+                assert connection.execute("SELECT count(*) FROM main.pkts").fetchone() == (0,)
+
+
+class TestCrossObjectAliasCollision:
+    """#100 M2, second shape: two Workspace objects on one file.
+
+    Same-process connections to one file share a DuckDB instance, so an alias
+    ``w1`` attached is live for ``w2`` as well — but ``w2._attachments`` is
+    empty, so ``Workspace.attach``'s own duplicate check (which compares against
+    *this* workspace's record) cannot see it and the collision is caught only by
+    DuckDB's binder. Decision D7 of #37 assigns a colliding alias to
+    ``WorkspaceAliasError``; before the fix this shape came back as a generic
+    ``WorkspaceError`` wrapping ``Binder Error: Failed to attach database:
+    database with name "peer" already exists``.
+    """
+
+    def test_second_workspace_reusing_an_alias_raises_alias_error(self, tmp_path: Path) -> None:
+        a = make_workspace(tmp_path / "a.duckdb")
+        b = make_workspace(tmp_path / "b.duckdb")
+        primary = make_workspace(tmp_path / "ws.duckdb")
+        with Workspace(primary) as w1, Workspace(primary) as w2:
+            w1.attach(a, "peer")
+            with pytest.raises(WorkspaceAliasError, match="already exists"):
+                w2.attach(b, "peer")
+            assert dict(w2.attachments) == {}
+
+    def test_duckdbs_duplicate_message_is_pinned(
+        self, con: DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        """The classifier reads DuckDB's message, so pin the message itself.
+
+        A duckdb upgrade that rewords this fails here loudly, rather than
+        silently degrading the refusal back to a generic ``WorkspaceError``.
+        """
+        attach_database(con, Attachment("peer", make_peer(tmp_path / "peer.duckdb")))
+        other = make_peer(tmp_path / "other.duckdb")
+        with pytest.raises(duckdb.Error) as caught:
+            con.execute(f"ATTACH '{other}' AS peer (READ_ONLY)")
+        assert 'database with name "peer" already exists' in str(caught.value)
+        assert is_duplicate_database_error(caught.value)
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "IO Error: Cannot open database",
+            "Binder Error: Failed to attach database: something else entirely",
+            "",
+        ],
+    )
+    def test_classifier_ignores_other_failures(self, message: str) -> None:
+        assert not is_duplicate_database_error(RuntimeError(message))
+
+
+class TestReplayRevalidation:
+    """#100: a peer replaced at the same path is revalidated, never trusted.
+
+    ``apply_attachments`` skips ``check_compatible`` to keep a catalog read off
+    the hot path, which was sound only for a file that had not changed. In rw
+    mode nothing is attached between operations and nothing holds the peer's
+    lock, so the file can be replaced at the same path; before the fix the
+    replacement was re-attached blind, and a foreign one surfaced as the raw
+    ``Catalog Error: … schema "meta" does not exist`` that ``attach_database``'s
+    refusal exists to prevent. The cheap close is an identity+mtime stamp
+    recorded at attach time and one ``stat`` per attachment per connection.
+    """
+
+    def test_attach_records_the_peers_stamp(self, tmp_path: Path) -> None:
+        peer = make_workspace(tmp_path / "peer.duckdb")
+        with Workspace(make_workspace(tmp_path / "ws.duckdb"), mode="rw") as ws:
+            ws.attach(peer, "peer")
+            recorded = ws._attachments["peer"]
+        assert recorded.stamp is not None
+        assert recorded.stamp == file_stamp(Path(os.path.realpath(peer)))
+
+    def test_foreign_replacement_is_refused_on_replay(self, tmp_path: Path) -> None:
+        peer = make_workspace(tmp_path / "peer.duckdb")
+        with Workspace(make_workspace(tmp_path / "ws.duckdb"), mode="rw") as ws:
+            ws.attach(peer, "peer")
+            peer.unlink()
+            # A DuckDB database that is not a remora workspace, built the way
+            # TestAttachDatabase builds one: no DDL, so no layout name is even
+            # reachable from this file (see test_workspace_schema.py's rules).
+            foreign = duckdb.connect(str(peer))
+            foreign.execute("SELECT 1")
+            foreign.close()
+            with pytest.raises(SchemaVersionError, match="not a remora workspace"), ws.read():
+                pass  # pragma: no cover - the body is never reached
+
+    def test_stale_version_replacement_is_refused_on_replay(self, tmp_path: Path) -> None:
+        peer = make_workspace(tmp_path / "peer.duckdb")
+        with Workspace(make_workspace(tmp_path / "ws.duckdb"), mode="rw") as ws:
+            ws.attach(peer, "peer")
+            peer.unlink()
+            make_peer(peer, version="1")
+            with pytest.raises(SchemaVersionError) as caught, ws.read():
+                pass  # pragma: no cover - the body is never reached
+        message = str(caught.value)
+        assert "cannot re-attach 'peer'" in message
+        assert "older remora" in message
+
+    def test_refusal_leaves_no_alias_attached(self, tmp_path: Path) -> None:
+        peer = make_workspace(tmp_path / "peer.duckdb")
+        with Workspace(make_workspace(tmp_path / "ws.duckdb"), mode="rw") as ws:
+            ws.attach(peer, "peer")
+            peer.unlink()
+            make_peer(peer, version="1")
+            with pytest.raises(SchemaVersionError), ws.read():
+                pass  # pragma: no cover - the body is never reached
+            ws.detach("peer")
+            with ws.read() as connection:
+                assert "peer" not in attached_databases(connection)
+
+    def test_an_unchanged_peer_is_not_revalidated(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The whole point of the stamp: the common case still costs one stat,
+        # not the catalog read apply_attachments was written to avoid.
+        peer = make_workspace(tmp_path / "peer.duckdb")
+        with Workspace(make_workspace(tmp_path / "ws.duckdb"), mode="rw") as ws:
+            ws.attach(peer, "peer")
+
+            def forbidden(connection: DuckDBPyConnection, *, database: str | None = None) -> None:
+                raise AssertionError("an unchanged peer must not be revalidated")
+
+            monkeypatch.setattr(attach_module, "check_compatible", forbidden)
+            with ws.read() as connection:
+                assert connection.execute('SELECT count(*) FROM "peer".main.pkts').fetchone() == (
+                    0,
+                )
+
+    def test_an_attachment_without_a_stamp_is_revalidated(
+        self, con: DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        # A caller building an Attachment by hand gets the safe default: no
+        # stamp means "cannot prove it is unchanged", so it is revalidated.
+        peer_path = make_peer(tmp_path / "peer.duckdb", version="1")
+        with pytest.raises(SchemaVersionError, match="older remora"):
+            apply_attachments(con, [Attachment("peer", peer_path)])
+        assert "peer" not in attached_databases(con)
+
+    def test_an_unstattable_peer_is_revalidated_not_trusted(
+        self, con: DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        # A peer that cannot be stat'ed has no comparable stamp, so it takes the
+        # revalidating path; here the ATTACH itself is what fails, which is the
+        # documented degradation — never a blind re-attach.
+        gone = tmp_path / "gone.duckdb"
+        stamp = file_stamp(make_peer(gone))
+        gone.unlink()
+        assert file_stamp(gone) is None
+        with pytest.raises(duckdb.Error):
+            apply_attachments(con, [Attachment("peer", gone, stamp)])
+
+    def test_file_stamp_moves_when_the_file_is_replaced(self, tmp_path: Path) -> None:
+        path = make_peer(tmp_path / "peer.duckdb")
+        before = file_stamp(path)
+        path.unlink()
+        make_peer(path)
+        assert before is not None
+        assert file_stamp(path) != before
+
+
 class TestCompactIsUnaffectedByAttachments:
     def test_compact_copies_only_the_primary(self, tmp_path: Path) -> None:
         peer = make_workspace(tmp_path / "peer.duckdb")
@@ -424,6 +659,8 @@ class TestPackageExports:
             "attach_database",
             "attached_databases",
             "detach_database",
+            "file_stamp",
+            "is_duplicate_database_error",
             "qualify",
             "validate_alias",
         ):

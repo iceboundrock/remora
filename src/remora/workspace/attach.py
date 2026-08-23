@@ -25,8 +25,10 @@ closes. ``Workspace`` in ``"rw"`` mode holds no connection between operations,
 so an attach made on one short-lived connection is gone by the next — which is
 why :func:`apply_attachments` exists and why ``Workspace`` replays its recorded
 attachments onto every connection it opens. Replay is verified rather than
-blind: an alias the instance already holds is left alone when it points at the
-same file read-only, and refused when it does not.
+blind, in both directions: an alias the instance already holds is left alone
+when it points at the same file read-only, and refused when it does not, while
+one it does not hold is re-attached — and revalidated, unless the peer file's
+stamp proves it is the same file untouched (see *Compatibility* below).
 
 "Gone by the next" is a statement about the *last* connection closing, not
 about one operation ending: any other live connection to the same file — an
@@ -65,8 +67,21 @@ errors far from the cause. :func:`attach_database` therefore runs
 :func:`remora.workspace.schema.check_compatible` against the alias and detaches
 again on refusal, so a failed attach leaves nothing behind.
 
+That check is a statement about the *file*, and a replay happens later, so
+:func:`apply_attachments` re-runs it whenever the file may have changed —
+compared by the ``(st_dev, st_ino, st_mtime_ns)`` stamp :func:`file_stamp`
+takes at attach time. The window it closes is narrow but real: while a peer is
+attached it holds a shared read lock, but ``"rw"`` mode attaches nothing
+between operations, so the file at that path can be replaced in between and
+would otherwise be re-attached unvalidated — reopening exactly the raw-binder
+gap the refusal above exists to prevent. The cost of closing it is one ``stat``
+per attachment per connection, which is why this module does filesystem I/O at
+all; it still opens no connection, spawns nothing and reads no capture.
+
 Like every module here but ``workspace.py`` this one is import-pure: duckdb is
-annotated under ``TYPE_CHECKING`` and no connection is opened.
+annotated under ``TYPE_CHECKING`` and no connection is opened. That is also why
+:func:`is_duplicate_database_error` classifies by message text rather than by
+exception class — the class is not importable here.
 """
 
 from __future__ import annotations
@@ -87,10 +102,13 @@ if TYPE_CHECKING:
 __all__ = [
     "RESERVED_ALIASES",
     "Attachment",
+    "FileStamp",
     "apply_attachments",
     "attach_database",
     "attached_databases",
     "detach_database",
+    "file_stamp",
+    "is_duplicate_database_error",
     "validate_alias",
 ]
 
@@ -98,6 +116,57 @@ RESERVED_ALIASES: Final[frozenset[str]] = frozenset({"main", "temp", "system"})
 """Database names DuckDB reserves; an ATTACH naming one is a binder error."""
 
 _ALIAS_RE: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+_DUPLICATE_DATABASE_RE: Final[re.Pattern[str]] = re.compile(
+    r"database with name .* already exists", re.IGNORECASE
+)
+"""What DuckDB says when an ATTACH reuses a live database name.
+
+Measured on duckdb 1.5.5: ``Binder Error: Failed to attach database: database
+with name "peer" already exists``. Matched as text because this module never
+imports duckdb (it is annotated under ``TYPE_CHECKING`` only), so the exception
+*class* is not available to test against;
+``tests/test_workspace_attach.py::TestCrossObjectAliasCollision`` pins the live
+message so a reworded upgrade fails loudly instead of silently degrading the
+refusal to a generic :class:`WorkspaceError`.
+"""
+
+FileStamp = tuple[int, int, int]
+"""``(st_dev, st_ino, st_mtime_ns)`` — enough to tell "same file, untouched"."""
+
+
+def file_stamp(path: str | os.PathLike[str]) -> FileStamp | None:
+    """Identity and mtime of ``path``, or ``None`` if it cannot be stat'ed.
+
+    File *identity* rather than pathname, the same ``(st_dev, st_ino)`` rule
+    ``workspace.py`` keys its coordination registry on and ``export.py`` guards
+    its destination with — a replacement at one path is a new inode, which a
+    pathname comparison cannot see. ``st_mtime_ns`` catches the in-place rewrite
+    that keeps the inode, and is integer nanoseconds for the reason
+    ``cachekey.py`` gives: exact and platform-stable where the float is neither.
+
+    ``None`` means "cannot prove anything about this file", and every caller
+    must treat it as changed rather than as unchanged.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino, st.st_mtime_ns)
+
+
+def is_duplicate_database_error(exc: BaseException) -> bool:
+    """Is ``exc`` DuckDB refusing an ATTACH because the alias is already live?
+
+    An alias collision is a :class:`WorkspaceAliasError` by #37's decision D7,
+    but one shape of it reaches DuckDB before remora can see it: same-process
+    connections to one file share a database instance, so an alias attached
+    through *another* ``Workspace`` object on the same file is live for this one
+    while its own record says nothing is attached. ``Workspace.attach`` uses
+    this to classify that failure rather than reporting it as a generic
+    workspace error.
+    """
+    return _DUPLICATE_DATABASE_RE.search(str(exc)) is not None
 
 
 @dataclass(frozen=True)
@@ -110,10 +179,17 @@ class Attachment:
         path: The attached file, always resolved with :func:`os.path.realpath`
             so it compares equal to the path DuckDB reports back in
             ``duckdb_databases()``.
+        stamp: What :func:`file_stamp` returned for ``path`` when the attach was
+            validated, or ``None`` when it is not known. :func:`apply_attachments`
+            revalidates on replay unless the stamp is present and still matches,
+            so ``None`` — the default, and what a caller building an
+            ``Attachment`` by hand gets — means "revalidate every time", which is
+            the safe direction.
     """
 
     alias: str
     path: Path
+    stamp: FileStamp | None = None
 
 
 def validate_alias(alias: str) -> None:
@@ -223,9 +299,22 @@ def apply_attachments(con: DuckDBPyConnection, attachments: Iterable[Attachment]
     quietly accepting a writable one, is the failure this verification exists
     to prevent.
 
-    No compatibility check runs here: :func:`attach_database` did it when the
-    attachment was recorded, and re-running it on every connection would put a
-    catalog read on the hot path of every query.
+    A compatibility check runs only when the peer file may have changed since
+    the attach was recorded. :func:`attach_database` validated it then, and
+    re-running :func:`check_compatible` on every connection would put a catalog
+    read on the hot path of every query — but "validated then" is a statement
+    about a *file*, and in ``"rw"`` mode, where nothing is attached and nothing
+    is locked between operations, the file at that path can be replaced. So each
+    replay compares :func:`file_stamp` against the recorded
+    :attr:`Attachment.stamp`: equal means the same inode, untouched, and takes
+    the bare ATTACH; anything else — a different inode, a newer mtime, a stamp
+    that was never recorded, or a file that cannot be stat'ed at all — takes the
+    full :func:`attach_database` path and is revalidated. One ``stat`` per
+    attachment per connection, versus a catalog read; and never a blind
+    re-attach, which is what let a foreign replacement surface as a raw binder
+    error from inside ``alias.meta.fields``. A changed peer stays on the
+    revalidating path until it is re-attached: the record is the caller's and is
+    not rewritten from here.
 
     Args:
         con: A freshly opened connection to the primary workspace.
@@ -233,19 +322,27 @@ def apply_attachments(con: DuckDBPyConnection, attachments: Iterable[Attachment]
 
     Raises:
         WorkspaceAliasError: If an alias is already attached to a different file
-            or is attached writable.
-        duckdb.Error: If DuckDB refuses an ATTACH — most often a lock held by
-            another process's writer.
+            or is attached writable, or is not a valid alias.
+        SchemaVersionError: If a peer that changed since the attach was recorded
+            is no longer a workspace of this layout version. The alias is
+            detached again, so a refused replay leaves nothing behind.
+        duckdb.Error: If DuckDB refuses an ATTACH — a peer that no longer
+            exists, or a lock held by another process's writer.
+            ``Workspace.read``/``Workspace.write`` translate these; a caller
+            holding its own connection sees them as themselves.
     """
     live = attached_databases(con)
     for attachment in attachments:
         current = live.get(attachment.alias)
         if current is None:
-            validate_alias(attachment.alias)
-            con.execute(
-                f"ATTACH '{_quote_path(str(attachment.path))}' "
-                f"AS {_quote_ident(attachment.alias)} (READ_ONLY)"
-            )
+            if attachment.stamp is not None and file_stamp(attachment.path) == attachment.stamp:
+                validate_alias(attachment.alias)
+                con.execute(
+                    f"ATTACH '{_quote_path(str(attachment.path))}' "
+                    f"AS {_quote_ident(attachment.alias)} (READ_ONLY)"
+                )
+            else:
+                attach_database(con, attachment)
             continue
         path, read_only = current
         if path != os.path.realpath(attachment.path) or not read_only:
