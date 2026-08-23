@@ -1,11 +1,14 @@
 """Unit tests for the Python predicate backend (:mod:`remora.compile.predicate`).
 
-Covers the predicate backend alone; the table-driven suite shared with the
-display-filter backend lives in ``tests/test_semantics_table.py``.
+Covers the predicate backend alone, plus one cross-backend class at the end
+holding the three backends' *user-error* messages byte-identical; the
+table-driven row-set suite shared with the display-filter backend lives in
+``tests/test_semantics_table.py``.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from ipaddress import IPv4Address
 
@@ -14,6 +17,7 @@ import pytest
 from conftest import FakePacket
 from remora.compile.dfilter import compile_dfilter
 from remora.compile.predicate import compile_predicate
+from remora.compile.sql import compile_sql
 from remora.expr import Expr
 from remora.fields import FieldRef
 
@@ -356,12 +360,40 @@ class TestMatches:
         assert pred(FakePacket({"http.host": ("CAFÉ.example",)})) is False
 
 
-class TestCrossBackendErrorParity:
-    """Verify that user-error messages are identical between dfilter and predicate backends.
+def _messages(expr: Expr, error: type[Exception]) -> list[str]:
+    """The message each backend raises for ``expr``, in backend order.
 
-    Both backends must raise the same exception type with the same message for
-    shared error cases. This class captures errors from both backends on the
-    same Expr and asserts they match exactly.
+    Args:
+        expr: An expression every backend must reject the same way.
+        error: The exception type all three are required to raise.
+
+    Returns:
+        One message per backend — dfilter, predicate, sql — so a caller can
+        assert they are byte-identical.
+    """
+    backends: tuple[Callable[[Expr], object], ...] = (
+        compile_dfilter,
+        compile_predicate,
+        compile_sql,
+    )
+    messages: list[str] = []
+    for compile_backend in backends:
+        with pytest.raises(error) as caught:
+            compile_backend(expr)
+        messages.append(str(caught.value))
+    return messages
+
+
+class TestCrossBackendErrorParity:
+    """Verify that user-error messages are identical across all three backends.
+
+    dfilter, predicate and sql must raise the same exception type with the same
+    message for shared error cases — a *user* error is a statement about the
+    expression, so which backend happened to compile it must not show through.
+    (A backend *refusal* is the opposite: ``UnsupportedSqlExprError`` and
+    ``UnsupportedExprError`` are per-backend by design and are not compared
+    here.) This class captures errors from all three on the same Expr and
+    asserts they match exactly.
     """
 
     @pytest.mark.parametrize(
@@ -373,11 +405,9 @@ class TestCrossBackendErrorParity:
     )
     def test_inverted_range_error_parity(self, expr: Expr) -> None:
         """Inverted membership ranges raise identical ValueError messages."""
-        with pytest.raises(ValueError) as exc_dfilter:
-            compile_dfilter(expr)
-        with pytest.raises(ValueError) as exc_predicate:
-            compile_predicate(expr)
-        assert str(exc_dfilter.value) == str(exc_predicate.value)
+        dfilter_message, predicate_message, sql_message = _messages(expr, ValueError)
+        assert dfilter_message == predicate_message
+        assert sql_message == predicate_message
 
     @pytest.mark.parametrize(
         "expr",
@@ -389,12 +419,15 @@ class TestCrossBackendErrorParity:
         ids=["str_field_bytes_needle", "bytes_field_str_needle", "int_field_str_needle"],
     )
     def test_contains_needle_mismatch_error_parity(self, expr: Expr) -> None:
-        """Contains needle type mismatch raises identical TypeError messages."""
-        with pytest.raises(TypeError) as exc_dfilter:
-            compile_dfilter(expr)
-        with pytest.raises(TypeError) as exc_predicate:
-            compile_predicate(expr)
-        assert str(exc_dfilter.value) == str(exc_predicate.value)
+        """Contains needle type mismatch raises identical TypeError messages.
+
+        The bytes-field row also pins the sql backend's *ordering*: a wrong
+        needle is the user's mistake and must be reported before the backend's
+        own BLOB refusal, which is about the column rather than the call.
+        """
+        dfilter_message, predicate_message, sql_message = _messages(expr, TypeError)
+        assert dfilter_message == predicate_message
+        assert sql_message == predicate_message
 
     @pytest.mark.parametrize(
         "expr",
@@ -405,8 +438,25 @@ class TestCrossBackendErrorParity:
     )
     def test_matches_on_non_string_field_error_parity(self, expr: Expr) -> None:
         """Matches on non-string fields raises identical TypeError messages."""
-        with pytest.raises(TypeError) as exc_dfilter:
-            compile_dfilter(expr)
-        with pytest.raises(TypeError) as exc_predicate:
-            compile_predicate(expr)
-        assert str(exc_dfilter.value) == str(exc_predicate.value)
+        dfilter_message, predicate_message, sql_message = _messages(expr, TypeError)
+        assert dfilter_message == predicate_message
+        assert sql_message == predicate_message
+
+    @pytest.mark.parametrize(
+        "expr",
+        [
+            SRC == "not-an-ip",
+            SRC.in_(["not-an-ip"]),
+            SRC.in_([("not-an-ip", "10.0.0.9")]),
+        ],
+        ids=["comparison", "membership_element", "range_endpoint"],
+    )
+    def test_malformed_literal_error_parity(self, expr: Expr) -> None:
+        """A malformed literal reads the same wherever it sits in the expression.
+
+        Every literal position, so the sql backend's shared coerce step (#89)
+        cannot start reporting one of them differently from the other two.
+        """
+        dfilter_message, predicate_message, sql_message = _messages(expr, ValueError)
+        assert dfilter_message == predicate_message
+        assert sql_message == predicate_message

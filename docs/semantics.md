@@ -314,8 +314,12 @@ residual) equal on >= 4.4 and pinning the documented divergence below it, over
   evidence for the policy, not a contract — and on a build that accepts the
   ordered comparisons the row-set half is witnessed vacuously, since no
   checked-in fixture carries a populated `FT_DOUBLE` field.
-- **`contains` on a `BLOB` column** is `UnsupportedSqlExprError`: DuckDB's
-  `contains()` takes `VARCHAR` or `LIST`, not `BLOB`. The pcap path runs it.
+- **`contains` on a `BLOB` column** is `UnsupportedSqlExprError`: on a bytes
+  field `contains` means a byte *subsequence*, and DuckDB has no subsequence
+  match over `BLOB` — its `contains()` is substring on `VARCHAR` and element
+  membership on `LIST`, so a multi-value `BLOB[]` column would even be accepted,
+  with the wrong meaning. The refusal names the column type the query would have
+  run against, `BLOB[]` included. The pcap path runs it.
 - **Control bytes in `-T fields` values on tshark < 4.4** stay escaped: that
   build's escaping is not invertible (see above), so the reader refuses to
   guess and the fields-mode residual keeps diverging from the pushdown and ek

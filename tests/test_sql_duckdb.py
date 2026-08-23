@@ -231,6 +231,117 @@ class TestBackfilledNullMultiColumn:
         assert select(con, ~PORTS.present()) == {0}
 
 
+class TestMultiOrderedComparisonAgainstRealDuckDB:
+    """``len(list_filter(col, x -> x <op> ?)) > 0``, executed (issue #89).
+
+    The float version is covered by ``TestNaNAgainstRealDuckDB``, where the
+    ``NOT isnan(x)`` guard is the point. This is the *unguarded* shape — an
+    integer LIST column — which was pinned only as a string, so nothing checked
+    that DuckDB reads it as any-occurrence rather than all-occurrence, or that
+    an empty list and a back-filled NULL both fall out of it.
+    """
+
+    @pytest.fixture
+    def seeded(self, con: DuckDBPyConnection) -> DuckDBPyConnection:
+        # Row 3 is materialized-absent ([]); no row here is NULL — that is the
+        # back-filled case, covered by TestMultiPresenceAgainstRealDuckDB.
+        materialize(
+            con,
+            (PORTS,),
+            (
+                {"tcp.port": ("80", "52034")},
+                {"tcp.port": ("80", "443")},
+                {"tcp.port": ("52034", "8080")},
+                {},
+            ),
+        )
+        return con
+
+    def test_gt_matches_on_any_occurrence(self, seeded: DuckDBPyConnection) -> None:
+        # Row 0 qualifies on its 52034 alone, even though its 80 does not; row 1
+        # has no occurrence above 1024, and row 3 has no occurrence at all.
+        assert select(seeded, PORTS > 1024) == {0, 2}
+
+    def test_lt_matches_on_any_occurrence(self, seeded: DuckDBPyConnection) -> None:
+        # The mirror direction: rows 0 and 1 qualify on their 80, and row 2 —
+        # which qualified above — does not, so this is not an all-occurrence
+        # test read in reverse.
+        assert select(seeded, PORTS < 1024) == {0, 1}
+
+    def test_ge_and_le_include_the_endpoint_where_gt_and_lt_do_not(
+        self, seeded: DuckDBPyConnection
+    ) -> None:
+        # 52034 is the highest occurrence anywhere and 80 the lowest, so the
+        # inclusive forms select every row carrying one and the strict forms
+        # select none — the boundary the lambda's operator decides.
+        assert select(seeded, PORTS >= 52034) == {0, 2}
+        assert select(seeded, PORTS > 52034) == set()
+        assert select(seeded, PORTS <= 80) == {0, 1}
+        assert select(seeded, PORTS < 80) == set()
+
+    def test_the_empty_list_row_never_qualifies(self, seeded: DuckDBPyConnection) -> None:
+        # list_filter over [] is [], so len(...) > 0 is false — not NULL, which
+        # is why the negated form selects the row rather than dropping it.
+        assert select(seeded, ~(PORTS > 1024)) == {1, 3}
+
+
+class TestMultiPresenceAgainstRealDuckDB:
+    """``len(coalesce(col, [])) > 0``, executed — the presence NULL-guard.
+
+    Three states reach one column: a row that predates the column (back-filled
+    NULL), a row materialized while the field was absent ([]), and a row
+    carrying occurrences. Only the first needs the ``coalesce``, and without it
+    ``len(NULL) > 0`` is NULL — so the row silently leaves *both* the presence
+    and the negated-presence row set instead of exactly one of them.
+    """
+
+    @pytest.fixture
+    def seeded(self, con: DuckDBPyConnection) -> DuckDBPyConnection:
+        spec = column_spec(PORTS.name, PORTS.ftype, PORTS.multi)
+        con.execute('INSERT INTO main.pkts ("frame_number") VALUES (0)')
+        add_field_column(con, spec.column_name, spec.sql_type)
+        for frame_number, raw in ((1, ()), (2, ("443",))):
+            con.execute(
+                f'INSERT INTO main.pkts ("frame_number", "{spec.column_name}") VALUES (?, ?)',
+                [frame_number, spec.encode_raw(raw)],
+            )
+        return con
+
+    def test_the_three_states_really_are_null_empty_and_populated(
+        self, seeded: DuckDBPyConnection
+    ) -> None:
+        rows = seeded.execute(
+            'SELECT frame_number, "tcp_port" FROM main.pkts ORDER BY frame_number'
+        ).fetchall()
+        assert [(int(number), value) for number, value in rows] == [
+            (0, None),
+            (1, []),
+            (2, [443]),
+        ]
+
+    def test_presence_selects_only_the_populated_row(self, seeded: DuckDBPyConnection) -> None:
+        assert select(seeded, PORTS.present()) == {2}
+
+    def test_negated_presence_selects_both_absent_rows(self, seeded: DuckDBPyConnection) -> None:
+        # Two-valued already, so #36 adds no coalesce here: the NULL row must
+        # come back from the negation on the strength of the presence test's
+        # own coalesce.
+        assert select(seeded, ~PORTS.present()) == {0, 1}
+
+    def test_the_null_the_coalesce_exists_for_is_real(self, seeded: DuckDBPyConnection) -> None:
+        # The unguarded form, run directly: len(NULL) > 0 is NULL, so the
+        # back-filled row answers neither the test nor its negation. Proven
+        # rather than asserted about, so the coalesce is visibly load-bearing.
+        rows = seeded.execute(
+            'SELECT frame_number, len("tcp_port") > 0 FROM main.pkts ORDER BY frame_number'
+        ).fetchall()
+        assert [(int(number), flag) for number, flag in rows] == [
+            (0, None),
+            (1, False),
+            (2, True),
+        ]
+
+
 class TestMatchesAgainstRealDuckDB:
     """matches executes as RE2, guarded (issue #36)."""
 

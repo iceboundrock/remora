@@ -428,9 +428,10 @@ refuses rather than diverging, in two layers:
   vertical tab is refused even under a pattern that could not observe the
   difference.
 
-`UnsupportedSqlExprError` also covers `contains` on a `BLOB` column — DuckDB's
-`contains()` takes `VARCHAR` or `LIST`, not `BLOB`. It is a statement about the
-backend, not about your workspace, and it propagates as itself.
+`UnsupportedSqlExprError` also covers `contains` on a `BLOB` column — on a bytes
+field `contains` means a byte *subsequence*, and DuckDB has no subsequence match
+over `BLOB`. It is a statement about the backend, not about your workspace, and
+it propagates as itself.
 
 <!-- ci:exec -->
 ```python
