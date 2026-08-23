@@ -27,8 +27,8 @@ from remora.expr import Expr
 from remora.fields import Packet
 from remora.planner import Plan, QueryTerm, make_plan
 from remora.reader.ek_reader import EkReader, ek_argv
-from remora.reader.fields_reader import FieldsReader, fields_argv
-from remora.reader.process import TsharkProcess
+from remora.reader.fields_reader import FieldsReader, escaping_is_reversible, fields_argv
+from remora.reader.process import TsharkProcess, probe_tshark_version
 
 __all__ = ["Capture", "CaptureFilter"]
 
@@ -66,20 +66,64 @@ class Capture:
     original is unchanged), so partial queries can be shared and extended.
     Iteration executes the query: each ``for`` loop spawns a fresh tshark
     subprocess and yields packets supporting ``pkt[IP].src`` typed access.
+
+    "Immutable" is about the *query*: the terms, the path and the binary
+    never change after construction. The one mutable field is a memo —
+    :meth:`_resolved_tshark_version` caches the `tshark --version` probe on
+    first fields-mode use, so a `Capture` reused across loops probes once
+    rather than per iteration. It is unobservable through the public API (the
+    probe is deterministic for a given binary, and an explicit
+    ``tshark_version=`` skips it entirely), which is why it does not make the
+    object stateful in any sense a caller has to reason about.
+
+    Not thread-safe, and no more so because of that memo: two threads racing
+    the first iteration may both probe, then store the same answer. Nothing
+    else here is synchronized either, so share a `Capture` across threads
+    only if you would have anyway.
     """
 
-    __slots__ = ("_path", "_terms", "_tshark")
+    __slots__ = ("_path", "_terms", "_tshark", "_tshark_version", "_version_known")
 
-    def __init__(self, path: str | os.PathLike[str], *, tshark: str | None = None) -> None:
+    def __init__(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        tshark: str | None = None,
+        tshark_version: str | None = None,
+    ) -> None:
         self._path = Path(path)
         self._tshark = _resolve_tshark(tshark)
         self._terms: tuple[CaptureFilter, ...] = ()
+        # Only consulted in fields mode, to decide whether tshark's value
+        # escaping can be inverted (see fields_reader's module docstring).
+        # Passing it explicitly skips the probe; leaving it None probes once,
+        # lazily, and only if a fields-mode plan actually runs.
+        self._tshark_version = tshark_version
+        self._version_known = tshark_version is not None
 
     def filter(self, *terms: CaptureFilter) -> Capture:
         """A new ``Capture`` with *terms* AND-ed onto the existing ones."""
         clone = Capture(self._path, tshark=self._tshark)
         clone._terms = self._terms + terms
+        # Carry the probe across the clone so a filter chain probes at most
+        # once; an explicit version is carried for the same reason.
+        clone._tshark_version = self._tshark_version
+        clone._version_known = self._version_known
         return clone
+
+    def _resolved_tshark_version(self) -> str | None:
+        """The binary's version, probed at most once per ``Capture``.
+
+        This is the memo the class docstring carves out of "immutable": it
+        writes ``_tshark_version``/``_version_known`` on first call. The
+        probe never raises (see :func:`probe_tshark_version`), so a failure
+        memoizes ``None`` — the conservative answer — rather than retrying
+        a broken binary on every iteration.
+        """
+        if not self._version_known:
+            self._tshark_version = probe_tshark_version(self._tshark)
+            self._version_known = True
+        return self._tshark_version
 
     def plan(self) -> Plan:
         """The query plan iteration would execute (inspectable, side-effect free)."""
@@ -95,7 +139,13 @@ class Capture:
             reader: Iterator[Packet]
             if plan.mode == "fields":
                 assert plan.projection is not None  # Plan invariant
-                reader = iter(FieldsReader(process, plan.projection))
+                reader = iter(
+                    FieldsReader(
+                        process,
+                        plan.projection,
+                        unescape_values=escaping_is_reversible(self._resolved_tshark_version()),
+                    )
+                )
             else:
                 reader = iter(EkReader(process))
             residual = plan.residual

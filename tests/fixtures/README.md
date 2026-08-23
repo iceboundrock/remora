@@ -29,3 +29,22 @@ samples (pcap + captured tshark output) owned by the reader unit tests.
 | 1 | UDP/DNS query `10.0.1.1:50001 → 10.0.1.53:53`, questions `alpha.example` A + `beta.example` AAAA | `dns.qry.name` occurs twice — multi-occurrence |
 | 2 | UDP/DNS query `10.0.1.2:50002 → 10.0.1.53:53`, question `gamma.example` A | |
 | 3 | TCP SYN `10.0.1.1:40000 → 10.0.1.53:80` | `dns.*` and `udp.*` absent |
+
+## ctrl_comments.pcapng
+
+Control characters in a string field value (issue #74). pcapng rather than
+pcap because a frame *comment* is the one place a capture can carry arbitrary
+bytes verbatim: every string field a dissector builds — `dns.qry.name`
+included — is already `format_text`-ed by the dissector and can never hold a
+raw control byte. All seven frames are the same TCP SYN; only
+`frame.comment` differs.
+
+| # | `frame.comment` | `-T fields` prints | Notes |
+|---|-----------------|--------------------|-------|
+| 1 | `tab<0x09>here` | `tab\there` | C-escaped |
+| 2 | `vt<0x0b>here` | `vt\vhere` | 0x0b is also the reader's column separator, so this frame proves the separator cannot be forged by a value |
+| 3 | `back<0x5c>slash` | `back\\slash` (>= 4.4) | the backslash doubling that makes the escaping invertible; 4.2.x prints `back\slash` |
+| 4 | `us<0x1f>here` | `us<0x1f>here` | passed through RAW; 0x1f was the column separator before #74 and used to split the column and abort the parse |
+| 5 | `C:<0x5c>temp` | `C:\\temp` (>= 4.4) | the collision that forces the version gate: 4.2.x prints `C:\temp`, byte-identical to what it prints for a value holding a real TAB, so unescaping there would rewrite this into `C:<0x09>emp` |
+| 6 | (none) | (empty column) | `frame.comment` absent |
+| 7 | `rs<0x1e>here` | `rs<0x1e>here` | passed through RAW like 0x1f, but 0x1e is the *occurrence* separator, so the fields path reports two occurrences (`("rs", "here")`) where `-T ek` reports the one true value. This is the residual #74 accepts rather than fixes — tshark returns `escape(occ1 + SEP + occ2)`, so no single-byte aggregator can recover the join positions. Appended after frame 6 so frames 1-6 keep the numbers the suite already pins |

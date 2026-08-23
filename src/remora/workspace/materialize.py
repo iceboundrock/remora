@@ -183,7 +183,7 @@ from typing import TYPE_CHECKING, Any, Final, Literal, Protocol, TypeAlias
 from remora.compile.dfilter import compile_dfilter
 from remora.expr import Expr
 from remora.fields import FieldRef
-from remora.reader.fields_reader import FieldsReader, fields_argv
+from remora.reader.fields_reader import FieldsReader, escaping_is_reversible, fields_argv
 from remora.reader.process import TsharkNotFoundError
 from remora.workspace.cachekey import PcapFingerprint, fingerprint_pcap, make_cache_key
 from remora.workspace.errors import (
@@ -248,10 +248,19 @@ TsharkRunner: TypeAlias = Callable[[Sequence[str]], TsharkRun]
 _ARGV_OPTIONS_OWNED_ELSEWHERE: Final[frozenset[str]] = frozenset({"-e", "-r", "-Y"})
 
 
-#: Wall-clock ceiling on the ``tshark --version`` probe. Generous, because it
-#: only has to bound a hung binary: the probe can run while
-#: ``Workspace.materialize`` holds the exclusive write lock, so a tshark that
-#: never returns would otherwise lock the workspace file forever.
+#: Wall-clock ceiling on the ``tshark --version`` probe. It exists because the
+#: probe can run while ``Workspace.materialize`` holds the exclusive write
+#: lock, so a tshark that never returns would otherwise lock the workspace
+#: file forever.
+#:
+#: Generous — three times ``remora.reader.process._VERSION_PROBE_TIMEOUT``,
+#: which bounds the same command — because the two differ in what giving up
+#: costs, not in what they run. There the answer only picks an unescaping
+#: policy and ``None`` is a safe default, so a short bound is free. Here the
+#: version is a cache-key component that ``detect_tshark_version`` must
+#: establish or raise, so an early timeout turns a loaded machine into a
+#: failed materialization. The lock argues for having a ceiling at all; the
+#: failure mode is what sets it this high.
 _VERSION_PROBE_TIMEOUT: Final[float] = 30.0
 
 _FRAME_NUMBER_SPEC: Final[ColumnSpec] = ColumnSpec(
@@ -691,8 +700,11 @@ def _materialize_fresh(
     row_count = 0
     batch_count = 0
     batch: list[list[Any]] = []
+    # tshark only escapes -T fields values invertibly from 4.4 (see the
+    # reader's module docstring); below that the text is stored as printed.
+    unescape_values = escaping_is_reversible(tshark_version)
     with runner(argv) as lines:
-        for row in FieldsReader(lines, projection_refs):
+        for row in FieldsReader(lines, projection_refs, unescape_values=unescape_values):
             batch.append([spec.encode_raw(row.get_raw(spec.abbrev)) for spec in insert_specs])
             if len(batch) >= batch_size:
                 con.executemany(insert_sql, batch)
@@ -1069,8 +1081,9 @@ def _backfill(
     row_count = 0
     batch_count = 0
     batch: list[list[Any]] = []
+    unescape_values = escaping_is_reversible(tshark_version)
     with runner(argv) as lines:
-        for row in FieldsReader(lines, projection_refs):
+        for row in FieldsReader(lines, projection_refs, unescape_values=unescape_values):
             values = [spec.encode_raw(row.get_raw(spec.abbrev)) for spec in new_specs]
             values.append(_FRAME_NUMBER_SPEC.encode_raw(row.get_raw(_FRAME_NUMBER_REF.name)))
             batch.append(values)

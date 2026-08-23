@@ -1019,6 +1019,88 @@ class TestInheritedFingerprintBlindSpot:
         )
 
 
+class TestReaderChangeInvalidatesStoredKeys:
+    """The consequence `docs/workspace.md` documents, pinned executably.
+
+    ``-E separator=``/``-E aggregator=`` are part of the effective argv and
+    the argv is hashed verbatim, so #74's move of the column separator from
+    ``0x1f`` to ``0x0b`` changes the cache key of every projection. A
+    workspace materialized by a pre-#74 remora therefore refuses reuse rather
+    than serving a hit computed under different framing.
+
+    The refusal is what makes the "no separator carve-out" decision safe, so
+    it is pinned here rather than left to the prose: two remoras that frame
+    columns differently do not necessarily turn one capture's bytes into the
+    same column values, and a silent hit across that boundary would be the
+    same class of mistake as ignoring ``-d``.
+    """
+
+    #: The separator/aggregator pair every remora before #74 ran with.
+    PRE_74_SEPARATORS = ("separator=\x1f", "aggregator=\x1e")
+
+    def age_the_stored_key(self, ws_path: Path) -> tuple[str, ...]:
+        """Rewrite the stored key's argv to its pre-#74 spelling; return it.
+
+        The row is replaced rather than reconstructed, so everything the
+        comparison looks at except the argv stays exactly as this remora
+        wrote it — the separator bytes are the only variable.
+        """
+        with Workspace(ws_path, mode="rw") as ws, ws.write() as con:
+            (stored,) = read_cache_keys(con)
+            aged = tuple(
+                arg.replace(UNIT_SEP, "\x1f").replace(OCC_SEP, "\x1e") for arg in stored.argv
+            )
+            assert aged != stored.argv, "fixture no longer carries the new separators"
+            con.execute("DELETE FROM meta.cache_keys")
+            record_cache_key(con, dataclasses.replace(stored, argv=aged))
+        return aged
+
+    def test_a_pre_74_workspace_refuses_reuse(self, tmp_path: Path) -> None:
+        pcap = make_pcap(tmp_path)
+        ws_path = tmp_path / "ws.duckdb"
+        run(ws_path, pcap, [IP_SRC])
+        aged = self.age_the_stored_key(ws_path)
+        assert any(part in arg for arg in aged for part in self.PRE_74_SEPARATORS)
+
+        # Same capture, same fields, same version — only the framing differs.
+        refuse(ws_path, pcap, [IP_SRC], MaterializationMismatchError, "tshark arguments")
+
+    def test_the_refusal_points_at_a_fresh_workspace(self, tmp_path: Path) -> None:
+        # The message has to say what to do, since there is no migration.
+        pcap = make_pcap(tmp_path)
+        ws_path = tmp_path / "ws.duckdb"
+        run(ws_path, pcap, [IP_SRC])
+        self.age_the_stored_key(ws_path)
+        refuse(ws_path, pcap, [IP_SRC], MaterializationMismatchError, "fresh workspace")
+
+    def test_nothing_is_rescanned_or_rewritten_by_the_refusal(self, tmp_path: Path) -> None:
+        # A refusal must leave the workspace exactly as it was: no partial
+        # rematerialization, no key replaced with the new spelling.
+        pcap = make_pcap(tmp_path)
+        ws_path = tmp_path / "ws.duckdb"
+        run(ws_path, pcap, [IP_SRC])
+        aged = self.age_the_stored_key(ws_path)
+        with reading(ws_path) as con:
+            before = checksum(con, ["frame_number", "frame_time", "ip_src"])
+
+        refuse(ws_path, pcap, [IP_SRC], MaterializationMismatchError, "tshark arguments")
+
+        with reading(ws_path) as con:
+            assert read_cache_keys(con)[0].argv == aged
+            assert checksum(con, ["frame_number", "frame_time", "ip_src"]) == before
+            assert count(con, "main.pkts") == 3
+
+    def test_a_workspace_this_remora_wrote_still_hits(self, tmp_path: Path) -> None:
+        # The control: the refusal above is caused by the aged argv and not by
+        # something else the helper disturbed.
+        pcap = make_pcap(tmp_path)
+        ws_path = tmp_path / "ws.duckdb"
+        run(ws_path, pcap, [IP_SRC])
+        again, second = run(ws_path, pcap, [IP_SRC])
+        assert second.outcome == "hit"
+        assert again.argv is None
+
+
 class TestBackfillAfterNarrowing:
     """A hit followed by a widening request still backfills only what is new."""
 

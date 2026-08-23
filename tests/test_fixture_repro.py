@@ -33,3 +33,27 @@ def test_tcp_mixed_is_reproducible() -> None:
 def test_dns_multi_is_reproducible() -> None:
     generator = _load_generator()
     assert generator.build_dns_multi() == (FIXTURES_DIR / "dns_multi.pcap").read_bytes()
+
+
+def test_ctrl_comments_is_reproducible() -> None:
+    generator = _load_generator()
+    assert generator.build_ctrl_comments() == (FIXTURES_DIR / "ctrl_comments.pcapng").read_bytes()
+
+
+def test_ctrl_comments_really_carries_raw_control_bytes() -> None:
+    """The whole point of the fixture (#74), checked without spawning tshark.
+
+    If a regeneration ever escaped these on the way in, the integration suite
+    comparing the three evaluation paths would pass vacuously.
+    """
+    raw = (FIXTURES_DIR / "ctrl_comments.pcapng").read_bytes()
+    for expected in (
+        b"tab\there",
+        b"vt\vhere",
+        b"back\\slash",
+        b"us\x1fhere",
+        # Frame 7: the OCC_SEP byte itself, which is what makes the
+        # occurrence fork witnessable end to end (#74's accepted residual).
+        b"rs\x1ehere",
+    ):
+        assert expected in raw

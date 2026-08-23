@@ -14,10 +14,16 @@ The three packets exercise the parse rules the reader must honor:
    ``tcp.port``, and ``dns.qry.name`` are all absent (empty columns).
 3. **DNS query** over UDP for ``foo,bar.example`` — the query name
    contains a comma, the classic value that breaks naive CSV-style
-   splitting and the reason the reader uses US/RS control bytes. (A
-   comma was chosen over a tab because tshark backslash-escapes control
-   characters inside string field values, which would test tshark's
-   escaping rather than our separator handling.)
+   splitting and the reason the reader frames columns with control bytes.
+   A comma keeps this sample about *framing*: tshark C-escapes control
+   characters inside string values (issue #74), and the round trip through
+   that escaping is pinned separately by
+   ``tests/integration/test_control_chars.py``, over a fixture whose frame
+   comments carry real control bytes.
+
+Regenerating after a change to :data:`remora.reader.fields_reader.UNIT_SEP`
+or ``OCC_SEP`` is mandatory: the separator bytes are baked into the committed
+output, which the golden test parses with the current constants.
 
 Checksums (IPv4 header, TCP, UDP) are computed properly so the capture
 is clean even with checksum validation enabled.

@@ -25,8 +25,8 @@ from remora import DNS, IP, TCP, UDP, Capture
 from remora.capture import _build_argv, _resolve_tshark
 from remora.fields import FieldNotProjectedError, Packet
 from remora.planner import make_plan
-from remora.reader.fields_reader import FieldsReader
-from remora.reader.process import TsharkProcess
+from remora.reader.fields_reader import FieldsReader, escaping_is_reversible
+from remora.reader.process import TsharkProcess, probe_tshark_version
 
 FIXTURES_DIR = Path(__file__).resolve().parent.parent / "fixtures"
 TCP_MIXED = FIXTURES_DIR / "tcp_mixed.pcap"
@@ -123,10 +123,23 @@ class TestFieldsProjection:
         names = [ref.name for ref in plan.projection]
         assert names == ["ip.src", "tcp.port"]
 
-        argv = _build_argv(_resolve_tshark(None), TCP_MIXED, plan)
+        tshark = _resolve_tshark(None)
+        argv = _build_argv(tshark, TCP_MIXED, plan)
         process = TsharkProcess(argv)
         try:
-            rows: list[Packet] = list(FieldsReader(process, plan.projection))
+            # unescape_values mirrors what Capture itself passes (#74): this
+            # test stands in for Capture's fields path, so leaving it at the
+            # safe default would quietly exercise a configuration Capture
+            # never uses. No value here carries a control byte, so the flag
+            # cannot change the assertions — which is the point: the pipeline
+            # is the same one, not merely a similar one.
+            rows: list[Packet] = list(
+                FieldsReader(
+                    process,
+                    plan.projection,
+                    unescape_values=escaping_is_reversible(probe_tshark_version(tshark)),
+                )
+            )
         finally:
             process.close()
 
