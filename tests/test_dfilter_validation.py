@@ -48,7 +48,7 @@ import pytest
 from dfilter_corpus import CAPTURE_DFILTER_GOLDENS, GOLDEN, PLANNER_DFILTER_GOLDENS, RESPTIME
 from exprgen import gen_corpus
 from remora import DNS, IP, TCP, UDP, values
-from remora.compile.dfilter import UnsupportedExprError, compile_dfilter
+from remora.compile.dfilter import compile_dfilter
 from remora.compile.predicate import compile_predicate
 from remora.expr import Expr
 from remora.proto.http import HTTP
@@ -354,7 +354,10 @@ class TestNaNIsARecognizedDfilterLiteral:
     These tests measure tshark rather than remora: they are the evidence behind
     the policy in ``dfilter.py``'s IEEE-754 section, pinned so a future
     Wireshark that changes how it lexes or orders ``nan`` is caught here and the
-    policy gets revisited, instead of the reasoning quietly going stale.
+    policy gets revisited, instead of the reasoning quietly going stale. The
+    refusal these measurements motivate is asserted in
+    ``tests/test_dfilter.py::TestNaNLiterals``, not here — this file measures
+    the binary, that one measures the compiler.
 
     Everything asserted below is measured on **both** tshark versions this
     project is tested against — CI's apt build (4.2.2) and a current release
@@ -419,14 +422,6 @@ class TestNaNIsARecognizedDfilterLiteral:
             dfilter = f"{RESPTIME.name} {op} nan"
             if _tshark_accepts(DNS_MULTI, dfilter):
                 assert _tshark_matching_frames(DNS_MULTI, dfilter) == set(), dfilter
-
-    def test_the_compiler_never_emits_any_of_those_filters(self) -> None:
-        # The refusal is what keeps the divergence above off the pushdown path.
-        # A float literal only reaches the renderer on a float ftype, so this is
-        # the same policy the measurements above are the motive for.
-        for expr in (RESPTIME > NAN, RESPTIME >= NAN, RESPTIME != NAN, RESPTIME.in_([NAN])):
-            with pytest.raises(UnsupportedExprError, match="NaN"):
-                compile_dfilter(expr)
 
 
 class TestInfinityIsPushedDownUnchanged:

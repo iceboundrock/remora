@@ -198,16 +198,27 @@ comparing row sets; the pattern half is pinned by
   asymmetry is deliberate: SQL has a boolean constant to compile to and a
   `DOUBLE` total order that has to be actively neutralized, with no fallback
   engine to defer to, while a display filter has neither the constant nor the
-  need. Wireshark does lex `nan` as a literal — measured on tshark 4.6.8, a
-  float field rejects ordered comparisons against it while a relative-time
-  field orders it *below every value*, so `frame.time_delta > nan` selects every
-  frame carrying the field where Python selects none — which is why rendering it
-  is not self-protecting and refusal is the fix. `inf`/`-inf` are pushed down
-  unchanged everywhere, since all three engines order them identically.
-  Enforced by `tests/test_dfilter.py::TestNaNLiterals`, the four
-  `nan-literal-*`/`inf-literal-*` rows of `tests/test_semantics_table.py`, and
-  `tests/test_dfilter_validation.py::TestNaNIsARecognizedDfilterLiteral`, which
-  pins the tshark measurements the policy rests on.
+  need. Wireshark does lex `nan` as a literal rather than rejecting it, which
+  is why rendering it is not self-protecting and refusal is the fix. What
+  tshark does with it *afterwards* is ftype- and version-dependent, and that
+  instability is itself the argument against a dfilter-native rendering: on a
+  float field tshark 4.6.8 rejects ordered comparisons against it while CI's
+  4.2.2 accepts them and matches nothing; on a relative-time field 4.6.8 orders
+  `nan` below every value, so `frame.time_delta > nan` selects every frame
+  carrying the field where Python selects none, while 4.2.2 rejects that filter
+  outright. `inf`/`-inf` are pushed down unchanged everywhere, since all three
+  engines order them identically. Enforced by
+  `tests/test_dfilter.py::TestNaNLiterals` and the four
+  `nan-literal-*`/`inf-literal-*` rows of `tests/test_semantics_table.py`.
+  `tests/test_dfilter_validation.py::TestNaNIsARecognizedDfilterLiteral`/
+  `TestInfinityIsPushedDownUnchanged` add a live-binary check, but assert only
+  what holds on **both** tested builds: that `nan` lexes where `nam`/`nan5`/`zzz`
+  do not, that an ordered NaN comparison is never accepted-and-matching, and
+  that infinities are accepted. The per-build divergences above are *recorded*
+  in those test docstrings rather than asserted — one build's behavior is
+  evidence for the policy, not a contract — and on a build that accepts the
+  ordered comparisons the row-set half is witnessed vacuously, since no
+  checked-in fixture carries a populated `FT_DOUBLE` field.
 - **`contains` on a `BLOB` column** is `UnsupportedSqlExprError`: DuckDB's
   `contains()` takes `VARCHAR` or `LIST`, not `BLOB`. The pcap path runs it.
 - **Field text tshark could not decode as UTF-8** reaches the predicate backend
