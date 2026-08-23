@@ -30,6 +30,13 @@ def main() -> int:
         for module in modules:
             assert f"remora/proto/{module}.py" in wheel, f"{module}.py missing from {extra}"
             assert f"remora/proto/{module}.pyi" in wheel, f"{module}.pyi missing from {extra}"
+        # PEP 561 marker (#77). Redundant in a wheel install -- every dist
+        # unpacks into one site-packages/remora/, so core's marker already
+        # covers these stubs -- but a marker the build backend silently drops
+        # would break the editable/multi-root layout, where mypy looks for it
+        # under the extra's own remora/ root. A marker file that is not
+        # packaged is worse than none, because it looks fixed.
+        assert "remora/py.typed" in wheel, f"py.typed missing from {extra}"
         assert not any(name.endswith("remora/__init__.py") for name in wheel), extra
         assert not any(name.endswith("remora/proto/__init__.py") for name in wheel), extra
     print("wheel contents OK")

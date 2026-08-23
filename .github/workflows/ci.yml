@@ -25,6 +25,16 @@ jobs:
         run: uv run ruff format --check .
       - name: Typecheck
         run: uv run mypy --strict src tests
+      # The editable half of #77's two-layout coverage. `uv sync` installs the
+      # extras as separate editable roots, so mypy finds `remora.proto.wlan`
+      # under `packages/remora-wireless/src/remora/` and needs a `py.typed`
+      # *there* — core's marker covers the extras only in a wheel install,
+      # where every distribution unpacks into one `site-packages/remora/`. The
+      # `wheels` job runs this same script against that layout. --python-version
+      # 3.12 selects typeshed semantics only (for `typing.assert_type`), so this
+      # runs unchanged on every interpreter in the matrix.
+      - name: Extras stubs resolve in the editable workspace
+        run: uv run mypy --strict --python-version 3.12 .github/scripts/check_stub_resolution.py
       - name: Install tshark
         run: |
           sudo apt-get update
@@ -133,6 +143,10 @@ jobs:
           from remora.proto import WLAN, RADIOTAP, MODBUS, MBTCP, DNP3, GTP, DIAMETER
           print('extras resolve OK; duckdb', duckdb.__version__, 'pyarrow', pyarrow.__version__)
           "
+      # The wheel half of #77's two-layout coverage: here every distribution has
+      # unpacked into one site-packages/remora/, so this passes on core's marker
+      # alone. The `checks` job runs the same script in the editable workspace,
+      # which is the layout that needs each extra's own remora/py.typed.
       - name: Extras stubs resolve for mypy
         run: |
           uv pip install --python all-env/bin/python mypy
