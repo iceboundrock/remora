@@ -60,7 +60,7 @@ psdsl = "remora.codegen.cli:main"
 [dependency-groups]
 dev = [
     "duckdb>=1.1",
-    "mypy>=1.14",
+    "mypy>=2.3.1",
     # Shipped to users as the optional "arrow" extra; here unconditionally,
     # because the Arrow tests must run whether or not a user would install it.
     "pyarrow>=16",
