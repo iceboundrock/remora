@@ -927,6 +927,19 @@ class Workspace:
         replay that fails names the alias, the path and :meth:`detach` as the
         remedy; see :meth:`read` and :meth:`write`.
 
+        That stamp is a cheap check rather than a proof, and it has two accepted
+        blind spots, both a single connection body wide and both pinned by
+        tests. A peer rewritten in place at the same inode whose mtime is
+        *restored* (``os.utime``, an archiver, a coarse-mtime filesystem) reads
+        as untouched and is re-attached unvalidated. And the check is
+        check-then-act: a peer swapped between the ``stat`` and the ``ATTACH``
+        is attached unvalidated too — unclosable here, since DuckDB opens the
+        peer by path — after which the shared read lock holds it and the next
+        replay sees the new stamp and revalidates. A caller who cannot rule
+        either out should :meth:`detach` the peer and attach it again, which
+        revalidates unconditionally; see
+        :func:`remora.workspace.attach.file_stamp`.
+
         **What an attachment costs.** It takes a shared read lock on the
         attached file for as long as it stays attached — which is for as long
         as a connection carrying it is open. Another process cannot write to

@@ -78,6 +78,13 @@ gap the refusal above exists to prevent. The cost of closing it is one ``stat``
 per attachment per connection, which is why this module does filesystem I/O at
 all; it still opens no connection, spawns nothing and reads no capture.
 
+A stamp is a cheap answer rather than a proof, and its two residuals are
+accepted and pinned rather than papered over — an in-place rewrite that keeps
+the inode and restores the mtime (:func:`file_stamp`), and the check-then-act
+window between the ``stat`` and the ``ATTACH`` (:func:`apply_attachments`).
+Both are one connection body wide and both are stated where the code that
+relies on them lives.
+
 Like every module here but ``workspace.py`` this one is import-pure: duckdb is
 annotated under ``TYPE_CHECKING`` and no connection is opened. That is also why
 :func:`is_duplicate_database_error` classifies by message text rather than by
@@ -118,17 +125,27 @@ RESERVED_ALIASES: Final[frozenset[str]] = frozenset({"main", "temp", "system"})
 _ALIAS_RE: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 _DUPLICATE_DATABASE_RE: Final[re.Pattern[str]] = re.compile(
-    r"database with name .* already exists", re.IGNORECASE
+    r"""database with name ["'`][^"'`\n]*["'`] already exists""", re.IGNORECASE
 )
 """What DuckDB says when an ATTACH reuses a live database name.
 
 Measured on duckdb 1.5.5: ``Binder Error: Failed to attach database: database
 with name "peer" already exists``. Matched as text because this module never
 imports duckdb (it is annotated under ``TYPE_CHECKING`` only), so the exception
-*class* is not available to test against;
-``tests/test_workspace_attach.py::TestCrossObjectAliasCollision`` pins the live
-message so a reworded upgrade fails loudly instead of silently degrading the
-refusal to a generic :class:`WorkspaceError`.
+*class* is not available to test against.
+
+Two failure directions, guarded from both sides. A *rewording* would silently
+degrade the refusal to a generic :class:`WorkspaceError`, which
+``tests/test_workspace_attach.py::TestCrossObjectAliasCollision::test_duckdbs_duplicate_message_is_pinned``
+catches by asserting the live message from a real duplicate ATTACH. A *false
+positive* would misreport some unrelated ATTACH failure as an alias collision,
+which is why the database name must appear quote-delimited and newline-free
+rather than as a bare ``.*``: the loose form matched anything that merely
+mentioned a database and an existing something ("Cannot open database with name
+resolution failure; the lock file already exists" is the shape), where this one
+needs DuckDB's actual phrasing. The three common quoting styles are all accepted
+so a quote-style change is not mistaken for a different error; a deeper rewording
+is meant to fail the pin test loudly instead.
 """
 
 FileStamp = tuple[int, int, int]
@@ -147,6 +164,24 @@ def file_stamp(path: str | os.PathLike[str]) -> FileStamp | None:
 
     ``None`` means "cannot prove anything about this file", and every caller
     must treat it as changed rather than as unchanged.
+
+    **Accepted blind spot.** A stamp answers "same file, untouched?" cheaply,
+    and buys that cheapness the same way ``cachekey.fingerprint_pcap`` buys
+    its own: with a named, pinned residual rather than a proof. An in-place
+    rewrite that keeps the inode *and* ends with the original ``st_mtime_ns``
+    stamps as unchanged — ``os.utime`` restores it outright, an archiver or a
+    ``rsync --times`` puts it back, and a coarse-mtime filesystem can hand two
+    genuinely different states one timestamp. The consequence for
+    :func:`apply_attachments` is one bare ATTACH of an altered peer per such
+    rewrite; ``tests/test_workspace_attach.py::TestStampBlindSpot`` constructs
+    exactly that and asserts the peer is attached unvalidated, so the
+    limitation is executable rather than aspirational, with a companion test
+    showing the same rewrite *without* the timestamp restored still
+    revalidates. Closing it would need a content digest of the peer on every
+    connection open, which is the catalog read this gate exists to avoid, only
+    dearer. A caller who cannot rule out a timestamp-preserving rewrite of a
+    peer should :meth:`~remora.workspace.workspace.Workspace.detach` and
+    attach it again, which revalidates unconditionally.
     """
     try:
         st = os.stat(path)
@@ -315,6 +350,21 @@ def apply_attachments(con: DuckDBPyConnection, attachments: Iterable[Attachment]
     error from inside ``alias.meta.fields``. A changed peer stays on the
     revalidating path until it is re-attached: the record is the caller's and is
     not rewritten from here.
+
+    Two residuals, both accepted and stated rather than implied. The stamp's own
+    blind spot is documented on :func:`file_stamp`: a rewrite that keeps the
+    inode and restores the mtime takes the bare ATTACH. And the gate is
+    **check-then-act** — the file can be swapped between the ``stat`` and the
+    ``ATTACH``, in which case the replacement is attached unvalidated. That
+    window is not closable here, for the same reason ``export.py``'s destination
+    check was not: DuckDB opens the peer *by path*, there is no "attach this
+    inode", and no amount of checking harder removes the gap. ``export.py``
+    escaped its own by writing somewhere private and renaming, which has no
+    analogue when the file to open is the caller's, not ours. What bounds it is
+    scope rather than probability: it is one connection body wide, because the
+    ATTACH's shared read lock then holds the peer for as long as the attachment
+    lives, and the *next* replay stats the swapped-in file, sees a stamp that no
+    longer matches the record, and revalidates.
 
     Args:
         con: A freshly opened connection to the primary workspace.

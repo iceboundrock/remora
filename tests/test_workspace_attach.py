@@ -517,10 +517,54 @@ class TestCrossObjectAliasCollision:
             "IO Error: Cannot open database",
             "Binder Error: Failed to attach database: something else entirely",
             "",
+            # The name must be quote-delimited: a bare `.*` bridged unrelated
+            # text and classified prose like this as an alias collision.
+            "IO Error: Cannot open database with name resolution failure; "
+            "the lock file already exists",
+            # Right shape, wrong object kind.
+            'Binder Error: table with name "peer" already exists',
         ],
     )
     def test_classifier_ignores_other_failures(self, message: str) -> None:
         assert not is_duplicate_database_error(RuntimeError(message))
+
+    @pytest.mark.parametrize("quote", ['"', "'", "`"])
+    def test_classifier_accepts_the_quoting_styles(self, quote: str) -> None:
+        # A quote-style change is not a different error; a deeper rewording is
+        # meant to fail test_duckdbs_duplicate_message_is_pinned instead.
+        message = f"Binder Error: database with name {quote}peer{quote} already exists"
+        assert is_duplicate_database_error(RuntimeError(message))
+
+    def test_real_non_duplicate_attach_failures_are_not_classified(
+        self, con: DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        """Real ATTACH failures, not synthetic strings — none is a collision.
+
+        The pin test above guards a duckdb *rewording*; this guards the other
+        direction, a false positive turning some unrelated ATTACH failure into a
+        ``WorkspaceAliasError`` that tells the caller to rename their alias.
+        """
+        junk = tmp_path / "junk.duckdb"
+        junk.write_bytes(b"not a duckdb database at all\n" * 64)
+        attempts = {
+            "missing path": str(tmp_path / "absent.duckdb"),
+            "not a duckdb file": str(junk),
+            "a directory": str(tmp_path),
+        }
+        for label, target in attempts.items():
+            with pytest.raises(duckdb.Error) as caught:
+                con.execute(f"ATTACH '{target}' AS a (READ_ONLY)")
+            assert not is_duplicate_database_error(caught.value), f"{label}: {caught.value}"
+
+    def test_a_non_duckdb_file_stays_a_plain_workspace_error(self, tmp_path: Path) -> None:
+        # End to end: the classification must not widen Workspace.attach's
+        # generic refusal into an alias refusal.
+        junk = tmp_path / "junk.duckdb"
+        junk.write_bytes(b"not a duckdb database at all\n" * 64)
+        with Workspace(make_workspace(tmp_path / "ws.duckdb")) as ws:
+            with pytest.raises(WorkspaceError) as caught:
+                ws.attach(junk, "peer")
+            assert not isinstance(caught.value, WorkspaceAliasError)
 
 
 class TestReplayRevalidation:
@@ -630,6 +674,82 @@ class TestReplayRevalidation:
         make_peer(path)
         assert before is not None
         assert file_stamp(path) != before
+
+
+def rewrite_in_place(target: Path, source: Path) -> None:
+    """Give ``target`` ``source``'s bytes without changing ``target``'s inode.
+
+    Writing through an open handle rather than replacing the file is what makes
+    the blind spot below deterministic: it is a property of the *stamp*, not of
+    whatever write strategy DuckDB happens to use.
+    """
+    payload = source.read_bytes()
+    with open(target, "r+b") as handle:
+        handle.truncate(0)
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+class TestStampBlindSpot:
+    """#100: the stamp's accepted residual, pinned rather than claimed closed.
+
+    ``(st_dev, st_ino, st_mtime_ns)`` answers "same file, untouched?" for one
+    ``stat``, and buys that cheapness the way ``cachekey.fingerprint_pcap`` buys
+    its own — with a residual that is named and executable rather than
+    aspirational (``TestFingerprint::test_middle_change_does_not_flip`` and
+    ``TestInheritedFingerprintBlindSpot`` are the precedent, companion test
+    included). Here the residual is an in-place rewrite at the same inode whose
+    mtime is *restored*: ``os.utime``, an archiver replaying timestamps, or a
+    coarse-mtime filesystem. Closing it would need a content digest of the peer
+    on every connection open — the catalog read this gate exists to avoid, only
+    dearer — so it is accepted, and a caller who cannot rule it out should
+    detach and attach again, which revalidates unconditionally.
+    """
+
+    def test_same_inode_rewrite_with_restored_mtime_is_attached_blind(self, tmp_path: Path) -> None:
+        peer = make_workspace(tmp_path / "peer.duckdb")
+        with Workspace(make_workspace(tmp_path / "ws.duckdb"), mode="rw") as ws:
+            ws.attach(peer, "peer")
+            recorded = ws._attachments["peer"].stamp
+            before = os.stat(peer)
+
+            # A v1 workspace — what check_compatible exists to refuse — written
+            # into the peer's own inode, with the timestamp put back afterwards.
+            rewrite_in_place(peer, make_peer(tmp_path / "v1.duckdb", version="1"))
+            assert file_stamp(peer) != recorded, "the rewrite must move the mtime"
+            os.utime(peer, ns=(before.st_atime_ns, before.st_mtime_ns))
+            assert file_stamp(peer) == recorded, "the blind spot must be armed"
+
+            # No revalidation, so the incompatible peer is attached and usable.
+            with ws.read() as connection:
+                assert connection.execute(
+                    "SELECT value FROM \"peer\".meta.info WHERE key = 'schema_version'"
+                ).fetchone() == ("1",)
+
+    def test_the_same_rewrite_without_restoring_the_mtime_is_refused(self, tmp_path: Path) -> None:
+        # The companion: identical edit, timestamp left alone. The blind spot is
+        # the restored mtime specifically, not in-place rewrites generally.
+        peer = make_workspace(tmp_path / "peer.duckdb")
+        with Workspace(make_workspace(tmp_path / "ws.duckdb"), mode="rw") as ws:
+            ws.attach(peer, "peer")
+            rewrite_in_place(peer, make_peer(tmp_path / "v1.duckdb", version="1"))
+            with pytest.raises(SchemaVersionError, match="cannot re-attach 'peer'"), ws.read():
+                pass  # pragma: no cover - the body is never reached
+
+    def test_detaching_and_attaching_again_revalidates_unconditionally(
+        self, tmp_path: Path
+    ) -> None:
+        # The documented remedy for a caller who cannot rule the blind spot out.
+        peer = make_workspace(tmp_path / "peer.duckdb")
+        with Workspace(make_workspace(tmp_path / "ws.duckdb"), mode="rw") as ws:
+            ws.attach(peer, "peer")
+            before = os.stat(peer)
+            rewrite_in_place(peer, make_peer(tmp_path / "v1.duckdb", version="1"))
+            os.utime(peer, ns=(before.st_atime_ns, before.st_mtime_ns))
+            ws.detach("peer")
+            with pytest.raises(SchemaVersionError, match="older remora"):
+                ws.attach(peer, "peer")
 
 
 class TestCompactIsUnaffectedByAttachments:

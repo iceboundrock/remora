@@ -593,7 +593,12 @@ An attachment is recorded and replayed onto every connection the workspace
 opens, so it outlives the short-lived connections `rw` mode uses. Two things
 follow. The peer's identity and mtime are recorded alongside its path, and a
 peer *replaced* at that path in between is re-checked before it is used rather
-than trusted. And because the replay runs on every connection, an attachment
+than trusted — with two accepted blind spots, each one connection body wide: a
+rewrite that keeps the inode and *restores* the mtime reads as untouched, and a
+peer swapped between the check and the `ATTACH` is attached unchecked (DuckDB
+opens it by path, so that window narrows rather than closes). Both are pinned by
+tests; if you cannot rule either out, `detach()` and attach again, which
+revalidates unconditionally. And because the replay runs on every connection, an attachment
 DuckDB can no longer honour — a deleted peer, one another process now holds
 read-write — fails whatever you were doing, including operations that never
 mention it; that reads as a `WorkspaceError` naming the alias, the path and the
