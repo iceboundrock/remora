@@ -19,9 +19,10 @@ uv run pytest -m "not integration"             # skip tests needing a real tshar
 uv run mypy --strict src tests                 # typecheck (tests included — this is the CI gate)
 uv run ruff check .                            # lint
 uv run ruff format --check .                   # format check (also formats code fences in docs/*.md)
+uv run mypy --strict --python-version 3.12 .github/scripts/check_stub_resolution.py  # extras stubs, editable layout
 ```
 
-The CI gate is all four: `ruff check`, `ruff format --check`, `mypy --strict src tests`, `pytest`. Run the full gate before committing.
+The CI gate is all five: `ruff check`, `ruff format --check`, `mypy --strict src tests`, the extras stub check, and `pytest`. Run the full gate before committing. That stub check is what keeps `from remora.proto.wlan import WLAN` typed in an editable or multi-root layout (#77) — it fails if any extras distribution loses its own `remora/py.typed`, a loss a wheel install masks because every distribution unpacks into one `site-packages/remora/` covered by core's marker. Its `--python-version 3.12` selects typeshed semantics only (`typing.assert_type` does not exist under this repo's pinned `python_version = 3.10`), so the one step runs unchanged on every interpreter in the 3.10–3.14 matrix; CI runs it in the `checks` job for the editable layout and again in `wheels` against a venv built from the wheels.
 
 Static typing assertions are part of the test suite: `assert_type(...)` calls in `tests/` are no-ops at runtime and are verified when mypy checks the test files. Beware that a preceding `assert x == value` can narrow a type and break a later `assert_type` — put `assert_type` before runtime asserts.
 

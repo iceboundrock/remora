@@ -171,6 +171,11 @@ def test_every_distribution_ships_a_py_typed_marker() -> None:
     ``.github/scripts/check_wheel_contents.py`` asserts the built wheels
     actually carry the marker; this test asserts the sources do.
     """
+    # Core is named literally rather than derived: its root is ``src/remora``,
+    # not ``packages/remora-<name>/src/remora``, and no list in this repo
+    # legitimately holds it beside the extras (``EXTRA_NAMES`` mirrors
+    # codegen.toml's ``[extras.*]``). Same shape as
+    # ``test_extras_dists_pin_core_and_share_its_version`` above.
     roots = {"remora": REPO / "src"}
     for extra in EXTRA_NAMES:
         roots[f"remora-{extra}"] = REPO / "packages" / f"remora-{extra}" / "src"
