@@ -162,18 +162,90 @@ def test_the_doc_names_where_each_rule_is_enforced() -> None:
         assert (REPO_ROOT / path).is_file(), path
 
 
-def code_fences() -> tuple[tuple[str, str], ...]:
-    r"""Every fenced block in the doc, as ``(info string, body)`` pairs.
+def parse_code_fences(text: str) -> tuple[tuple[str, str], ...]:
+    r"""Every fenced block in *text*, as ``(info string, body)`` pairs.
+
+    Takes the text rather than reading the doc so the parser can be exercised
+    on synthetic input: the doc carries no fences, so a parser tested only
+    through it is tested on nothing (issue #102 review).
 
     The info string is matched with ``[^\n]*`` rather than ``.*``: under
     ``re.S`` a dot spans newlines, so a greedy tag group swallows the body and
-    hands the mistag guard an empty one to inspect — which would make it
-    vacuous for a reason nothing announces.
+    hands the mistag rule an empty one to inspect — which would make that rule
+    vacuous for a reason nothing announces. That bug was real and shipped in
+    this file's first draft, which is why the synthetic test below asserts the
+    split itself and not only the rule's verdict.
     """
     return tuple(
         (match.group(1).strip(), match.group(2))
-        for match in re.finditer(r"^```([^\n]*)\n(.*?)^```", read_doc(), re.M | re.S)
+        for match in re.finditer(r"^```([^\n]*)\n(.*?)^```", text, re.M | re.S)
     )
+
+
+def code_fences() -> tuple[tuple[str, str], ...]:
+    """Every fenced block in ``docs/semantics.md``."""
+    return parse_code_fences(read_doc())
+
+
+def mistagged_stub_fences(
+    fences: tuple[tuple[str, str], ...],
+) -> tuple[tuple[str, str], ...]:
+    """The fences that are stub examples tagged for the Python formatter.
+
+    A *stub example* is a body whose first line carries ``...``. ``ruff
+    format`` rewrites ```python fences in ``docs/*.md``, so such an example
+    must be tagged ```pyi or it is reformatted as a ``.py`` file and silently
+    corrupted. Every other tag — ```py, ```python3, untagged — is the same
+    mistake: the tag is what has to move.
+    """
+    return tuple(
+        (tag, body) for tag, body in fences if "..." in body.split("\n", 1)[0] and tag != "pyi"
+    )
+
+
+#: Synthetic input for the enforcement test below: two stub examples that
+#: differ only in their tag, plus a ```python fence that is not a stub. Written
+#: as a Python string constant on purpose — a fixture file under ``docs/`` would
+#: be reformatted by the very ``ruff format`` pass this rule exists to survive,
+#: and a docstring would be too if ``docstring-code-format`` were ever enabled.
+SYNTHETIC_FENCES = (
+    "prose before\n\n"
+    "```python\n"
+    "class IP:\n"
+    "    src: Field[IPv4Address]\n"
+    "```\n\n"
+    "```python\n"
+    "def src(self) -> Field[IPv4Address]: ...\n"
+    "```\n\n"
+    "```pyi\n"
+    "def dst(self) -> Field[IPv4Address]: ...\n"
+    "```\n\n"
+    "prose after\n"
+)
+
+
+def test_the_mistag_rule_rejects_a_stub_tagged_for_the_python_formatter() -> None:
+    """The guard's enforcement, proven on input the doc does not have to carry.
+
+    The doc has no fences, so applying the rule to it proves detection, never
+    rejection: a regression in the rule — or in the parser feeding it — leaves
+    CI green because the loop runs zero times (issue #102 review). Synthetic
+    text decouples the two, so the rule is tested on its own terms and the
+    inventory test goes back to doing only its own job.
+
+    The REAL parser runs over that text rather than the tuples being
+    hand-built, because the one bug this file has actually had lived in the
+    parser: a tag group that swallowed the body left the rule with an empty
+    string to inspect, and a test that skipped the parser would have passed
+    right through it.
+    """
+    fences = parse_code_fences(SYNTHETIC_FENCES)
+    # The split itself, pinned: tag on one side, body on the other.
+    assert [tag for tag, _ in fences] == ["python", "python", "pyi"]
+    assert fences[1][1] == "def src(self) -> Field[IPv4Address]: ...\n"
+    # ...and the verdict. The ```python stub is rejected; the ```pyi twin of
+    # the same body is not, and neither is a ```python fence that is no stub.
+    assert mistagged_stub_fences(fences) == (fences[1],)
 
 
 def test_the_fence_inventory_the_mistag_guard_runs_over() -> None:
@@ -185,12 +257,12 @@ def test_the_fence_inventory_the_mistag_guard_runs_over() -> None:
     added to this document fails here, which is exactly when someone should
     check that the guard below is saying what that fence needs.
 
-    Deliberately a separate test from that guard rather than one merged check.
-    The two fail for different reasons and want different responses: this one
-    fires when the doc gains a fence, which is a maintainer decision and not a
-    defect, while the guard fires on a fence that really is tagged wrongly.
-    Merged, the node name would no longer say which of the two happened, and
-    the teaching message below would have to fire for a plain mistag too.
+    One of three deliberately separate tests, because they fail for three
+    different reasons and want three different responses, and a merged node
+    name would stop saying which happened: the rule is *enforced* on synthetic
+    fences above, this one *announces* that the doc's fence set changed (a
+    maintainer decision, not a defect), and the third applies the rule to the
+    doc. Only this one needs the teaching message below.
     """
     fences = code_fences()
     assert fences == (), (
@@ -198,23 +270,32 @@ def test_the_fence_inventory_the_mistag_guard_runs_over() -> None:
         + ", ".join("```" + (tag or "untagged") for tag, _ in fences)
         + "), which is the event this test exists to announce.\n"
         "Until now test_no_fenced_stub_example_is_tagged_for_the_python_formatter "
-        "looped over zero fences, so it was vacuous by construction and this "
-        "assertion is what said so out loud.\n"
-        "Two things to do, in this order: (1) confirm the mistag guard now "
-        "actually covers the new fence — a stub example (a body whose first "
-        "line carries '...') must be tagged ```pyi, because `ruff format` "
-        "rewrites ```python fences in docs/*.md and would reformat a .pyi "
-        "example as .py and silently corrupt it; (2) then update this "
-        "inventory to the fences the doc now carries, so it keeps announcing "
-        "the next change rather than this one."
+        "looped over zero fences — the rule it applies is enforced on synthetic "
+        "input by test_the_mistag_rule_rejects_a_stub_tagged_for_the_python_"
+        "formatter, and this assertion is what says the real doc fed it nothing.\n"
+        "Two things to do, in this order: (1) check the new fence against that "
+        "rule — a stub example (a body whose first line carries '...') must be "
+        "tagged ```pyi, because `ruff format` rewrites ```python fences in "
+        "docs/*.md and would reformat a .pyi example as .py and silently "
+        "corrupt it; (2) then update this inventory to the fences the doc now "
+        "carries, so it keeps announcing the next change rather than this one."
     )
 
 
 def test_no_fenced_stub_example_is_tagged_for_the_python_formatter() -> None:
-    # ruff format rewrites ```python fences in docs/*.md, so a .pyi example
-    # tagged ```python is reformatted as a .py file and silently corrupted.
-    # Checked over EVERY fence rather than only the ```python ones: an untagged
-    # or ```py-tagged stub is the same mistake, and the tag is what has to move.
-    for tag, body in code_fences():
-        if "..." in body.split("\n", 1)[0]:
-            assert tag == "pyi", f"stub example must use a ```pyi fence, not ```{tag}"
+    """The rule above, applied to the document this suite is about.
+
+    Third of three jobs, each with its own node name: the rule is *enforced*
+    by the synthetic test, the doc's fence set is *announced* by the inventory
+    test, and this one applies the enforced rule to the real doc. It runs over
+    zero fences today; that is a fact about the doc, not about the rule, and
+    the synthetic test is what keeps the rule honest meanwhile.
+    """
+    offenders = mistagged_stub_fences(code_fences())
+    assert offenders == (), (
+        "docs/semantics.md carries a stub example tagged "
+        + ", ".join("```" + (tag or "untagged") for tag, _ in offenders)
+        + " — it must be tagged ```pyi, because `ruff format` rewrites "
+        "```python fences in docs/*.md and would reformat a .pyi example as "
+        ".py and silently corrupt it."
+    )
