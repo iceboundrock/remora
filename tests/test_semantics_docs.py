@@ -163,10 +163,16 @@ def test_the_doc_names_where_each_rule_is_enforced() -> None:
 
 
 def code_fences() -> tuple[tuple[str, str], ...]:
-    """Every fenced block in the doc, as ``(info string, body)`` pairs."""
+    r"""Every fenced block in the doc, as ``(info string, body)`` pairs.
+
+    The info string is matched with ``[^\n]*`` rather than ``.*``: under
+    ``re.S`` a dot spans newlines, so a greedy tag group swallows the body and
+    hands the mistag guard an empty one to inspect — which would make it
+    vacuous for a reason nothing announces.
+    """
     return tuple(
         (match.group(1).strip(), match.group(2))
-        for match in re.finditer(r"^```(.*)\n(.*?)^```", read_doc(), re.M | re.S)
+        for match in re.finditer(r"^```([^\n]*)\n(.*?)^```", read_doc(), re.M | re.S)
     )
 
 
@@ -178,8 +184,30 @@ def test_the_fence_inventory_the_mistag_guard_runs_over() -> None:
     Asserting the inventory it depends on says so out loud: the first fence
     added to this document fails here, which is exactly when someone should
     check that the guard below is saying what that fence needs.
+
+    Deliberately a separate test from that guard rather than one merged check.
+    The two fail for different reasons and want different responses: this one
+    fires when the doc gains a fence, which is a maintainer decision and not a
+    defect, while the guard fires on a fence that really is tagged wrongly.
+    Merged, the node name would no longer say which of the two happened, and
+    the teaching message below would have to fire for a plain mistag too.
     """
-    assert code_fences() == ()
+    fences = code_fences()
+    assert fences == (), (
+        "docs/semantics.md has gained its first fenced code block ("
+        + ", ".join("```" + (tag or "untagged") for tag, _ in fences)
+        + "), which is the event this test exists to announce.\n"
+        "Until now test_no_fenced_stub_example_is_tagged_for_the_python_formatter "
+        "looped over zero fences, so it was vacuous by construction and this "
+        "assertion is what said so out loud.\n"
+        "Two things to do, in this order: (1) confirm the mistag guard now "
+        "actually covers the new fence — a stub example (a body whose first "
+        "line carries '...') must be tagged ```pyi, because `ruff format` "
+        "rewrites ```python fences in docs/*.md and would reformat a .pyi "
+        "example as .py and silently corrupt it; (2) then update this "
+        "inventory to the fences the doc now carries, so it keeps announcing "
+        "the next change rather than this one."
+    )
 
 
 def test_no_fenced_stub_example_is_tagged_for_the_python_formatter() -> None:

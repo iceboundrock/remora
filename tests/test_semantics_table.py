@@ -760,6 +760,12 @@ def truth_id_signature(case_id: str) -> TruthSignature:
     head, _, tail = rest.partition("-")
     if head != "null" or not tail:
         raise ValueError(f"not a truth-grid id: {case_id!r}")
+    # The split assumes no operator slug contains a "-", which every entry in
+    # _OP_SLUG satisfies. A hyphenated slug added later would land part of
+    # itself in `multiplicity`, and both halves are checked against their
+    # closed sets below — so it fails loudly here rather than mis-reading an
+    # id, which is why this stays a plain rpartition instead of growing
+    # speculative parsing for a slug that does not exist.
     slug, _, multiplicity = tail.rpartition("-")
     if slug not in _SLUG_OP or multiplicity not in _MULTIPLICITIES:
         raise ValueError(f"not a truth-grid id: {case_id!r}")
