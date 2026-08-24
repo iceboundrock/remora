@@ -27,8 +27,8 @@ why :func:`apply_attachments` exists and why ``Workspace`` replays its recorded
 attachments onto every connection it opens. Replay is verified rather than
 blind, in both directions: an alias the instance already holds is left alone
 when it points at the same file read-only, and refused when it does not, while
-one it does not hold is re-attached — and revalidated, unless the peer file's
-stamp proves it is the same file untouched (see *Compatibility* below).
+one it does not hold is attached through :func:`attach_database` — which
+validates it — exactly as the first attach was (see *Compatibility* below).
 
 "Gone by the next" is a statement about the *last* connection closing, not
 about one operation ending: any other live connection to the same file — an
@@ -67,23 +67,36 @@ errors far from the cause. :func:`attach_database` therefore runs
 :func:`remora.workspace.schema.check_compatible` against the alias and detaches
 again on refusal, so a failed attach leaves nothing behind.
 
-That check is a statement about the *file*, and a replay happens later, so
-:func:`apply_attachments` re-runs it whenever the file may have changed —
-compared by the ``(st_dev, st_ino, st_mtime_ns)`` stamp :func:`file_stamp`
-takes at attach time. The window it closes is narrow but real: while a peer is
-attached it holds a shared read lock, but ``"rw"`` mode attaches nothing
-between operations, so the file at that path can be replaced in between and
-would otherwise be re-attached unvalidated — reopening exactly the raw-binder
-gap the refusal above exists to prevent. The cost of closing it is one ``stat``
-per attachment per connection, which is why this module does filesystem I/O at
-all; it still opens no connection, spawns nothing and reads no capture.
+That check is a statement about the *file*, and a replay attaches a file later,
+so :func:`apply_attachments` re-runs it on **every** ATTACH it issues rather
+than trying to decide in advance that it need not. In ``"rw"`` mode nothing is
+attached and nothing is locked between operations, so the file at a recorded
+path can be replaced in between; a replay that skipped the check would adopt
+the replacement and reopen exactly the raw-binder gap the refusal above exists
+to prevent.
 
-A stamp is a cheap answer rather than a proof, and its two residuals are
-accepted and pinned rather than papered over — an in-place rewrite that keeps
-the inode and restores the mtime (:func:`file_stamp`), and the check-then-act
-window between the ``stat`` and the ``ATTACH`` (:func:`apply_attachments`).
-Both are one connection body wide and both are stated where the code that
-relies on them lives.
+Validating **after** the ATTACH rather than before is what makes that airtight,
+and it is the whole reason this is not a check-then-act gate. A pre-ATTACH test
+— of a stamp, a digest, anything — is a statement about whatever was at the
+path when it ran, and DuckDB then opens the path *again*: no amount of checking
+harder binds those two operations together, because there is no "attach this
+inode" to ask for, and the private-temp-then-rename trick ``export.py`` closes
+its own window with has no analogue when the file to open is the caller's
+rather than ours. After the ATTACH the peer is open and read-locked, so
+``check_compatible`` against the alias reads the file that was *actually*
+attached, whatever raced in to become it.
+
+An earlier revision of this module tried to skip the check when a recorded
+``(st_dev, st_ino, st_mtime_ns)`` stamp still matched. It was withdrawn as
+unsound on both halves — the stat/ATTACH window above, and an in-place rewrite
+that restores the mtime, which no stamp can see — and the measurement it was
+justifying does not support it either: replay happens once per *connection
+open*, and the ATTACH it accompanies already opens the peer file, so the
+catalog read is a fraction of a cost that is being paid anyway (measured on
+duckdb 1.5.5: ``connect+ATTACH+close`` 6.5 ms, the added validation 1.7 ms,
+the ``stat`` it would have replaced 2 µs). Buying 2 µs with a soundness hole is
+not a trade this module makes; ``"ro"`` mode, where the connection is held and
+the alias stays live, pays nothing either way.
 
 Like every module here but ``workspace.py`` this one is import-pure: duckdb is
 annotated under ``TYPE_CHECKING`` and no connection is opened. That is also why
@@ -109,12 +122,10 @@ if TYPE_CHECKING:
 __all__ = [
     "RESERVED_ALIASES",
     "Attachment",
-    "FileStamp",
     "apply_attachments",
     "attach_database",
     "attached_databases",
     "detach_database",
-    "file_stamp",
     "is_duplicate_database_error",
     "validate_alias",
 ]
@@ -148,47 +159,6 @@ so a quote-style change is not mistaken for a different error; a deeper rewordin
 is meant to fail the pin test loudly instead.
 """
 
-FileStamp = tuple[int, int, int]
-"""``(st_dev, st_ino, st_mtime_ns)`` — enough to tell "same file, untouched"."""
-
-
-def file_stamp(path: str | os.PathLike[str]) -> FileStamp | None:
-    """Identity and mtime of ``path``, or ``None`` if it cannot be stat'ed.
-
-    File *identity* rather than pathname, the same ``(st_dev, st_ino)`` rule
-    ``workspace.py`` keys its coordination registry on and ``export.py`` guards
-    its destination with — a replacement at one path is a new inode, which a
-    pathname comparison cannot see. ``st_mtime_ns`` catches the in-place rewrite
-    that keeps the inode, and is integer nanoseconds for the reason
-    ``cachekey.py`` gives: exact and platform-stable where the float is neither.
-
-    ``None`` means "cannot prove anything about this file", and every caller
-    must treat it as changed rather than as unchanged.
-
-    **Accepted blind spot.** A stamp answers "same file, untouched?" cheaply,
-    and buys that cheapness the same way ``cachekey.fingerprint_pcap`` buys
-    its own: with a named, pinned residual rather than a proof. An in-place
-    rewrite that keeps the inode *and* ends with the original ``st_mtime_ns``
-    stamps as unchanged — ``os.utime`` restores it outright, an archiver or a
-    ``rsync --times`` puts it back, and a coarse-mtime filesystem can hand two
-    genuinely different states one timestamp. The consequence for
-    :func:`apply_attachments` is one bare ATTACH of an altered peer per such
-    rewrite; ``tests/test_workspace_attach.py::TestStampBlindSpot`` constructs
-    exactly that and asserts the peer is attached unvalidated, so the
-    limitation is executable rather than aspirational, with a companion test
-    showing the same rewrite *without* the timestamp restored still
-    revalidates. Closing it would need a content digest of the peer on every
-    connection open, which is the catalog read this gate exists to avoid, only
-    dearer. A caller who cannot rule out a timestamp-preserving rewrite of a
-    peer should :meth:`~remora.workspace.workspace.Workspace.detach` and
-    attach it again, which revalidates unconditionally.
-    """
-    try:
-        st = os.stat(path)
-    except OSError:
-        return None
-    return (st.st_dev, st.st_ino, st.st_mtime_ns)
-
 
 def is_duplicate_database_error(exc: BaseException) -> bool:
     """Is ``exc`` DuckDB refusing an ATTACH because the alias is already live?
@@ -214,17 +184,10 @@ class Attachment:
         path: The attached file, always resolved with :func:`os.path.realpath`
             so it compares equal to the path DuckDB reports back in
             ``duckdb_databases()``.
-        stamp: What :func:`file_stamp` returned for ``path`` when the attach was
-            validated, or ``None`` when it is not known. :func:`apply_attachments`
-            revalidates on replay unless the stamp is present and still matches,
-            so ``None`` — the default, and what a caller building an
-            ``Attachment`` by hand gets — means "revalidate every time", which is
-            the safe direction.
     """
 
     alias: str
     path: Path
-    stamp: FileStamp | None = None
 
 
 def validate_alias(alias: str) -> None:
@@ -334,37 +297,34 @@ def apply_attachments(con: DuckDBPyConnection, attachments: Iterable[Attachment]
     quietly accepting a writable one, is the failure this verification exists
     to prevent.
 
-    A compatibility check runs only when the peer file may have changed since
-    the attach was recorded. :func:`attach_database` validated it then, and
-    re-running :func:`check_compatible` on every connection would put a catalog
-    read on the hot path of every query — but "validated then" is a statement
-    about a *file*, and in ``"rw"`` mode, where nothing is attached and nothing
-    is locked between operations, the file at that path can be replaced. So each
-    replay compares :func:`file_stamp` against the recorded
-    :attr:`Attachment.stamp`: equal means the same inode, untouched, and takes
-    the bare ATTACH; anything else — a different inode, a newer mtime, a stamp
-    that was never recorded, or a file that cannot be stat'ed at all — takes the
-    full :func:`attach_database` path and is revalidated. One ``stat`` per
-    attachment per connection, versus a catalog read; and never a blind
-    re-attach, which is what let a foreign replacement surface as a raw binder
-    error from inside ``alias.meta.fields``. A changed peer stays on the
-    revalidating path until it is re-attached: the record is the caller's and is
-    not rewritten from here.
+    Every ATTACH this issues goes through :func:`attach_database`, so every
+    file it attaches is validated **after** it is open and read-locked. There
+    is deliberately no cheaper path for a peer believed unchanged: any such
+    test would run before the ATTACH, and the ATTACH reopens the path, so the
+    file tested and the file attached are two different questions (see the
+    module docstring for the withdrawn stamp scheme and the measurement).
+    Validating what was actually attached is what makes "a replaced peer is
+    never attached blind" true rather than likely.
 
-    Two residuals, both accepted and stated rather than implied. The stamp's own
-    blind spot is documented on :func:`file_stamp`: a rewrite that keeps the
-    inode and restores the mtime takes the bare ATTACH. And the gate is
-    **check-then-act** — the file can be swapped between the ``stat`` and the
-    ``ATTACH``, in which case the replacement is attached unvalidated. That
-    window is not closable here, for the same reason ``export.py``'s destination
-    check was not: DuckDB opens the peer *by path*, there is no "attach this
-    inode", and no amount of checking harder removes the gap. ``export.py``
-    escaped its own by writing somewhere private and renaming, which has no
-    analogue when the file to open is the caller's, not ours. What bounds it is
-    scope rather than probability: it is one connection body wide, because the
-    ATTACH's shared read lock then holds the peer for as long as the attachment
-    lives, and the *next* replay stats the swapped-in file, sees a stamp that no
-    longer matches the record, and revalidates.
+    **A live alias binds to the file it was attached to, not to the pathname.**
+    When the instance already holds the alias, this compares the attached path
+    and read-only flag and then leaves it alone — it does not ask whether the
+    recorded pathname still resolves to that same file. If a peer is replaced
+    at its path while another connection keeps the alias attached, the alias
+    goes on serving the old, already-validated file, and ``attachments``
+    reports a path whose current contents are not what queries against the
+    alias see. That is the contract rather than an oversight, for three
+    reasons: the alias belongs to the *instance*, so detaching it to re-attach
+    the replacement would yank it out from under every other connection using
+    it; the file in use was validated when it was attached, so nothing
+    unchecked is being read; and ``"ro"`` mode never re-attaches at all, so
+    refusing here would make the guarantee hold in one mode and not the other,
+    which is worse than a guarantee stated plainly. The remedy for a caller who
+    wants the replacement is
+    :meth:`~remora.workspace.workspace.Workspace.detach` and attach again,
+    which validates the new file.
+    ``tests/test_workspace_attach.py::TestLiveAliasBindsToTheAttachedFile``
+    pins it.
 
     Args:
         con: A freshly opened connection to the primary workspace.
@@ -373,9 +333,10 @@ def apply_attachments(con: DuckDBPyConnection, attachments: Iterable[Attachment]
     Raises:
         WorkspaceAliasError: If an alias is already attached to a different file
             or is attached writable, or is not a valid alias.
-        SchemaVersionError: If a peer that changed since the attach was recorded
-            is no longer a workspace of this layout version. The alias is
-            detached again, so a refused replay leaves nothing behind.
+        SchemaVersionError: If a peer this replay attaches is not a workspace of
+            this layout version — whether it changed since the attach was
+            recorded or the caller never validated it. The alias is detached
+            again, so a refused replay leaves nothing behind.
         duckdb.Error: If DuckDB refuses an ATTACH — a peer that no longer
             exists, or a lock held by another process's writer.
             ``Workspace.read``/``Workspace.write`` translate these; a caller
@@ -385,14 +346,7 @@ def apply_attachments(con: DuckDBPyConnection, attachments: Iterable[Attachment]
     for attachment in attachments:
         current = live.get(attachment.alias)
         if current is None:
-            if attachment.stamp is not None and file_stamp(attachment.path) == attachment.stamp:
-                validate_alias(attachment.alias)
-                con.execute(
-                    f"ATTACH '{_quote_path(str(attachment.path))}' "
-                    f"AS {_quote_ident(attachment.alias)} (READ_ONLY)"
-                )
-            else:
-                attach_database(con, attachment)
+            attach_database(con, attachment)
             continue
         path, read_only = current
         if path != os.path.realpath(attachment.path) or not read_only:

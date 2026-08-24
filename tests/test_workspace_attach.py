@@ -18,12 +18,11 @@ from remora.workspace.attach import (
     attach_database,
     attached_databases,
     detach_database,
-    file_stamp,
     is_duplicate_database_error,
     validate_alias,
 )
 from remora.workspace.errors import SchemaVersionError, WorkspaceAliasError, WorkspaceError
-from remora.workspace.schema import create_schema
+from remora.workspace.schema import SCHEMA_VERSION, check_compatible, create_schema
 from remora.workspace.workspace import Mode, Workspace
 
 if TYPE_CHECKING:
@@ -576,17 +575,9 @@ class TestReplayRevalidation:
     lock, so the file can be replaced at the same path; before the fix the
     replacement was re-attached blind, and a foreign one surfaced as the raw
     ``Catalog Error: … schema "meta" does not exist`` that ``attach_database``'s
-    refusal exists to prevent. The cheap close is an identity+mtime stamp
-    recorded at attach time and one ``stat`` per attachment per connection.
+    refusal exists to prevent. The close is to validate every file a replay
+    attaches, after the ATTACH has opened and read-locked it.
     """
-
-    def test_attach_records_the_peers_stamp(self, tmp_path: Path) -> None:
-        peer = make_workspace(tmp_path / "peer.duckdb")
-        with Workspace(make_workspace(tmp_path / "ws.duckdb"), mode="rw") as ws:
-            ws.attach(peer, "peer")
-            recorded = ws._attachments["peer"]
-        assert recorded.stamp is not None
-        assert recorded.stamp == file_stamp(Path(os.path.realpath(peer)))
 
     def test_foreign_replacement_is_refused_on_replay(self, tmp_path: Path) -> None:
         peer = make_workspace(tmp_path / "peer.duckdb")
@@ -626,54 +617,47 @@ class TestReplayRevalidation:
             with ws.read() as connection:
                 assert "peer" not in attached_databases(connection)
 
-    def test_an_unchanged_peer_is_not_revalidated(
+    def test_every_replay_validates_what_it_attached(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # The whole point of the stamp: the common case still costs one stat,
-        # not the catalog read apply_attachments was written to avoid.
+        """No fast path: the check runs on every ATTACH a replay issues.
+
+        The withdrawn stamp scheme skipped it for a peer whose
+        ``(st_dev, st_ino, st_mtime_ns)`` still matched, which is a statement
+        about the file *before* the ATTACH reopened the path. This counts the
+        calls rather than faking one, so it fails if any such short-circuit
+        comes back.
+        """
+        calls = 0
+        real = check_compatible
+
+        def counting(connection: DuckDBPyConnection, *, database: str | None = None) -> None:
+            nonlocal calls
+            calls += 1
+            real(connection, database=database)
+
         peer = make_workspace(tmp_path / "peer.duckdb")
         with Workspace(make_workspace(tmp_path / "ws.duckdb"), mode="rw") as ws:
             ws.attach(peer, "peer")
+            monkeypatch.setattr(attach_module, "check_compatible", counting)
+            for _ in range(3):
+                with ws.read() as connection:
+                    assert connection.execute(
+                        'SELECT count(*) FROM "peer".main.pkts'
+                    ).fetchone() == (0,)
+        assert calls == 3, "each replayed ATTACH must validate the file it attached"
 
-            def forbidden(connection: DuckDBPyConnection, *, database: str | None = None) -> None:
-                raise AssertionError("an unchanged peer must not be revalidated")
-
-            monkeypatch.setattr(attach_module, "check_compatible", forbidden)
-            with ws.read() as connection:
-                assert connection.execute('SELECT count(*) FROM "peer".main.pkts').fetchone() == (
-                    0,
-                )
-
-    def test_an_attachment_without_a_stamp_is_revalidated(
+    def test_an_unstattable_peer_is_refused_not_attached(
         self, con: DuckDBPyConnection, tmp_path: Path
     ) -> None:
-        # A caller building an Attachment by hand gets the safe default: no
-        # stamp means "cannot prove it is unchanged", so it is revalidated.
-        peer_path = make_peer(tmp_path / "peer.duckdb", version="1")
-        with pytest.raises(SchemaVersionError, match="older remora"):
-            apply_attachments(con, [Attachment("peer", peer_path)])
-        assert "peer" not in attached_databases(con)
-
-    def test_an_unstattable_peer_is_revalidated_not_trusted(
-        self, con: DuckDBPyConnection, tmp_path: Path
-    ) -> None:
-        # A peer that cannot be stat'ed has no comparable stamp, so it takes the
-        # revalidating path; here the ATTACH itself is what fails, which is the
+        # A peer that is gone fails on the ATTACH itself, which is the
         # documented degradation — never a blind re-attach.
         gone = tmp_path / "gone.duckdb"
-        stamp = file_stamp(make_peer(gone))
+        make_peer(gone)
         gone.unlink()
-        assert file_stamp(gone) is None
         with pytest.raises(duckdb.Error):
-            apply_attachments(con, [Attachment("peer", gone, stamp)])
-
-    def test_file_stamp_moves_when_the_file_is_replaced(self, tmp_path: Path) -> None:
-        path = make_peer(tmp_path / "peer.duckdb")
-        before = file_stamp(path)
-        path.unlink()
-        make_peer(path)
-        assert before is not None
-        assert file_stamp(path) != before
+            apply_attachments(con, [Attachment("peer", gone)])
+        assert "peer" not in attached_databases(con)
 
 
 def rewrite_in_place(target: Path, source: Path) -> None:
@@ -691,62 +675,119 @@ def rewrite_in_place(target: Path, source: Path) -> None:
         os.fsync(handle.fileno())
 
 
-class TestStampBlindSpot:
-    """#100: the stamp's accepted residual, pinned rather than claimed closed.
+class TestReplayValidatesWhatItAttached:
+    """#100 P1: the adversarial cases a pre-ATTACH check cannot catch.
 
-    ``(st_dev, st_ino, st_mtime_ns)`` answers "same file, untouched?" for one
-    ``stat``, and buys that cheapness the way ``cachekey.fingerprint_pcap`` buys
-    its own — with a residual that is named and executable rather than
-    aspirational (``TestFingerprint::test_middle_change_does_not_flip`` and
-    ``TestInheritedFingerprintBlindSpot`` are the precedent, companion test
-    included). Here the residual is an in-place rewrite at the same inode whose
-    mtime is *restored*: ``os.utime``, an archiver replaying timestamps, or a
-    coarse-mtime filesystem. Closing it would need a content digest of the peer
-    on every connection open — the catalog read this gate exists to avoid, only
-    dearer — so it is accepted, and a caller who cannot rule it out should
-    detach and attach again, which revalidates unconditionally.
+    Validation runs *after* the ATTACH, on the open, read-locked peer, so the
+    file checked is the file attached. These pin the two shapes that defeated
+    the withdrawn stamp scheme — a replacement disguised to look identical on
+    disk, and one that could be swapped in after any pre-check had run — and
+    both fail against a stamp fast path.
     """
 
-    def test_same_inode_rewrite_with_restored_mtime_is_attached_blind(self, tmp_path: Path) -> None:
+    def test_a_replacement_disguised_with_the_original_metadata_is_refused(
+        self, tmp_path: Path
+    ) -> None:
+        # The strongest disguise available to an adversary short of forging the
+        # file's contents: same inode (written through an open handle, so no
+        # replacement is even visible) and the original mtime restored to the
+        # nanosecond. Every pre-ATTACH test of the path passes; the peer is
+        # still an incompatible workspace, and validating the attached file is
+        # what sees that.
         peer = make_workspace(tmp_path / "peer.duckdb")
         with Workspace(make_workspace(tmp_path / "ws.duckdb"), mode="rw") as ws:
             ws.attach(peer, "peer")
-            recorded = ws._attachments["peer"].stamp
             before = os.stat(peer)
-
-            # A v1 workspace — what check_compatible exists to refuse — written
-            # into the peer's own inode, with the timestamp put back afterwards.
             rewrite_in_place(peer, make_peer(tmp_path / "v1.duckdb", version="1"))
-            assert file_stamp(peer) != recorded, "the rewrite must move the mtime"
             os.utime(peer, ns=(before.st_atime_ns, before.st_mtime_ns))
-            assert file_stamp(peer) == recorded, "the blind spot must be armed"
+            after = os.stat(peer)
+            assert (after.st_dev, after.st_ino, after.st_mtime_ns) == (
+                before.st_dev,
+                before.st_ino,
+                before.st_mtime_ns,
+            ), "the disguise must be perfect for this to be the adversarial case"
 
-            # No revalidation, so the incompatible peer is attached and usable.
-            with ws.read() as connection:
-                assert connection.execute(
-                    "SELECT value FROM \"peer\".meta.info WHERE key = 'schema_version'"
-                ).fetchone() == ("1",)
-
-    def test_the_same_rewrite_without_restoring_the_mtime_is_refused(self, tmp_path: Path) -> None:
-        # The companion: identical edit, timestamp left alone. The blind spot is
-        # the restored mtime specifically, not in-place rewrites generally.
-        peer = make_workspace(tmp_path / "peer.duckdb")
-        with Workspace(make_workspace(tmp_path / "ws.duckdb"), mode="rw") as ws:
-            ws.attach(peer, "peer")
-            rewrite_in_place(peer, make_peer(tmp_path / "v1.duckdb", version="1"))
             with pytest.raises(SchemaVersionError, match="cannot re-attach 'peer'"), ws.read():
                 pass  # pragma: no cover - the body is never reached
 
-    def test_detaching_and_attaching_again_revalidates_unconditionally(
-        self, tmp_path: Path
+    def test_a_replacement_landing_between_the_last_check_and_the_attach(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # The documented remedy for a caller who cannot rule the blind spot out.
+        """The TOCTOU interposition, at the exact instant that defeats a pre-check.
+
+        ``validate_alias`` is the last call before the ``ATTACH`` statement is
+        issued, in this implementation and in the withdrawn stamp one alike, so
+        swapping the file there lands strictly *after* any pre-ATTACH
+        inspection and strictly *before* DuckDB opens the path — which is
+        precisely the window a check-then-act gate leaves open. The seam only
+        chooses **when** the file changes; the real function still runs and the
+        assertion is the refusal, not the seam. This is the case that fails
+        against a stamp fast path, which compared its stamp before this point.
+        """
         peer = make_workspace(tmp_path / "peer.duckdb")
         with Workspace(make_workspace(tmp_path / "ws.duckdb"), mode="rw") as ws:
             ws.attach(peer, "peer")
-            before = os.stat(peer)
+            real = attach_module.validate_alias
+            swapped = False
+
+            def swap_then_validate(alias: str) -> None:
+                nonlocal swapped
+                real(alias)
+                if not swapped:
+                    swapped = True
+                    os.replace(make_peer(tmp_path / "v1.duckdb", version="1"), peer)
+
+            monkeypatch.setattr(attach_module, "validate_alias", swap_then_validate)
+            with pytest.raises(SchemaVersionError, match="cannot re-attach 'peer'"), ws.read():
+                pass  # pragma: no cover - the body is never reached
+        assert swapped, "the interposition must actually have run"
+
+
+class TestLiveAliasBindsToTheAttachedFile:
+    """#100 P2: what a live shared-instance alias does when its path changes.
+
+    An ATTACH belongs to the database *instance*, so an alias another
+    connection holds is left alone by replay. The decided contract is that such
+    an alias goes on serving the file it was attached to — which was validated
+    when it was attached — rather than being refused because the pathname now
+    resolves elsewhere. Refusing would detach an alias out from under other
+    connections using it, and ``"ro"`` mode never re-attaches at all, so the
+    refusal would hold in one mode and not the other.
+    """
+
+    def test_a_live_alias_keeps_serving_the_file_it_was_attached_to(self, tmp_path: Path) -> None:
+        peer = make_workspace(tmp_path / "peer.duckdb")
+        primary = make_workspace(tmp_path / "ws.duckdb")
+        with Workspace(primary, mode="rw") as ws:
+            ws.attach(peer, "peer")
+            # A caller's own connection keeps the instance — and the alias —
+            # alive across the replacement below.
+            outside = duckdb.connect(str(primary))
+            try:
+                outside.execute(f"ATTACH '{peer}' AS peer (READ_ONLY)")
+                # A pathname replacement: a *new inode* at the recorded path,
+                # which is what leaves the open one still reachable. (An
+                # in-place rewrite of the bytes under a live attachment is a
+                # different thing entirely — DuckDB reads them through its own
+                # open descriptor — and nothing here can defend against a raw
+                # write into a database file that is open.)
+                os.replace(make_peer(tmp_path / "v1.duckdb", version="1"), peer)
+                # Replay leaves the live alias alone, and it still serves the
+                # validated file rather than the replacement now at that path.
+                with ws.read() as connection:
+                    assert connection.execute(
+                        "SELECT value FROM \"peer\".meta.info WHERE key = 'schema_version'"
+                    ).fetchone() == (str(SCHEMA_VERSION),)
+            finally:
+                outside.close()
+
+    def test_detaching_and_attaching_again_picks_up_the_replacement(self, tmp_path: Path) -> None:
+        # The documented remedy, and proof the replacement is validated when it
+        # is finally attached rather than adopted silently.
+        peer = make_workspace(tmp_path / "peer.duckdb")
+        with Workspace(make_workspace(tmp_path / "ws.duckdb"), mode="rw") as ws:
+            ws.attach(peer, "peer")
             rewrite_in_place(peer, make_peer(tmp_path / "v1.duckdb", version="1"))
-            os.utime(peer, ns=(before.st_atime_ns, before.st_mtime_ns))
             ws.detach("peer")
             with pytest.raises(SchemaVersionError, match="older remora"):
                 ws.attach(peer, "peer")
@@ -779,7 +820,6 @@ class TestPackageExports:
             "attach_database",
             "attached_databases",
             "detach_database",
-            "file_stamp",
             "is_duplicate_database_error",
             "qualify",
             "validate_alias",

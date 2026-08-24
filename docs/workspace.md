@@ -593,12 +593,19 @@ An attachment is recorded and replayed onto every connection the workspace
 opens, so it outlives the short-lived connections `rw` mode uses. Two things
 follow. The peer's identity and mtime are recorded alongside its path, and a
 peer *replaced* at that path in between is re-checked before it is used rather
-than trusted — with two accepted blind spots, each one connection body wide: a
-rewrite that keeps the inode and *restores* the mtime reads as untouched, and a
-peer swapped between the check and the `ATTACH` is attached unchecked (DuckDB
-opens it by path, so that window narrows rather than closes). Both are pinned by
-tests; if you cannot rule either out, `detach()` and attach again, which
-revalidates unconditionally. And because the replay runs on every connection, an attachment
+than trusted: every ATTACH a replay issues is validated, and validated *after*
+the file is open, so what gets checked is what actually got attached — no
+disguise on disk (same inode, restored timestamps) and no swap timed against
+the check can slip a foreign or stale peer past it.
+
+One consequence to know: an attachment binds to the **file** it attached, not to
+the pathname. While an alias is live — continuously in `ro` mode, for the
+duration of a body in `rw` — replacing the file at its path does not change what
+the alias serves, and `attachments` will report a path whose current contents
+are not what your queries see. `detach()` and attach again to pick up a
+replacement; that validates the new file.
+
+And because the replay runs on every connection, an attachment
 DuckDB can no longer honour — a deleted peer, one another process now holds
 read-write — fails whatever you were doing, including operations that never
 mention it; that reads as a `WorkspaceError` naming the alias, the path and the

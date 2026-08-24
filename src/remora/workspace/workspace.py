@@ -46,7 +46,6 @@ import stat
 import threading
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from types import TracebackType
@@ -63,7 +62,6 @@ from remora.workspace.attach import (
     apply_attachments,
     attach_database,
     detach_database,
-    file_stamp,
     is_duplicate_database_error,
     validate_alias,
 )
@@ -919,26 +917,21 @@ class Workspace:
         Attachments are recorded on this workspace and replayed onto every
         connection it opens, because a DuckDB attachment belongs to the
         *database instance* rather than the connection and ``"rw"`` mode holds
-        no connection between operations. :meth:`close` clears them. The peer's
-        ``(st_dev, st_ino, st_mtime_ns)`` stamp is recorded alongside the path,
-        so a replay can tell "the same file, untouched" — which takes the bare
-        ATTACH — from a file replaced at that path in between, which is
-        revalidated against this library's layout version before it is used. A
-        replay that fails names the alias, the path and :meth:`detach` as the
-        remedy; see :meth:`read` and :meth:`write`.
+        no connection between operations. :meth:`close` clears them. Each replay
+        validates the file it attaches, after the ATTACH has opened and
+        read-locked it — so a peer *replaced* at its path between operations is
+        refused rather than adopted, however closely the replacement resembles
+        the original on disk. A replay that fails names the alias, the path and
+        :meth:`detach` as the remedy; see :meth:`read` and :meth:`write`.
 
-        That stamp is a cheap check rather than a proof, and it has two accepted
-        blind spots, both a single connection body wide and both pinned by
-        tests. A peer rewritten in place at the same inode whose mtime is
-        *restored* (``os.utime``, an archiver, a coarse-mtime filesystem) reads
-        as untouched and is re-attached unvalidated. And the check is
-        check-then-act: a peer swapped between the ``stat`` and the ``ATTACH``
-        is attached unvalidated too — unclosable here, since DuckDB opens the
-        peer by path — after which the shared read lock holds it and the next
-        replay sees the new stamp and revalidates. A caller who cannot rule
-        either out should :meth:`detach` the peer and attach it again, which
-        revalidates unconditionally; see
-        :func:`remora.workspace.attach.file_stamp`.
+        One consequence worth knowing: an attachment binds to the **file** that
+        was attached, not to the pathname. While an alias stays live on the
+        database instance — continuously in ``"ro"`` mode, and for the duration
+        of a body in ``"rw"`` — a replacement at its path does not change what
+        the alias serves, and :attr:`attachments` goes on reporting a path
+        whose current contents are not what queries against that alias see.
+        :meth:`detach` and attach again to pick the replacement up; see
+        :func:`remora.workspace.attach.apply_attachments`.
 
         **What an attachment costs.** It takes a shared read lock on the
         attached file for as long as it stays attached — which is for as long
@@ -1053,10 +1046,6 @@ class Workspace:
                         f"one shares — detach it there, or choose another alias"
                     ) from exc
                 raise WorkspaceError(f"cannot attach {path} as {alias!r}: {exc}") from exc
-            # Stamped here, inside the connection block: the peer is attached
-            # and read-locked at this instant, so the stamp describes exactly
-            # the file check_compatible just accepted.
-            attachment = replace(attachment, stamp=file_stamp(resolved))
         # Recorded only after the connection block, so a refused attach leaves
         # nothing behind for the next connection to replay.
         self._attachments[alias] = attachment

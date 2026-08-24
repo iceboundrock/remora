@@ -35,12 +35,10 @@ from remora.workspace.annotations import (
 from remora.workspace.attach import (
     RESERVED_ALIASES,
     Attachment,
-    FileStamp,
     apply_attachments,
     attach_database,
     attached_databases,
     detach_database,
-    file_stamp,
     is_duplicate_database_error,
     validate_alias,
 )
@@ -138,7 +136,6 @@ __all__ = [
     "FieldDeclarationMismatchError",
     "FieldNotMaterializedError",
     "FieldRecord",
-    "FileStamp",
     "MaterializationMismatchError",
     "MaterializeOutcome",
     "MaterializeResult",
@@ -169,7 +166,6 @@ __all__ = [
     "detach_database",
     "detect_tshark_version",
     "export_parquet",
-    "file_stamp",
     "find_collisions",
     "find_covering_cache_key",
     "fingerprint_pcap",
