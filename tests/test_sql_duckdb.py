@@ -237,14 +237,21 @@ class TestMultiOrderedComparisonAgainstRealDuckDB:
     The float version is covered by ``TestNaNAgainstRealDuckDB``, where the
     ``NOT isnan(x)`` guard is the point. This is the *unguarded* shape — an
     integer LIST column — which was pinned only as a string, so nothing checked
-    that DuckDB reads it as any-occurrence rather than all-occurrence, or that
-    an empty list and a back-filled NULL both fall out of it.
+    that DuckDB reads it as any-occurrence rather than all-occurrence.
+
+    Absence reaches this shape in **two** forms and both are executed here: a
+    row materialized while the field was absent holds ``[]``, and a row that
+    predates the column holds the ``NULL`` its ``ALTER TABLE ... ADD COLUMN``
+    back-filled. They are not interchangeable — ``[]`` makes the leaf ``FALSE``
+    where ``NULL`` makes it ``NULL`` — so the negated form is where they could
+    part company, and ``coalesce(..., FALSE)`` is what stops them.
     """
 
     @pytest.fixture
     def seeded(self, con: DuckDBPyConnection) -> DuckDBPyConnection:
-        # Row 3 is materialized-absent ([]); no row here is NULL — that is the
-        # back-filled case, covered by TestMultiPresenceAgainstRealDuckDB.
+        # Row 3 is materialized-absent ([]). The back-filled NULL row cannot be
+        # produced this way — every row here is written after the column
+        # exists — so it gets its own fixture below.
         materialize(
             con,
             (PORTS,),
@@ -255,6 +262,19 @@ class TestMultiOrderedComparisonAgainstRealDuckDB:
                 {},
             ),
         )
+        return con
+
+    @pytest.fixture
+    def back_filled(self, con: DuckDBPyConnection) -> DuckDBPyConnection:
+        """Row 0 predates the column (NULL), row 1 is absent ([]), row 2 has ports."""
+        spec = column_spec(PORTS.name, PORTS.ftype, PORTS.multi)
+        con.execute('INSERT INTO main.pkts ("frame_number") VALUES (0)')
+        add_field_column(con, spec.column_name, spec.sql_type)
+        for frame_number, raw in ((1, ()), (2, ("80", "443"))):
+            con.execute(
+                f'INSERT INTO main.pkts ("frame_number", "{spec.column_name}") VALUES (?, ?)',
+                [frame_number, spec.encode_raw(raw)],
+            )
         return con
 
     def test_gt_matches_on_any_occurrence(self, seeded: DuckDBPyConnection) -> None:
@@ -283,6 +303,52 @@ class TestMultiOrderedComparisonAgainstRealDuckDB:
         # list_filter over [] is [], so len(...) > 0 is false — not NULL, which
         # is why the negated form selects the row rather than dropping it.
         assert select(seeded, ~(PORTS > 1024)) == {1, 3}
+
+    def test_the_two_absences_really_are_null_and_empty(
+        self, back_filled: DuckDBPyConnection
+    ) -> None:
+        rows = back_filled.execute(
+            'SELECT frame_number, "tcp_port" FROM main.pkts ORDER BY frame_number'
+        ).fetchall()
+        assert [(int(number), value) for number, value in rows] == [
+            (0, None),
+            (1, []),
+            (2, [80, 443]),
+        ]
+
+    def test_positive_ordered_comparison_excludes_the_back_filled_row(
+        self, back_filled: DuckDBPyConnection
+    ) -> None:
+        # len(list_filter(NULL, ...)) > 0 is NULL, which the WHERE clause filters
+        # out — the same answer the other two backends give for an absent field,
+        # and the reason a positive leaf needs no coalesce (#36).
+        assert select(back_filled, PORTS > 100) == {2}
+
+    def test_negated_ordered_comparison_includes_the_back_filled_row(
+        self, back_filled: DuckDBPyConnection
+    ) -> None:
+        # The case three-valued SQL could get wrong: NOT (NULL) is NULL, so
+        # without #36's coalesce the back-filled row would drop out where
+        # Wireshark and the predicate backend include a packet missing the
+        # field. Both absences must come back, and for the same reason.
+        assert select(back_filled, ~(PORTS > 100)) == {0, 1}
+
+    def test_the_null_the_coalesce_exists_for_is_real(
+        self, back_filled: DuckDBPyConnection
+    ) -> None:
+        # The unguarded leaf, run directly: NULL for the back-filled row and
+        # FALSE for the materialized-absent one. Proven rather than asserted
+        # about, so the coalesce above is visibly load-bearing on this shape
+        # too — presence is not the only place it matters.
+        rows = back_filled.execute(
+            'SELECT frame_number, len(list_filter("tcp_port", x -> x > 100)) > 0 '
+            "FROM main.pkts ORDER BY frame_number"
+        ).fetchall()
+        assert [(int(number), flag) for number, flag in rows] == [
+            (0, None),
+            (1, False),
+            (2, True),
+        ]
 
 
 class TestMultiPresenceAgainstRealDuckDB:
