@@ -67,11 +67,20 @@ Rendering rules
 
 Parameter encoding
 ------------------
-A literal is normalized once with :func:`remora.values.coerce_literal` (so
+Every literal takes one two-step path, whichever node it sits in: ``_coerce``
+normalizes it with :func:`remora.values.coerce_literal` (so
 ``IP.src == "10.0.0.1"`` binds an integer address and ``"not-an-ip"`` is
-rejected), then encoded with :mod:`remora.workspace.types`' codec for the ftype
-— the same encoder the materialize path writes the column with, so a bound value
-and a stored value can never disagree.
+rejected), and ``_encode_coerced`` then encodes it with
+:mod:`remora.workspace.types`' codec for the ftype — the same encoder the
+materialize path writes the column with, so a bound value and a stored value can
+never disagree.
+
+The two halves are separate rather than one call because the value *between*
+them is needed on its own: the NaN test below and a range's inversion check both
+read the coerced form. Folding them back together would force the range branch
+to inline its own coerce and reach for the codec directly, which is what it used
+to do — one more call site for a change to the shared pipeline to miss, and one
+more literal coerced twice.
 
 ``FT_IPv6`` is the one ftype whose encoder emits **decimal text** rather than the
 ``int`` its ``UHUGEINT`` column suggests (see
@@ -130,7 +139,11 @@ Python semantics — the predicate backend is the reference:
   every row, absent ones included — exactly the predicate backend's ``not False``.
 - **A stored NaN is excluded from ``>`` and ``>=``** by a ``NOT isnan(...)``
   guard on float columns: scalar ``("col" > ? AND NOT isnan("col"))``, multi
-  ``x -> x > ? AND NOT isnan(x)``. Without it, NaN sorting greatest makes
+  ``x -> x > ? AND NOT isnan(x)``. Which ftypes those are is read from #26's
+  :data:`remora.workspace.types.COLUMN_TYPES` — every ftype whose column is
+  ``DOUBLE`` — rather than from the Python type
+  :mod:`remora.values` parses into, because ``isnan()`` runs on the column.
+  Without it, NaN sorting greatest makes
   ``"col" > ?`` true for a stored NaN against *any* literal, where Python's
   ``nan > 0.5`` is false.
 - **``<``, ``<=``, ``BETWEEN`` and ``=`` need no guard, deliberately.** NaN
@@ -202,8 +215,13 @@ the expression" — an unknown ``Expr`` node, a ``Matches`` *pattern* DuckDB's R
 engine cannot run *or* cannot agree about (what
 :func:`remora.compile.re2.unportable_reason` names: lookarounds, repeats above
 1000, and any non-ASCII character — ``Matches`` itself is no longer refused
-categorically), and ``Contains`` on a ``BLOB`` column
-(DuckDB's ``contains`` takes ``VARCHAR`` or ``LIST``, not ``BLOB``). User errors
+categorically), and ``Contains`` on a ``BLOB`` column: on a bytes field
+``contains`` means a byte *subsequence*, and DuckDB has no subsequence match
+over ``BLOB`` — its ``contains()`` is substring on ``VARCHAR`` and element
+membership on ``LIST``, so a multi-value ``BLOB[]`` column would even be
+*accepted*, with the wrong meaning. The refusal names the column type the query
+would have run against (``BLOB[]``, not ``BLOB``, for such a column), which is
+why it passes ``field.multi`` to :func:`column_sql_type`. User errors
 — a malformed literal such as ``IP.src == "not-an-ip"``, a ``contains`` needle
 whose type does not match the field, or ``matches`` on a non-string field —
 surface as the ``ValueError``/``TypeError`` the sibling backends raise and are
@@ -235,7 +253,7 @@ from remora.expr import (
     ValueRange,
 )
 from remora.workspace.naming import column_name
-from remora.workspace.types import column_sql_type, get_column_type
+from remora.workspace.types import COLUMN_TYPES, column_sql_type, get_column_type
 
 __all__ = ["SqlPredicate", "UnsupportedSqlExprError", "compile_sql"]
 
@@ -282,11 +300,17 @@ _LAMBDA_VAR: Final[str] = "x"
 #: Python, so the predicate *is* this constant). Self-delimiting like every leaf.
 _FALSE: Final[str] = "FALSE"
 
+#: The one column type ``isnan()`` applies to, as #26 spells it.
+_DOUBLE_SQL_TYPE: Final[str] = "DOUBLE"
+
 #: FTypes whose column holds a float and can therefore hold a NaN. Derived from
-#: the ftype table rather than listed, so a float ftype added to
-#: :mod:`remora.values` cannot silently escape the NaN rules.
+#: the *column* table rather than listed, so a float ftype added to
+#: :mod:`remora.values` cannot silently escape the NaN rules — and derived from
+#: the SQL type rather than from the Python type because ``isnan()`` is a claim
+#: about the column: it runs on a ``DOUBLE`` column, whatever
+#: :mod:`remora.values` parses that column's text into.
 _FLOAT_FTYPES: Final[frozenset[str]] = frozenset(
-    ftype for ftype, info in values.FTYPE_TABLE.items() if info.py_type is float
+    ftype for ftype, column in COLUMN_TYPES.items() if column.sql_type == _DOUBLE_SQL_TYPE
 )
 
 #: Operators whose DuckDB result on a *stored* NaN disagrees with Python, because
@@ -371,12 +395,13 @@ def _render(expr: Expr, params: list[Any], *, negated: bool = False) -> str:
 def _render_comparison(expr: Comparison, params: list[Any], *, negated: bool) -> str:
     """Render ``field <op> literal`` against a scalar or a LIST column."""
     field = expr.field
-    if _is_nan(values.coerce_literal(field.ftype, expr.value)):
+    coerced = _coerce(field.ftype, expr.value)
+    if _is_nan(coerced):
         # A constant, never NULL, so it is never coalesced.
         return _FALSE
     column = _column(field)
     placeholder = _placeholder(field.ftype)
-    params.append(_encode(field.ftype, expr.value))
+    params.append(_encode_coerced(field.ftype, coerced))
     guard = _needs_nan_guard(field.ftype, expr.op)
     if not field.multi:
         condition = f"{column} {_SQL_OPS[expr.op]} {placeholder}"
@@ -414,24 +439,24 @@ def _render_member(field: FieldLike, column: str, item: MembershipItem, params: 
     ftype = field.ftype
     placeholder = _placeholder(ftype)
     if isinstance(item, ValueRange):
-        lo: Any = values.coerce_literal(ftype, item.lo)
-        hi: Any = values.coerce_literal(ftype, item.hi)
+        lo: Any = _coerce(ftype, item.lo)
+        hi: Any = _coerce(ftype, item.hi)
         # Before the inversion check, not after: every comparison with NaN is
         # false, so `hi < lo` would wave a NaN endpoint straight through.
         if _is_nan(lo) or _is_nan(hi):
             return _FALSE
         if hi < lo:
             raise ValueError(f"inverted membership range: {item.lo!r}..{item.hi!r}")
-        encode = get_column_type(ftype).encode
-        params.append(encode(lo))
-        params.append(encode(hi))
+        params.append(_encode_coerced(ftype, lo))
+        params.append(_encode_coerced(ftype, hi))
         between = f"BETWEEN {placeholder} AND {placeholder}"
         if field.multi:
             return _any_occurrence(column, f"{_LAMBDA_VAR} {between}")
         return f"{column} {between}"
-    if _is_nan(values.coerce_literal(ftype, item)):
+    coerced = _coerce(ftype, item)
+    if _is_nan(coerced):
         return _FALSE
-    params.append(_encode(ftype, item))
+    params.append(_encode_coerced(ftype, coerced))
     if field.multi:
         return f"list_contains({column}, {placeholder})"
     return f"{column} = {placeholder}"
@@ -453,8 +478,11 @@ def _render_contains(expr: Contains, params: list[Any], *, negated: bool) -> str
     if py_type is not str:
         raise UnsupportedSqlExprError(
             f"contains on {field.ftype} is not compiled to SQL: the column is "
-            f"{column_sql_type(field.ftype)} and DuckDB's contains() takes VARCHAR "
-            "or LIST, not BLOB"
+            f"{column_sql_type(field.ftype, field.multi)} and DuckDB has no "
+            "subsequence match over BLOB — its contains() is substring on VARCHAR "
+            "and element membership on LIST, neither of which is the byte "
+            "subsequence contains means on a bytes field; run this filter on the "
+            "pcap path (remora.Capture) instead."
         )
     column = _column(field)
     params.append(needle)
@@ -556,9 +584,45 @@ def _placeholder(ftype: str) -> str:
     return "?"
 
 
-def _encode(ftype: str, value: LiteralValue) -> Any:
-    """Normalize a user literal and encode it the way the column stores it."""
-    return get_column_type(ftype).encode(values.coerce_literal(ftype, value))
+def _coerce(ftype: str, value: LiteralValue) -> Any:
+    """Normalize a user literal for a field's ftype — the first half of the seam.
+
+    Paired with :func:`_encode_coerced`, which every literal then passes
+    through. The two are separate because the value *between* them is needed on
+    its own: a range's inversion check and the NaN test both read the coerced
+    value, and coercing a second time to encode would run
+    :func:`remora.values.coerce_literal` twice and leave a second call site for
+    a future change to miss.
+
+    Args:
+        ftype: tshark ftype of the field the literal is compared against.
+        value: The literal as the caller wrote it.
+
+    Returns:
+        The literal as its ftype's Python type.
+
+    Raises:
+        ValueError: If the literal is malformed for the ftype.
+        TypeError: If the literal's type is wrong for the ftype.
+    """
+    return values.coerce_literal(ftype, value)
+
+
+def _encode_coerced(ftype: str, coerced: Any) -> Any:
+    """Encode an already-coerced literal the way the column stores it.
+
+    The second half of the seam :func:`_coerce` opens. The encoder is the same
+    one the materialize path writes the column with, so a bound value and a
+    stored value can never disagree.
+
+    Args:
+        ftype: tshark ftype of the field the literal is compared against.
+        coerced: The literal, already through :func:`_coerce`.
+
+    Returns:
+        The value to bind, in the column's stored representation.
+    """
+    return get_column_type(ftype).encode(coerced)
 
 
 def _is_nan(value: Any) -> bool:

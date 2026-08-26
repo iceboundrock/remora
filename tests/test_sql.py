@@ -9,13 +9,17 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from ipaddress import IPv4Address, IPv6Address, ip_network
+from typing import Any, Final
 
 import pytest
 
+from remora.compile import sql as sql_backend
 from remora.compile.sql import SqlPredicate, UnsupportedSqlExprError, compile_sql
 from remora.expr import Expr
 from remora.fields import FieldRef
+from remora.values import FTYPE_TABLE
 from remora.workspace.naming import column_name
+from remora.workspace.types import COLUMN_TYPES, column_sql_type
 
 SRC = FieldRef[IPv4Address]("ip.src", "FT_IPv4", False)
 DST = FieldRef[IPv4Address]("ip.dst", "FT_IPv4", False)
@@ -24,6 +28,7 @@ PORT = FieldRef[int]("tcp.port", "FT_UINT16", True)
 HOST = FieldRef[str]("http.host", "FT_STRING", False)
 QNAME = FieldRef[str]("dns.qry.name", "FT_STRING", True)
 PAYLOAD = FieldRef[bytes]("tcp.payload", "FT_BYTES", False)
+PAYLOADS = FieldRef[bytes]("x.chunks", "FT_BYTES", True)
 TIME = FieldRef[datetime]("frame.time", "FT_ABSOLUTE_TIME", False)
 V6SRC = FieldRef[IPv6Address]("ipv6.src", "FT_IPv6", False)
 V6ADDR = FieldRef[IPv6Address]("ipv6.addr", "FT_IPv6", True)
@@ -222,10 +227,24 @@ class TestContains:
         assert result.params == ("example",)
 
     def test_bytes_field_is_unsupported(self) -> None:
-        # DuckDB's contains() takes VARCHAR or LIST, not BLOB, and #26 stores
-        # FT_BYTES as BLOB: refuse rather than emit something that half-works.
-        with pytest.raises(UnsupportedSqlExprError, match="BLOB"):
+        # Wireshark's `contains` on a bytes field is a *subsequence* test, and
+        # #26 stores FT_BYTES as BLOB: DuckDB has no subsequence match over
+        # BLOB, so refuse rather than emit something that half-works.
+        with pytest.raises(UnsupportedSqlExprError, match="BLOB") as exc:
             compile_sql(PAYLOAD.contains(b"\xbb\xcc"))
+        assert "subsequence" in str(exc.value)
+
+    def test_multi_bytes_refusal_names_the_list_column_type(self) -> None:
+        # The refusal names the column the query would run against, so a
+        # multi-value bytes field must read BLOB[], not BLOB. DuckDB's
+        # contains() does accept a LIST — as element membership, which is not
+        # the subsequence test the DSL means — so "takes VARCHAR or LIST" was
+        # the wrong reason to give for exactly this column shape.
+        with pytest.raises(UnsupportedSqlExprError) as exc:
+            compile_sql(PAYLOADS.contains(b"\xbb\xcc"))
+        message = str(exc.value)
+        assert "BLOB[]" in message
+        assert "subsequence" in message
 
     def test_needle_type_mismatch_is_a_user_error(self) -> None:
         # Same timing and same exception type as the dfilter/predicate backends.
@@ -330,11 +349,138 @@ class TestNaN:
         assert result.sql == '"ip_ttl" > ?'
         assert "isnan" not in result.sql
 
-    def test_infinity_needs_no_special_handling(self) -> None:
-        # Both engines order inf identically, so it binds as an ordinary literal.
+    def test_infinity_literal_binds_under_the_usual_column_guard(self) -> None:
+        # An inf *literal* needs no special handling — both engines order inf
+        # identically, so it binds as an ordinary parameter rather than becoming
+        # the FALSE constant a NaN literal becomes. The `NOT isnan(...)` guard is
+        # still emitted, because it is a claim about the *stored* value: `>` on a
+        # float column carries it whatever the literal is.
         result = compile_sql(DVAL > INF)
         assert result.sql == '("x_value" > ? AND NOT isnan("x_value"))'
         assert result.params == (INF,)
+
+
+class TestFloatGuardFollowsTheColumnType:
+    """``NOT isnan(...)`` is a claim about the column, so the set follows #26.
+
+    ``isnan()`` is a DuckDB function over a ``DOUBLE`` column, not a statement
+    about the Python type a literal happens to have, so ``_FLOAT_FTYPES`` is
+    derived from :data:`remora.workspace.types.COLUMN_TYPES`. The two
+    derivations agree today; pinning both directions is what keeps an ftype
+    whose column stops being ``DOUBLE`` from silently keeping the guard, or
+    gaining one it cannot run.
+    """
+
+    def test_the_guarded_set_is_exactly_the_double_columns(self) -> None:
+        double_columns = frozenset(
+            ftype for ftype, column in COLUMN_TYPES.items() if column.sql_type == "DOUBLE"
+        )
+        assert double_columns == sql_backend._FLOAT_FTYPES
+
+    def test_a_float_python_type_always_means_a_double_column(self) -> None:
+        # The invariant the old py_type-derived set silently depended on.
+        for ftype, info in FTYPE_TABLE.items():
+            if info.py_type is float:
+                assert COLUMN_TYPES[ftype].sql_type == "DOUBLE", ftype
+
+    def test_every_guarded_ftype_reports_a_double_column(self) -> None:
+        for ftype in sql_backend._FLOAT_FTYPES:
+            assert column_sql_type(ftype) == "DOUBLE", ftype
+
+
+#: One expression per path a literal can take into the parameter list, with the
+#: number of literals it carries. Used by :class:`TestOneLiteralPipeline`.
+LITERAL_PATHS: Final[list[tuple[Expr, int]]] = [
+    (TTL == 64, 1),
+    (PORT > 1024, 1),
+    (TTL.in_([1, 64]), 2),
+    (PORT.in_([80, 443]), 2),
+    (TTL.in_([(1, 64)]), 2),
+    (PORT.in_([range(8000, 8081)]), 2),
+    (V6SRC == "ff02::1", 1),
+]
+PATH_IDS: Final[list[str]] = [
+    "scalar-comparison",
+    "multi-comparison",
+    "scalar-set",
+    "multi-set",
+    "scalar-range",
+    "multi-range",
+    "cast-ftype",
+]
+
+
+class TestOneLiteralPipeline:
+    """Every literal takes one coerce -> NaN check -> encode path (issue #89).
+
+    The range branch used to inline its own coerce and reach for the codec
+    directly, because the inversion check needs the *coerced* endpoints, so a
+    change to the shared encode step would have skipped ranges entirely. The
+    seam is now two named halves every branch calls, and these tests spy on them
+    rather than on the emitted SQL — the string-pinned tests above already cover
+    the output.
+    """
+
+    @pytest.mark.parametrize(("expr", "literals"), LITERAL_PATHS, ids=PATH_IDS)
+    def test_every_bound_literal_goes_through_the_shared_encode_step(
+        self, monkeypatch: pytest.MonkeyPatch, expr: Expr, literals: int
+    ) -> None:
+        calls: list[Any] = []
+        real = sql_backend._encode_coerced
+
+        def spy(ftype: str, coerced: Any) -> Any:
+            calls.append(coerced)
+            return real(ftype, coerced)
+
+        monkeypatch.setattr(sql_backend, "_encode_coerced", spy)
+        result = compile_sql(expr)
+        assert len(calls) == literals
+        assert len(result.params) == literals
+
+    @pytest.mark.parametrize(("expr", "literals"), LITERAL_PATHS, ids=PATH_IDS)
+    def test_no_literal_is_coerced_twice(
+        self, monkeypatch: pytest.MonkeyPatch, expr: Expr, literals: int
+    ) -> None:
+        # The NaN check needs the coerced value and the encoder needs it too;
+        # coercing once and threading it through is what keeps the two from
+        # disagreeing (and what stops `coerce_literal` running twice per
+        # literal, as the comparison and membership paths used to).
+        calls: list[Any] = []
+        real = sql_backend._coerce
+
+        def spy(ftype: str, value: Any) -> Any:
+            calls.append(value)
+            return real(ftype, value)
+
+        monkeypatch.setattr(sql_backend, "_coerce", spy)
+        compile_sql(expr)
+        assert len(calls) == literals
+
+    def test_a_nan_literal_is_coerced_but_never_encoded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The FALSE constant binds no parameter, so the encode half must not run
+        # — on the comparison path, the membership element path or an endpoint.
+        encoded: list[Any] = []
+        coerced: list[Any] = []
+        real_encode = sql_backend._encode_coerced
+        real_coerce = sql_backend._coerce
+
+        def encode_spy(ftype: str, value: Any) -> Any:
+            encoded.append(value)
+            return real_encode(ftype, value)
+
+        def coerce_spy(ftype: str, value: Any) -> Any:
+            coerced.append(value)
+            return real_coerce(ftype, value)
+
+        monkeypatch.setattr(sql_backend, "_encode_coerced", encode_spy)
+        monkeypatch.setattr(sql_backend, "_coerce", coerce_spy)
+        assert compile_sql(DVAL > NAN) == SqlPredicate("FALSE", ())
+        assert compile_sql(DVAL.in_([NAN])) == SqlPredicate("FALSE", ())
+        assert compile_sql(DVAL.in_([(0.0, NAN)])) == SqlPredicate("FALSE", ())
+        assert encoded == []
+        assert len(coerced) == 4  # one value, one element, two endpoints
 
 
 class TestNullHarmonization:
