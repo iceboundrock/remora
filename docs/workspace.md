@@ -590,13 +590,14 @@ the attached file's schema version is checked at attach time, so a foreign or
 stale file is refused by path rather than surfacing later as a binder error.
 
 An attachment is recorded and replayed onto every connection the workspace
-opens, so it outlives the short-lived connections `rw` mode uses. Two things
-follow. The peer's identity and mtime are recorded alongside its path, and a
-peer *replaced* at that path in between is re-checked before it is used rather
-than trusted: every ATTACH a replay issues is validated, and validated *after*
-the file is open, so what gets checked is what actually got attached — no
-disguise on disk (same inode, restored timestamps) and no swap timed against
-the check can slip a foreign or stale peer past it.
+opens, so it outlives the short-lived connections `rw` mode uses. Every ATTACH a
+replay issues is validated, and validated *after* the file is open — so what
+gets checked is what actually got attached, and a peer replaced at that path in
+between is refused rather than trusted. No disguise on disk (same inode,
+restored timestamps) and no swap timed against the check slips a foreign or
+stale peer past that, because nothing is decided from the file's metadata
+beforehand. A replay that fails detaches whatever it had already attached, so a
+failed operation leaves no half-applied attachments behind.
 
 One consequence to know: an attachment binds to the **file** it attached, not to
 the pathname. While an alias is live — continuously in `ro` mode, for the

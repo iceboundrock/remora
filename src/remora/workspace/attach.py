@@ -106,9 +106,10 @@ exception class — the class is not importable here.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
@@ -127,6 +128,7 @@ __all__ = [
     "attached_databases",
     "detach_database",
     "is_duplicate_database_error",
+    "roll_back_attachments",
     "validate_alias",
 ]
 
@@ -268,7 +270,10 @@ def attach_database(con: DuckDBPyConnection, attachment: Attachment) -> None:
     try:
         check_compatible(con, database=attachment.alias)
     except BaseException:
-        detach_database(con, attachment.alias)
+        # Suppressed, not propagated: the caller needs the reason the file was
+        # refused, not the reason detaching it again went wrong.
+        with contextlib.suppress(Exception):
+            detach_database(con, attachment.alias)
         raise
 
 
@@ -287,7 +292,34 @@ def detach_database(con: DuckDBPyConnection, alias: str) -> None:
         con.execute(f"DETACH {_quote_ident(alias)}")
 
 
-def apply_attachments(con: DuckDBPyConnection, attachments: Iterable[Attachment]) -> None:
+def roll_back_attachments(con: DuckDBPyConnection, aliases: Sequence[str]) -> None:
+    """Detach ``aliases`` in reverse order, never raising.
+
+    The undo half of a failed batch of ATTACHes, in one place because two
+    scopes need the identical policy: :func:`apply_attachments` over the
+    attachments of one call, and ``Workspace``'s replay over the several calls
+    it makes to name the alias that failed.
+
+    Never raising is the point rather than laziness: this only ever runs while
+    another exception is propagating, and the caller needs to know why the
+    replay failed, not why the tidying afterwards did. Reverse order so aliases
+    go away in the opposite order they arrived.
+
+    Args:
+        con: The connection the aliases were attached on.
+        aliases: Aliases *this* operation attached. Never pass one that was
+            already live — it belongs to another connection or an earlier
+            replay, and detaching it is the mirror image of the bug the
+            live-alias rule in :func:`apply_attachments` exists to avoid.
+    """
+    for alias in reversed(tuple(aliases)):
+        with contextlib.suppress(Exception):
+            detach_database(con, alias)
+
+
+def apply_attachments(
+    con: DuckDBPyConnection, attachments: Iterable[Attachment]
+) -> tuple[str, ...]:
     """Replay recorded attachments onto a freshly opened connection.
 
     Idempotent by design: an ATTACH lives on the database *instance*, so a
@@ -305,6 +337,27 @@ def apply_attachments(con: DuckDBPyConnection, attachments: Iterable[Attachment]
     module docstring for the withdrawn stamp scheme and the measurement).
     Validating what was actually attached is what makes "a replaced peer is
     never attached blind" true rather than likely.
+
+    **All or nothing across the batch.** A replay attaches several aliases in
+    turn, and an ATTACH lives on the database *instance* rather than on this
+    connection, so a failure partway used to leave the aliases before it
+    attached — invisible to the caller, whose whole operation had raised, and
+    outliving the connection whenever another same-process connection kept the
+    instance alive. Their peers' shared read locks outlived it too. So a
+    failing invocation detaches everything it attached before re-raising, which
+    is ``attach_database``'s own detach-on-refusal discipline scaled to the
+    batch and the failure semantics ``Workspace.write`` already leads callers
+    to expect. The batch is not always one call — ``Workspace`` replays one
+    attachment at a time so a failure can name the alias — which is why the
+    aliases attached are *returned* as well as rolled back here: the caller
+    accumulating them gets the same guarantee across its whole replay. Two
+    things it deliberately does not do: it never touches an
+    alias that was **already live** — that one belongs to another connection or
+    an earlier replay, and yanking it is the mirror image of the bug the
+    live-alias rule below exists to avoid — and a failure *during* that
+    rollback is suppressed, because the caller needs the reason the replay
+    failed rather than the reason the tidying afterwards did. Success is
+    unaffected: nothing is detached on the path where everything attaches.
 
     **A live alias binds to the file it was attached to, not to the pathname.**
     When the instance already holds the alias, this compares the attached path
@@ -330,6 +383,13 @@ def apply_attachments(con: DuckDBPyConnection, attachments: Iterable[Attachment]
         con: A freshly opened connection to the primary workspace.
         attachments: The recorded attachments, in the order they were made.
 
+    Returns:
+        The aliases this call attached, in the order attached — what an
+        already-live alias is not, and what :func:`roll_back_attachments` needs
+        to undo the call. ``Workspace`` accumulates these across the several
+        single-attachment calls it makes, so its replay is all-or-nothing over
+        the whole batch and not merely over each call.
+
     Raises:
         WorkspaceAliasError: If an alias is already attached to a different file
             or is attached writable, or is not a valid alias.
@@ -343,15 +403,23 @@ def apply_attachments(con: DuckDBPyConnection, attachments: Iterable[Attachment]
             holding its own connection sees them as themselves.
     """
     live = attached_databases(con)
-    for attachment in attachments:
-        current = live.get(attachment.alias)
-        if current is None:
-            attach_database(con, attachment)
-            continue
-        path, read_only = current
-        if path != os.path.realpath(attachment.path) or not read_only:
-            raise WorkspaceAliasError(
-                f"alias {attachment.alias!r} is already attached to {path} "
-                f"({'read-only' if read_only else 'read-write'}) rather than to "
-                f"{attachment.path} read-only; detach it before reusing the alias"
-            )
+    attached_here: list[str] = []
+    try:
+        for attachment in attachments:
+            current = live.get(attachment.alias)
+            if current is None:
+                attach_database(con, attachment)
+                attached_here.append(attachment.alias)
+                continue
+            path, read_only = current
+            if path != os.path.realpath(attachment.path) or not read_only:
+                raise WorkspaceAliasError(
+                    f"alias {attachment.alias!r} is already attached to {path} "
+                    f"({'read-only' if read_only else 'read-write'}) rather than to "
+                    f"{attachment.path} read-only; detach it before reusing the alias"
+                )
+    except BaseException:
+        # All or nothing, and only over what this call introduced.
+        roll_back_attachments(con, attached_here)
+        raise
+    return tuple(attached_here)

@@ -569,14 +569,13 @@ class TestCrossObjectAliasCollision:
 class TestReplayRevalidation:
     """#100: a peer replaced at the same path is revalidated, never trusted.
 
-    ``apply_attachments`` skips ``check_compatible`` to keep a catalog read off
-    the hot path, which was sound only for a file that had not changed. In rw
-    mode nothing is attached between operations and nothing holds the peer's
-    lock, so the file can be replaced at the same path; before the fix the
-    replacement was re-attached blind, and a foreign one surfaced as the raw
-    ``Catalog Error: … schema "meta" does not exist`` that ``attach_database``'s
-    refusal exists to prevent. The close is to validate every file a replay
-    attaches, after the ATTACH has opened and read-locked it.
+    In rw mode nothing is attached between operations and nothing holds the
+    peer's lock, so the file at a recorded path can be replaced. Replay used to
+    adopt the replacement, and a foreign one surfaced as the raw ``Catalog
+    Error: … schema "meta" does not exist`` that ``attach_database``'s refusal
+    exists to prevent. Every ATTACH a replay issues now runs through
+    ``attach_database``, so ``check_compatible`` sees the file after it is open
+    and read-locked — the file that was actually attached.
     """
 
     def test_foreign_replacement_is_refused_on_replay(self, tmp_path: Path) -> None:
@@ -664,8 +663,9 @@ def rewrite_in_place(target: Path, source: Path) -> None:
     """Give ``target`` ``source``'s bytes without changing ``target``'s inode.
 
     Writing through an open handle rather than replacing the file is what makes
-    the blind spot below deterministic: it is a property of the *stamp*, not of
-    whatever write strategy DuckDB happens to use.
+    the disguise below deterministic — not even the inode moves, so the swap is
+    invisible to every property of the path except its contents, whatever write
+    strategy DuckDB itself would have used.
     """
     payload = source.read_bytes()
     with open(target, "r+b") as handle:
@@ -791,6 +791,99 @@ class TestLiveAliasBindsToTheAttachedFile:
             ws.detach("peer")
             with pytest.raises(SchemaVersionError, match="older remora"):
                 ws.attach(peer, "peer")
+
+
+class TestReplayIsAllOrNothing:
+    """#100 P2: a failed replay leaves none of its own attachments behind.
+
+    An ATTACH lives on the database *instance*, not on the connection that
+    issued it, so an alias attached before a later one failed outlives the
+    failing connection whenever another same-process connection keeps the
+    instance alive — a supported scenario, not a corner. The caller's operation
+    raised, so nothing tells them that alias exists or that its peer is now
+    under a shared read lock. A failing invocation therefore detaches what it
+    attached, and only what it attached.
+    """
+
+    def test_a_later_failure_rolls_back_an_earlier_attachment(self, tmp_path: Path) -> None:
+        good = make_workspace(tmp_path / "good.duckdb")
+        doomed = make_workspace(tmp_path / "doomed.duckdb")
+        primary = make_workspace(tmp_path / "ws.duckdb")
+        with Workspace(primary, mode="rw") as ws:
+            ws.attach(good, "good")
+            ws.attach(doomed, "doomed")
+            # Replaced after the attach, so replay attaches "good", then fails
+            # on this one. os.replace: a new inode at the recorded path.
+            os.replace(make_peer(tmp_path / "v1.duckdb", version="1"), doomed)
+            # A second connection holds the instance, so anything left attached
+            # by the failed replay survives the replay connection's close.
+            outside = duckdb.connect(str(primary))
+            try:
+                with (
+                    pytest.raises(SchemaVersionError, match="cannot re-attach 'doomed'"),
+                    ws.read(),
+                ):
+                    pass  # pragma: no cover - the body is never reached
+                live = attached_databases(outside)
+                assert "good" not in live, "a failed replay must not leave its attachments behind"
+                assert "doomed" not in live
+            finally:
+                outside.close()
+
+    def test_rollback_leaves_an_already_live_alias_alone(self, tmp_path: Path) -> None:
+        # The other half of the rule: an alias this invocation found already
+        # attached belongs to whoever attached it. Rolling that one back would
+        # detach a database out from under another connection.
+        good = make_workspace(tmp_path / "good.duckdb")
+        doomed = make_workspace(tmp_path / "doomed.duckdb")
+        primary = make_workspace(tmp_path / "ws.duckdb")
+        with Workspace(primary, mode="rw") as ws:
+            ws.attach(good, "good")
+            ws.attach(doomed, "doomed")
+            os.replace(make_peer(tmp_path / "v1.duckdb", version="1"), doomed)
+            outside = duckdb.connect(str(primary))
+            try:
+                # "good" is live before the replay begins, on someone else's
+                # connection, so the replay only verifies it.
+                outside.execute(f"ATTACH '{good}' AS good (READ_ONLY)")
+                with (
+                    pytest.raises(SchemaVersionError, match="cannot re-attach 'doomed'"),
+                    ws.read(),
+                ):
+                    pass  # pragma: no cover - the body is never reached
+                assert "good" in attached_databases(outside), (
+                    "an alias the replay did not attach must survive its rollback"
+                )
+            finally:
+                outside.close()
+
+    def test_the_original_cause_survives_the_rollback(self, tmp_path: Path) -> None:
+        # Cleanup must not become the headline: the caller needs the reason the
+        # replay failed. A DETACH that raises is suppressed, not propagated.
+        good = make_workspace(tmp_path / "good.duckdb")
+        doomed = make_workspace(tmp_path / "doomed.duckdb")
+        primary = make_workspace(tmp_path / "ws.duckdb")
+        with Workspace(primary, mode="rw") as ws:
+            ws.attach(good, "good")
+            ws.attach(doomed, "doomed")
+            os.replace(make_peer(tmp_path / "v1.duckdb", version="1"), doomed)
+
+            def failing_detach(connection: DuckDBPyConnection, alias: str) -> None:
+                raise RuntimeError("DETACH exploded")
+
+            with pytest.MonkeyPatch.context() as patch:
+                patch.setattr(attach_module, "detach_database", failing_detach)
+                with pytest.raises(SchemaVersionError, match="older remora"), ws.read():
+                    pass  # pragma: no cover - the body is never reached
+
+    def test_a_successful_replay_detaches_nothing(self, tmp_path: Path) -> None:
+        good = make_workspace(tmp_path / "good.duckdb")
+        other = make_workspace(tmp_path / "other.duckdb")
+        with Workspace(make_workspace(tmp_path / "ws.duckdb"), mode="rw") as ws:
+            ws.attach(good, "good")
+            ws.attach(other, "other")
+            with ws.read() as connection:
+                assert set(attached_databases(connection)) == {"good", "other"}
 
 
 class TestCompactIsUnaffectedByAttachments:

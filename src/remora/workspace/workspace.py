@@ -63,6 +63,7 @@ from remora.workspace.attach import (
     attach_database,
     detach_database,
     is_duplicate_database_error,
+    roll_back_attachments,
     validate_alias,
 )
 from remora.workspace.errors import (
@@ -342,10 +343,31 @@ class Workspace:
         That costs one ``duckdb_databases()`` read per recorded attachment
         rather than one per connection; it is an in-memory catalog query, and
         recorded attachments number in the handfuls.
+
+        Splitting the batch that way is also why the rollback lives here as
+        well as inside :func:`~remora.workspace.attach.apply_attachments`: each
+        call is atomic on its own, but the *batch* spans several of them, and a
+        replay that raises must leave none of its attachments behind. Only what
+        this replay attached is detached — an alias already live on the
+        instance belongs to another connection.
         """
+        attached_here: list[str] = []
+        try:
+            self._replay_each(con, attached_here)
+        except BaseException:
+            # All or nothing across the whole replay, not merely within each
+            # call: an ATTACH lives on the database instance, so one left
+            # behind by a failed replay outlives this connection whenever
+            # another shares the instance — holding its peer's read lock,
+            # invisible to a caller whose operation raised.
+            roll_back_attachments(con, attached_here)
+            raise
+
+    def _replay_each(self, con: DuckDBPyConnection, attached_here: list[str]) -> None:
+        """Replay one attachment at a time, recording what actually attached."""
         for attachment in self._attachments.values():
             try:
-                apply_attachments(con, (attachment,))
+                attached_here.extend(apply_attachments(con, (attachment,)))
             except SchemaVersionError as exc:
                 raise SchemaVersionError(
                     f"cannot re-attach {attachment.alias!r} at {attachment.path}: "
@@ -922,7 +944,9 @@ class Workspace:
         read-locked it — so a peer *replaced* at its path between operations is
         refused rather than adopted, however closely the replacement resembles
         the original on disk. A replay that fails names the alias, the path and
-        :meth:`detach` as the remedy; see :meth:`read` and :meth:`write`.
+        :meth:`detach` as the remedy, and detaches whatever it had already
+        attached, so a failed operation leaves no half-applied attachments
+        holding read locks on peers; see :meth:`read` and :meth:`write`.
 
         One consequence worth knowing: an attachment binds to the **file** that
         was attached, not to the pathname. While an alias stays live on the
