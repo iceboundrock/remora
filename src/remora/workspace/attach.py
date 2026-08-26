@@ -25,8 +25,10 @@ closes. ``Workspace`` in ``"rw"`` mode holds no connection between operations,
 so an attach made on one short-lived connection is gone by the next — which is
 why :func:`apply_attachments` exists and why ``Workspace`` replays its recorded
 attachments onto every connection it opens. Replay is verified rather than
-blind: an alias the instance already holds is left alone when it points at the
-same file read-only, and refused when it does not.
+blind, in both directions: an alias the instance already holds is left alone
+when it points at the same file read-only, and refused when it does not, while
+one it does not hold is attached through :func:`attach_database` — which
+validates it — exactly as the first attach was (see *Compatibility* below).
 
 "Gone by the next" is a statement about the *last* connection closing, not
 about one operation ending: any other live connection to the same file — an
@@ -65,15 +67,49 @@ errors far from the cause. :func:`attach_database` therefore runs
 :func:`remora.workspace.schema.check_compatible` against the alias and detaches
 again on refusal, so a failed attach leaves nothing behind.
 
+That check is a statement about the *file*, and a replay attaches a file later,
+so :func:`apply_attachments` re-runs it on **every** ATTACH it issues rather
+than trying to decide in advance that it need not. In ``"rw"`` mode nothing is
+attached and nothing is locked between operations, so the file at a recorded
+path can be replaced in between; a replay that skipped the check would adopt
+the replacement and reopen exactly the raw-binder gap the refusal above exists
+to prevent.
+
+Validating **after** the ATTACH rather than before is what makes that airtight,
+and it is the whole reason this is not a check-then-act gate. A pre-ATTACH test
+— of a stamp, a digest, anything — is a statement about whatever was at the
+path when it ran, and DuckDB then opens the path *again*: no amount of checking
+harder binds those two operations together, because there is no "attach this
+inode" to ask for, and the private-temp-then-rename trick ``export.py`` closes
+its own window with has no analogue when the file to open is the caller's
+rather than ours. After the ATTACH the peer is open and read-locked, so
+``check_compatible`` against the alias reads the file that was *actually*
+attached, whatever raced in to become it.
+
+An earlier revision of this module tried to skip the check when a recorded
+``(st_dev, st_ino, st_mtime_ns)`` stamp still matched. It was withdrawn as
+unsound on both halves — the stat/ATTACH window above, and an in-place rewrite
+that restores the mtime, which no stamp can see — and the measurement it was
+justifying does not support it either: replay happens once per *connection
+open*, and the ATTACH it accompanies already opens the peer file, so the
+catalog read is a fraction of a cost that is being paid anyway (measured on
+duckdb 1.5.5: ``connect+ATTACH+close`` 6.5 ms, the added validation 1.7 ms,
+the ``stat`` it would have replaced 2 µs). Buying 2 µs with a soundness hole is
+not a trade this module makes; ``"ro"`` mode, where the connection is held and
+the alias stays live, pays nothing either way.
+
 Like every module here but ``workspace.py`` this one is import-pure: duckdb is
-annotated under ``TYPE_CHECKING`` and no connection is opened.
+annotated under ``TYPE_CHECKING`` and no connection is opened. That is also why
+:func:`is_duplicate_database_error` classifies by message text rather than by
+exception class — the class is not importable here.
 """
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
@@ -91,6 +127,8 @@ __all__ = [
     "attach_database",
     "attached_databases",
     "detach_database",
+    "is_duplicate_database_error",
+    "roll_back_attachments",
     "validate_alias",
 ]
 
@@ -98,6 +136,44 @@ RESERVED_ALIASES: Final[frozenset[str]] = frozenset({"main", "temp", "system"})
 """Database names DuckDB reserves; an ATTACH naming one is a binder error."""
 
 _ALIAS_RE: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+_DUPLICATE_DATABASE_RE: Final[re.Pattern[str]] = re.compile(
+    r"""database with name ["'`][^"'`\n]*["'`] already exists""", re.IGNORECASE
+)
+"""What DuckDB says when an ATTACH reuses a live database name.
+
+Measured on duckdb 1.5.5: ``Binder Error: Failed to attach database: database
+with name "peer" already exists``. Matched as text because this module never
+imports duckdb (it is annotated under ``TYPE_CHECKING`` only), so the exception
+*class* is not available to test against.
+
+Two failure directions, guarded from both sides. A *rewording* would silently
+degrade the refusal to a generic :class:`WorkspaceError`, which
+``tests/test_workspace_attach.py::TestCrossObjectAliasCollision::test_duckdbs_duplicate_message_is_pinned``
+catches by asserting the live message from a real duplicate ATTACH. A *false
+positive* would misreport some unrelated ATTACH failure as an alias collision,
+which is why the database name must appear quote-delimited and newline-free
+rather than as a bare ``.*``: the loose form matched anything that merely
+mentioned a database and an existing something ("Cannot open database with name
+resolution failure; the lock file already exists" is the shape), where this one
+needs DuckDB's actual phrasing. The three common quoting styles are all accepted
+so a quote-style change is not mistaken for a different error; a deeper rewording
+is meant to fail the pin test loudly instead.
+"""
+
+
+def is_duplicate_database_error(exc: BaseException) -> bool:
+    """Is ``exc`` DuckDB refusing an ATTACH because the alias is already live?
+
+    An alias collision is a :class:`WorkspaceAliasError` by #37's decision D7,
+    but one shape of it reaches DuckDB before remora can see it: same-process
+    connections to one file share a database instance, so an alias attached
+    through *another* ``Workspace`` object on the same file is live for this one
+    while its own record says nothing is attached. ``Workspace.attach`` uses
+    this to classify that failure rather than reporting it as a generic
+    workspace error.
+    """
+    return _DUPLICATE_DATABASE_RE.search(str(exc)) is not None
 
 
 @dataclass(frozen=True)
@@ -194,7 +270,10 @@ def attach_database(con: DuckDBPyConnection, attachment: Attachment) -> None:
     try:
         check_compatible(con, database=attachment.alias)
     except BaseException:
-        detach_database(con, attachment.alias)
+        # Suppressed, not propagated: the caller needs the reason the file was
+        # refused, not the reason detaching it again went wrong.
+        with contextlib.suppress(Exception):
+            detach_database(con, attachment.alias)
         raise
 
 
@@ -213,7 +292,34 @@ def detach_database(con: DuckDBPyConnection, alias: str) -> None:
         con.execute(f"DETACH {_quote_ident(alias)}")
 
 
-def apply_attachments(con: DuckDBPyConnection, attachments: Iterable[Attachment]) -> None:
+def roll_back_attachments(con: DuckDBPyConnection, aliases: Sequence[str]) -> None:
+    """Detach ``aliases`` in reverse order, never raising.
+
+    The undo half of a failed batch of ATTACHes, in one place because two
+    scopes need the identical policy: :func:`apply_attachments` over the
+    attachments of one call, and ``Workspace``'s replay over the several calls
+    it makes to name the alias that failed.
+
+    Never raising is the point rather than laziness: this only ever runs while
+    another exception is propagating, and the caller needs to know why the
+    replay failed, not why the tidying afterwards did. Reverse order so aliases
+    go away in the opposite order they arrived.
+
+    Args:
+        con: The connection the aliases were attached on.
+        aliases: Aliases *this* operation attached. Never pass one that was
+            already live — it belongs to another connection or an earlier
+            replay, and detaching it is the mirror image of the bug the
+            live-alias rule in :func:`apply_attachments` exists to avoid.
+    """
+    for alias in reversed(tuple(aliases)):
+        with contextlib.suppress(Exception):
+            detach_database(con, alias)
+
+
+def apply_attachments(
+    con: DuckDBPyConnection, attachments: Iterable[Attachment]
+) -> tuple[str, ...]:
     """Replay recorded attachments onto a freshly opened connection.
 
     Idempotent by design: an ATTACH lives on the database *instance*, so a
@@ -223,34 +329,97 @@ def apply_attachments(con: DuckDBPyConnection, attachments: Iterable[Attachment]
     quietly accepting a writable one, is the failure this verification exists
     to prevent.
 
-    No compatibility check runs here: :func:`attach_database` did it when the
-    attachment was recorded, and re-running it on every connection would put a
-    catalog read on the hot path of every query.
+    Every ATTACH this issues goes through :func:`attach_database`, so every
+    file it attaches is validated **after** it is open and read-locked. There
+    is deliberately no cheaper path for a peer believed unchanged: any such
+    test would run before the ATTACH, and the ATTACH reopens the path, so the
+    file tested and the file attached are two different questions (see the
+    module docstring for the withdrawn stamp scheme and the measurement).
+    Validating what was actually attached is what makes "a replaced peer is
+    never attached blind" true rather than likely.
+
+    **All or nothing across the batch.** A replay attaches several aliases in
+    turn, and an ATTACH lives on the database *instance* rather than on this
+    connection, so a failure partway used to leave the aliases before it
+    attached — invisible to the caller, whose whole operation had raised, and
+    outliving the connection whenever another same-process connection kept the
+    instance alive. Their peers' shared read locks outlived it too. So a
+    failing invocation detaches everything it attached before re-raising, which
+    is ``attach_database``'s own detach-on-refusal discipline scaled to the
+    batch and the failure semantics ``Workspace.write`` already leads callers
+    to expect. The batch is not always one call — ``Workspace`` replays one
+    attachment at a time so a failure can name the alias — which is why the
+    aliases attached are *returned* as well as rolled back here: the caller
+    accumulating them gets the same guarantee across its whole replay. Two
+    things it deliberately does not do: it never touches an
+    alias that was **already live** — that one belongs to another connection or
+    an earlier replay, and yanking it is the mirror image of the bug the
+    live-alias rule below exists to avoid — and a failure *during* that
+    rollback is suppressed, because the caller needs the reason the replay
+    failed rather than the reason the tidying afterwards did. Success is
+    unaffected: nothing is detached on the path where everything attaches.
+
+    **A live alias binds to the file it was attached to, not to the pathname.**
+    When the instance already holds the alias, this compares the attached path
+    and read-only flag and then leaves it alone — it does not ask whether the
+    recorded pathname still resolves to that same file. If a peer is replaced
+    at its path while another connection keeps the alias attached, the alias
+    goes on serving the old, already-validated file, and ``attachments``
+    reports a path whose current contents are not what queries against the
+    alias see. That is the contract rather than an oversight, for three
+    reasons: the alias belongs to the *instance*, so detaching it to re-attach
+    the replacement would yank it out from under every other connection using
+    it; the file in use was validated when it was attached, so nothing
+    unchecked is being read; and ``"ro"`` mode never re-attaches at all, so
+    refusing here would make the guarantee hold in one mode and not the other,
+    which is worse than a guarantee stated plainly. The remedy for a caller who
+    wants the replacement is
+    :meth:`~remora.workspace.workspace.Workspace.detach` and attach again,
+    which validates the new file.
+    ``tests/test_workspace_attach.py::TestLiveAliasBindsToTheAttachedFile``
+    pins it.
 
     Args:
         con: A freshly opened connection to the primary workspace.
         attachments: The recorded attachments, in the order they were made.
 
+    Returns:
+        The aliases this call attached, in the order attached — what an
+        already-live alias is not, and what :func:`roll_back_attachments` needs
+        to undo the call. ``Workspace`` accumulates these across the several
+        single-attachment calls it makes, so its replay is all-or-nothing over
+        the whole batch and not merely over each call.
+
     Raises:
         WorkspaceAliasError: If an alias is already attached to a different file
-            or is attached writable.
-        duckdb.Error: If DuckDB refuses an ATTACH — most often a lock held by
-            another process's writer.
+            or is attached writable, or is not a valid alias.
+        SchemaVersionError: If a peer this replay attaches is not a workspace of
+            this layout version — whether it changed since the attach was
+            recorded or the caller never validated it. The alias is detached
+            again, so a refused replay leaves nothing behind.
+        duckdb.Error: If DuckDB refuses an ATTACH — a peer that no longer
+            exists, or a lock held by another process's writer.
+            ``Workspace.read``/``Workspace.write`` translate these; a caller
+            holding its own connection sees them as themselves.
     """
     live = attached_databases(con)
-    for attachment in attachments:
-        current = live.get(attachment.alias)
-        if current is None:
-            validate_alias(attachment.alias)
-            con.execute(
-                f"ATTACH '{_quote_path(str(attachment.path))}' "
-                f"AS {_quote_ident(attachment.alias)} (READ_ONLY)"
-            )
-            continue
-        path, read_only = current
-        if path != os.path.realpath(attachment.path) or not read_only:
-            raise WorkspaceAliasError(
-                f"alias {attachment.alias!r} is already attached to {path} "
-                f"({'read-only' if read_only else 'read-write'}) rather than to "
-                f"{attachment.path} read-only; detach it before reusing the alias"
-            )
+    attached_here: list[str] = []
+    try:
+        for attachment in attachments:
+            current = live.get(attachment.alias)
+            if current is None:
+                attach_database(con, attachment)
+                attached_here.append(attachment.alias)
+                continue
+            path, read_only = current
+            if path != os.path.realpath(attachment.path) or not read_only:
+                raise WorkspaceAliasError(
+                    f"alias {attachment.alias!r} is already attached to {path} "
+                    f"({'read-only' if read_only else 'read-write'}) rather than to "
+                    f"{attachment.path} read-only; detach it before reusing the alias"
+                )
+    except BaseException:
+        # All or nothing, and only over what this call introduced.
+        roll_back_attachments(con, attached_here)
+        raise
+    return tuple(attached_here)

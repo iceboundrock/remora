@@ -590,6 +590,29 @@ writes are impossible rather than merely unattempted. The alias is validated and
 the attached file's schema version is checked at attach time, so a foreign or
 stale file is refused by path rather than surfacing later as a binder error.
 
+An attachment is recorded and replayed onto every connection the workspace
+opens, so it outlives the short-lived connections `rw` mode uses. Every ATTACH a
+replay issues is validated, and validated *after* the file is open — so what
+gets checked is what actually got attached, and a peer replaced at that path in
+between is refused rather than trusted. No disguise on disk (same inode,
+restored timestamps) and no swap timed against the check slips a foreign or
+stale peer past that, because nothing is decided from the file's metadata
+beforehand. A replay that fails detaches whatever it had already attached, so a
+failed operation leaves no half-applied attachments behind.
+
+One consequence to know: an attachment binds to the **file** it attached, not to
+the pathname. While an alias is live — continuously in `ro` mode, for the
+duration of a body in `rw` — replacing the file at its path does not change what
+the alias serves, and `attachments` will report a path whose current contents
+are not what your queries see. `detach()` and attach again to pick up a
+replacement; that validates the new file.
+
+And because the replay runs on every connection, an attachment
+DuckDB can no longer honour — a deleted peer, one another process now holds
+read-write — fails whatever you were doing, including operations that never
+mention it; that reads as a `WorkspaceError` naming the alias, the path and the
+remedy (`detach()` it), never as a raw duckdb exception.
+
 <!-- ci:typecheck -->
 ```python
 from remora import IP

@@ -39,6 +39,7 @@ from remora.workspace.attach import (
     attach_database,
     attached_databases,
     detach_database,
+    is_duplicate_database_error,
     validate_alias,
 )
 from remora.workspace.cachekey import (
@@ -170,6 +171,7 @@ __all__ = [
     "fingerprint_pcap",
     "from_db_timestamp",
     "get_column_type",
+    "is_duplicate_database_error",
     "iter_ddl",
     "list_annotations",
     "make_cache_key",

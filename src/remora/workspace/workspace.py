@@ -62,6 +62,8 @@ from remora.workspace.attach import (
     apply_attachments,
     attach_database,
     detach_database,
+    is_duplicate_database_error,
+    roll_back_attachments,
     validate_alias,
 )
 from remora.workspace.errors import (
@@ -326,6 +328,59 @@ class Workspace:
         if not self._opened:
             raise WorkspaceError("workspace is not open; use it as a context manager")
 
+    def _replay_attachments(self, con: DuckDBPyConnection) -> None:
+        """Replay recorded attachments, naming the one that fails.
+
+        Everything ``apply_attachments`` can refuse is a failure of *this*
+        workspace's operation, whatever the operation was about: replay runs on
+        every connection, so an unattachable peer fails a ``materialize()`` that
+        never mentions it. A raw ``_duckdb.IOException`` there names neither the
+        alias nor the remedy, so every non-workspace failure is translated —
+        with the alias, the path and the way out, which is to
+        :meth:`detach` it.
+
+        One attachment at a time, so the message can name the one that failed.
+        That costs one ``duckdb_databases()`` read per recorded attachment
+        rather than one per connection; it is an in-memory catalog query, and
+        recorded attachments number in the handfuls.
+
+        Splitting the batch that way is also why the rollback lives here as
+        well as inside :func:`~remora.workspace.attach.apply_attachments`: each
+        call is atomic on its own, but the *batch* spans several of them, and a
+        replay that raises must leave none of its attachments behind. Only what
+        this replay attached is detached — an alias already live on the
+        instance belongs to another connection.
+        """
+        attached_here: list[str] = []
+        try:
+            self._replay_each(con, attached_here)
+        except BaseException:
+            # All or nothing across the whole replay, not merely within each
+            # call: an ATTACH lives on the database instance, so one left
+            # behind by a failed replay outlives this connection whenever
+            # another shares the instance — holding its peer's read lock,
+            # invisible to a caller whose operation raised.
+            roll_back_attachments(con, attached_here)
+            raise
+
+    def _replay_each(self, con: DuckDBPyConnection, attached_here: list[str]) -> None:
+        """Replay one attachment at a time, recording what actually attached."""
+        for attachment in self._attachments.values():
+            try:
+                attached_here.extend(apply_attachments(con, (attachment,)))
+            except SchemaVersionError as exc:
+                raise SchemaVersionError(
+                    f"cannot re-attach {attachment.alias!r} at {attachment.path}: "
+                    f"{exc}; detach it to continue"
+                ) from exc
+            except WorkspaceError:
+                raise
+            except Exception as exc:
+                raise WorkspaceError(
+                    f"cannot re-attach {attachment.alias!r} at {attachment.path}: "
+                    f"{exc}; detach it to continue"
+                ) from exc
+
     @contextmanager
     def read(self) -> Iterator[DuckDBPyConnection]:
         """Yield a connection for reading.
@@ -346,10 +401,16 @@ class Workspace:
         Raises:
             WorkspaceError: In rw mode, if a :meth:`compact` on this file is
                 in progress anywhere in this process — mirroring the
-                fail-fast lock error a second process gets.
+                fail-fast lock error a second process gets; or if replaying a
+                recorded attachment fails for a reason with no more specific
+                type below — a peer that no longer exists, or one another
+                process holds read-write. A replay message always names the
+                alias, the path and the remedy: :meth:`detach` it.
             WorkspaceAliasError: If an alias this workspace recorded is
                 already attached to a different file, or writable, on the
                 connection's database instance.
+            SchemaVersionError: If a peer replaced at its path since it was
+                attached is no longer a workspace of this layout version.
         """
         self._require_open()
         if self._mode == "ro":
@@ -360,7 +421,7 @@ class Workspace:
         try:
             con = _connect(str(self._path), read_only=False)
             try:
-                apply_attachments(con, self._attachments.values())
+                self._replay_attachments(con)
                 yield con
             finally:
                 con.close()
@@ -385,10 +446,16 @@ class Workspace:
                 ``Workspace(path, mode='rw')`` to write.
             WorkspaceError: If a :meth:`compact` on this file is in progress
                 anywhere in this process — mirroring the fail-fast lock
-                error a second process gets.
+                error a second process gets; or if replaying a recorded
+                attachment fails for a reason with no more specific type below
+                — a peer that no longer exists, or one another process holds
+                read-write. A replay message always names the alias, the path
+                and the remedy: :meth:`detach` it.
             WorkspaceAliasError: If an alias this workspace recorded is
                 already attached to a different file, or writable, on the
                 connection's database instance.
+            SchemaVersionError: If a peer replaced at its path since it was
+                attached is no longer a workspace of this layout version.
         """
         self._require_open()
         if self._mode == "ro":
@@ -403,7 +470,7 @@ class Workspace:
                 # Before BEGIN: a ROLLBACK undoes an ATTACH issued inside the
                 # transaction, so replaying there would lose the attachments
                 # exactly when an exception makes a caller want them least.
-                apply_attachments(con, self._attachments.values())
+                self._replay_attachments(con)
                 con.execute("BEGIN")
                 try:
                     yield con
@@ -872,7 +939,23 @@ class Workspace:
         Attachments are recorded on this workspace and replayed onto every
         connection it opens, because a DuckDB attachment belongs to the
         *database instance* rather than the connection and ``"rw"`` mode holds
-        no connection between operations. :meth:`close` clears them.
+        no connection between operations. :meth:`close` clears them. Each replay
+        validates the file it attaches, after the ATTACH has opened and
+        read-locked it — so a peer *replaced* at its path between operations is
+        refused rather than adopted, however closely the replacement resembles
+        the original on disk. A replay that fails names the alias, the path and
+        :meth:`detach` as the remedy, and detaches whatever it had already
+        attached, so a failed operation leaves no half-applied attachments
+        holding read locks on peers; see :meth:`read` and :meth:`write`.
+
+        One consequence worth knowing: an attachment binds to the **file** that
+        was attached, not to the pathname. While an alias stays live on the
+        database instance — continuously in ``"ro"`` mode, and for the duration
+        of a body in ``"rw"`` — a replacement at its path does not change what
+        the alias serves, and :attr:`attachments` goes on reporting a path
+        whose current contents are not what queries against that alias see.
+        :meth:`detach` and attach again to pick the replacement up; see
+        :func:`remora.workspace.attach.apply_attachments`.
 
         **What an attachment costs.** It takes a shared read lock on the
         attached file for as long as it stays attached — which is for as long
@@ -903,8 +986,11 @@ class Workspace:
 
         Raises:
             WorkspaceAliasError: If the alias is invalid, reserved, already in
-                use here (exactly, or differing from a recorded alias only in
-                case), or names this workspace's own database.
+                use (exactly, or differing from a recorded alias only in case —
+                and whether this workspace recorded it or another ``Workspace``
+                object on this same file attached it on the DuckDB instance the
+                two share, which only DuckDB's binder can see), or names this
+                workspace's own database.
             WorkspaceError: If the workspace is not open, if ``path`` does not
                 exist or is this workspace's own file, or if DuckDB refuses the
                 attach — a file that is not a DuckDB database, or one another
@@ -968,6 +1054,21 @@ class Workspace:
             except WorkspaceError:
                 raise
             except Exception as exc:
+                # An alias this workspace has not recorded can still be live on
+                # the shared database instance, attached by another Workspace
+                # object on this same file: same-process connections to one file
+                # share the instance, and the duplicate check above compares
+                # against *this* workspace's record only. DuckDB's binder is what
+                # catches that shape, and a colliding alias is a
+                # WorkspaceAliasError by #37's decision D7 whichever half found
+                # it, so it is classified rather than reported as a generic
+                # workspace failure.
+                if is_duplicate_database_error(exc):
+                    raise WorkspaceAliasError(
+                        f"cannot attach {path} as {alias!r}: {exc}; another Workspace on "
+                        f"{self._path} attached that alias on the DuckDB instance this "
+                        f"one shares — detach it there, or choose another alias"
+                    ) from exc
                 raise WorkspaceError(f"cannot attach {path} as {alias!r}: {exc}") from exc
         # Recorded only after the connection block, so a refused attach leaves
         # nothing behind for the next connection to replay.
