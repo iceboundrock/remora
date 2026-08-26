@@ -32,6 +32,15 @@ def _toml(path: Path) -> dict[str, object]:
         return tomllib.load(handle)
 
 
+def _nested(config: dict[str, object], *keys: str) -> object:
+    """Walk a chain of TOML tables, asserting each level is one."""
+    node: object = config
+    for key in keys:
+        assert isinstance(node, dict), f"{key}: not a table"
+        node = node[key]
+    return node
+
+
 def test_extras_map_has_the_seed_assignments() -> None:
     assert EXTRAS_MODULES["wlan"] == "wireless"
     assert EXTRAS_MODULES["dnp3"] == "industrial"
@@ -139,6 +148,49 @@ def test_extras_dists_pin_core_and_share_its_version() -> None:
         assert project["name"] == f"remora-{extra}"
         assert project["version"] == version
         assert project["dependencies"] == [f"remora=={version}"]
+
+
+def test_every_distribution_ships_a_py_typed_marker() -> None:
+    """PEP 561 markers, one per distribution root (issue #77).
+
+    A wheel install unpacks every distribution into one
+    ``site-packages/remora/``, so core's marker alone covers the extras' stubs
+    there. An editable or multi-root layout does not: mypy finds
+    ``remora.proto.wlan`` under ``packages/remora-wireless/src/remora/`` and
+    needs the marker in *that* root, or it reports "module is installed, but
+    missing library stubs or py.typed marker" and types every field ``Any``.
+
+    Four distributions therefore ship the same path. That is harmless on
+    install -- the files are byte-identical (empty), and both pip and uv
+    overwrite without complaint -- which the emptiness assertion below keeps
+    true. The residual, measured on pip 25.0.1 and uv: uninstalling any one of
+    the four removes the shared ``remora/py.typed``, so the survivors go
+    untyped until one is reinstalled. That is a type-checking regression only,
+    never a runtime one.
+
+    ``.github/scripts/check_wheel_contents.py`` asserts the built wheels
+    actually carry the marker; this test asserts the sources do.
+    """
+    # Core is named literally rather than derived: its root is ``src/remora``,
+    # not ``packages/remora-<name>/src/remora``, and no list in this repo
+    # legitimately holds it beside the extras (``EXTRA_NAMES`` mirrors
+    # codegen.toml's ``[extras.*]``). Same shape as
+    # ``test_extras_dists_pin_core_and_share_its_version`` above.
+    roots = {"remora": REPO / "src"}
+    for extra in EXTRA_NAMES:
+        roots[f"remora-{extra}"] = REPO / "packages" / f"remora-{extra}" / "src"
+    for dist, src in roots.items():
+        marker = src / "remora" / "py.typed"
+        assert marker.is_file(), f"{dist}: {marker} missing"
+        assert marker.read_bytes() == b"", f"{dist}: py.typed must be empty"
+
+
+def test_extras_wheels_package_the_root_holding_the_marker() -> None:
+    """The marker rides in on ``src/remora``, the path each wheel target packages."""
+    for extra in EXTRA_NAMES:
+        config = _toml(REPO / "packages" / f"remora-{extra}" / "pyproject.toml")
+        packaged = _nested(config, "tool", "hatch", "build", "targets", "wheel", "packages")
+        assert packaged == ["src/remora"], f"remora-{extra}: {packaged}"
 
 
 def test_installed_extra_resolves_through_proto_getattr() -> None:
