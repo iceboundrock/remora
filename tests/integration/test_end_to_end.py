@@ -6,9 +6,12 @@ residual-lambda ek fallback, exact -T fields projection, multi-value
 against raw tshark ``!(x == v)`` is deliberately NOT asserted here — that
 check lives in the #18 dfilter-validation suite.
 
-M1's Capture has no projection/select API, so the fields-mode test drives
-the same pipeline Capture would (make_plan -> argv -> TsharkProcess ->
-FieldsReader) with an explicit ``select``.
+The fields-mode test here assembles the pipeline by hand (make_plan -> argv
+-> TsharkProcess -> FieldsReader) with an explicit ``select``. Since #105
+that is a choice rather than the only route — ``Capture.select()`` reaches
+the same branch, and ``test_capture_integration.py``'s ``TestProjectedPath``
+covers it from the public surface — so this one stays as the direct exercise
+of the layers underneath, where each stage's output is inspectable.
 """
 
 from __future__ import annotations
