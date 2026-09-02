@@ -23,9 +23,10 @@ Planning algorithm
    original order: first every residual-``Expr`` predicate, then every opaque
    callable — cheap compiled predicates run before arbitrary user lambdas
    regardless of how the terms were interleaved. ``None`` when there are none.
-5. Mode: ``"ek"`` if any opaque callable is present OR ``select`` is None
-   (M1's Capture has no projection API yet, so the consumer may access
-   arbitrary fields); otherwise ``"fields"`` with a projection of the
+5. Mode: ``"ek"`` if any opaque callable is present OR ``select`` is None —
+   nothing bounds the fields an arbitrary lambda reads, and a caller who
+   named no projection may likewise access any field, so both must be handed
+   whole packets; otherwise ``"fields"`` with a projection of the
    selected fields plus the fields referenced by residual ``Expr``\s,
    deduplicated by field name (select order first, then residual-field
    order). Fields of *pushed* conjuncts are not projected — tshark already

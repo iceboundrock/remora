@@ -117,6 +117,7 @@ That's pcap → typed query → results:
 - `IP.src == "10.0.0.1"` (class access) builds an expression; Remora compiles the whole conjunction to the display filter `(ip.src == 10.0.0.1) && (tcp.port == 443)` and pushes it down to tshark, so filtering happens at capture speed, not in Python.
 - `pkt[IP].src` (instance access) returns a parsed `IPv4Address | None` — never a bare string, never an exception for an absent field.
 - Opaque Python predicates work too — `cap.filter(lambda pkt: some_check(pkt))` — Remora runs what it can't push down as a residual filter in Python.
+- `.select()` narrows what comes back: name the fields you read and tshark renders only those columns instead of every field of every packet — see [Projections](#projections-ask-only-for-the-fields-you-read).
 
 This snippet is executed by CI against a test pcap on every pull request and every push to `main` (see `tests/test_readme.py`), so it cannot rot.
 
@@ -147,6 +148,23 @@ from remora import TCP
 
 not_port_80 = TCP.port != 80  # compiles to !(tcp.port == 80)
 ```
+
+## Projections: ask only for the fields you read
+
+A `Capture` with no projection reads whole packets (`-T ek`), so it answers any field name — convenient, and it makes tshark render every field of every packet. `.select()` names the columns you actually read; the query then plans to `-T fields`, where tshark renders only those, which is markedly cheaper. Like `.filter()`, it returns a new `Capture` and chains:
+
+<!-- ci:exec -->
+```python
+from remora import IP, TCP, Capture
+
+cap = Capture("capture.pcap").filter(TCP.port == 443).select(IP.src, TCP.dstport)
+
+assert cap.plan().mode == "fields"  # only ip.src and tcp.dstport are rendered
+```
+
+The trade-off: inside a projection, a field you did not name is a *mistake*, not an absence — `pkt[TCP].flags` here raises `FieldNotProjectedError`, because not having asked for a field is a caller bug. Fields that are genuinely absent still come back as `None` / `()` exactly as they do without a projection.
+
+Two things do not follow from calling it. Fields a residual Python filter needs are added to the projection for you, so name only what you read yourself; and an opaque `lambda` term forces whole-packet mode regardless, since nothing bounds the fields an arbitrary callable reads. `cap.plan().mode` says which happened. (`select()` with no arguments is a deliberate no-op.)
 
 ## The DuckDB workspace
 
