@@ -35,7 +35,7 @@ wireless = ["remora-wireless==0.1.0"]
 industrial = ["remora-industrial==0.1.0"]
 telecom = ["remora-telecom==0.1.0"]
 # DuckDB workspace (M4). Core stays dependency-free for tshark-only users.
-workspace = ["duckdb>=1.1"]
+workspace = ["duckdb>=1.5.6"]
 # Arrow output for Query.arrow() (#35). Separate from "workspace" on purpose:
 # duckdb names pyarrow only under its own "all" extra, so `remora[workspace]`
 # installs duckdb *without* it, and a workspace user who never calls .arrow()
@@ -50,7 +50,7 @@ all = [
     "remora-wireless==0.1.0",
     "remora-industrial==0.1.0",
     "remora-telecom==0.1.0",
-    "duckdb>=1.1",
+    "duckdb>=1.5.6",
     "pyarrow>=16",
 ]
 
@@ -59,7 +59,7 @@ psdsl = "remora.codegen.cli:main"
 
 [dependency-groups]
 dev = [
-    "duckdb>=1.1",
+    "duckdb>=1.5.6",
     "mypy>=2.3.1",
     # Shipped to users as the optional "arrow" extra; here unconditionally,
     # because the Arrow tests must run whether or not a user would install it.
