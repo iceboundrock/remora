@@ -8,6 +8,7 @@ import stat
 import subprocess
 import sys
 import threading
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,51 @@ from remora.workspace.swap import replace_file
 from remora.workspace.workspace import Workspace
 
 duckdb = pytest.importorskip("duckdb")
+
+
+@contextlib.contextmanager
+def _held_without_delete_sharing(path: Path) -> Iterator[None]:
+    """Hold ``path`` open on Windows the one way that refuses only a rename over it.
+
+    The handle asks for DELETE access alone and shares read and write but not
+    delete. A CRT ``open()`` would not do: it asks for read access, and
+    DuckDB opens a read-write database sharing nothing but delete, so the
+    workspace's own connect would fail on the CRT handle before compact ever
+    reached the swap. DELETE is shared by DuckDB and data access is not
+    asked for, so the connect succeeds beside this handle; the missing
+    delete sharing then refuses the rename, as a pre-1.5.0 duckdb's own
+    handle would.
+    """
+    if sys.platform != "win32":
+        raise NotImplementedError("Windows share modes only")
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    delete_access = 0x00010000
+    share_read_write = 0x00000001 | 0x00000002  # FILE_SHARE_READ | FILE_SHARE_WRITE
+    open_existing = 3
+    handle: int = kernel32.CreateFileW(
+        str(path), delete_access, share_read_write, None, open_existing, 0x80, None
+    )
+    if handle == wintypes.HANDLE(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        yield
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 class TestLifecycle:
@@ -429,10 +475,11 @@ class TestCompact:
                     timeout=60,
                 )
                 assert result.returncode != 0
-                err = result.stderr.lower()
-                # POSIX: "Could not set lock on file"; Windows: "The process
-                # cannot access the file ... File is already open in ...".
-                assert b"lock" in err or b"already open in" in err
+                if sys.platform == "win32":
+                    # "The process cannot access the file ... File is already open in ..."
+                    assert b"already open in" in result.stderr.lower()
+                else:
+                    assert b"lock" in result.stderr.lower()
                 probed.append(result.stderr)
                 real_replace(src, dst)
 
@@ -891,6 +938,31 @@ class TestCompact:
         leftovers = [p.name for p in tmp_path.iterdir() if p.name != path.name]
         assert leftovers == []
 
+    @pytest.mark.skipif(
+        sys.platform != "win32", reason="exercises the Windows rename refusal through compact()"
+    )
+    def test_real_swap_refusal_leaves_original_intact(self, tmp_path: Path) -> None:
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw") as ws:
+            with ws.write() as con:
+                con.execute(
+                    "INSERT INTO pkts (frame_number, frame_time) "
+                    "VALUES (7, TIMESTAMP '2024-01-01 00:00:00')"
+                )
+            # No monkeypatching: the real POSIX-semantics rename is refused
+            # while a handle without delete sharing is open on the workspace.
+            with _held_without_delete_sharing(path):  # noqa: SIM117
+                with pytest.raises(WorkspaceError, match="delete sharing"):
+                    ws.compact()
+            assert not (tmp_path / "ws.duckdb.compacting").exists()
+            with ws.read() as con:
+                row = con.execute("SELECT count(*) FROM pkts").fetchone()
+                assert row is not None
+                assert row[0] == 1
+            ws.compact()  # succeeds once the holder is gone
+        leftovers = [p.name for p in tmp_path.iterdir() if p.name != path.name]
+        assert leftovers == []
+
     def test_copy_stage_failure_leaves_original_intact(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -952,7 +1024,11 @@ class TestCompact:
                 rows = con.execute("SELECT frame_number FROM pkts").fetchall()
             assert rows == [(7,)]
         assert alias.is_symlink()
-        assert os.path.samefile(alias, real)
+        if sys.platform == "win32":
+            # os.readlink may hand back a \\?\-prefixed path here.
+            assert os.path.samefile(alias, real)
+        else:
+            assert os.readlink(alias) == str(real)
         assert real.exists()
         assert not real.is_symlink()
         leftovers = sorted(
