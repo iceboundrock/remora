@@ -72,8 +72,9 @@ DDL_TARGET = re.compile(
 # rw open() refuses a foreign database instead of grafting the layout onto it.
 DDL_SCRATCH_FILES = frozenset(
     {
-        REPO_ROOT / "tests" / "test_workspace_types.py",
         REPO_ROOT / "tests" / "test_workspace_lifecycle.py",
+        REPO_ROOT / "tests" / "test_workspace_swap.py",
+        REPO_ROOT / "tests" / "test_workspace_types.py",
     }
 )
 

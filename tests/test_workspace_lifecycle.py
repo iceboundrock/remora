@@ -866,12 +866,19 @@ class TestCompact:
 
             def denied(src: object, dst: object) -> None:
                 # What a Windows rename over a file this process holds open
-                # raises; POSIX-first is tracked in #85.
+                # raises; POSIX-first is tracked in #85. On POSIX this error
+                # propagates as-is; only Windows-specific errors are wrapped.
                 raise PermissionError("Access is denied")
 
-            monkeypatch.setattr("remora.workspace.workspace.os.replace", denied)
-            with pytest.raises(WorkspaceError, match=r"#85"):
-                ws.compact()
+            monkeypatch.setattr("remora.workspace.swap.os.replace", denied)
+            if sys.platform == "win32":
+                # On Windows, the error is wrapped in WorkspaceError
+                with pytest.raises(WorkspaceError, match=r"#85"):
+                    ws.compact()
+            else:
+                # On POSIX, PermissionError propagates as-is
+                with pytest.raises(PermissionError):
+                    ws.compact()
             monkeypatch.undo()
             with ws.read() as con:
                 row = con.execute("SELECT count(*) FROM pkts").fetchone()
