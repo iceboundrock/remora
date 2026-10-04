@@ -606,7 +606,6 @@ class TestCompact:
 
         monkeypatch.setattr(workspace_module, "replace_file", probing_replace)
 
-    @pytest.mark.skipif(os.name != "posix", reason="hard links need privileges on Windows")
     def test_write_from_hardlink_alias_during_compact_raises(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -931,7 +930,6 @@ class TestCompact:
                 assert row[0] == 1
             ws.compact()
 
-    @pytest.mark.skipif(os.name != "posix", reason="symlinks need privileges on Windows")
     def test_compact_through_symlink_preserves_alias(self, tmp_path: Path) -> None:
         real = tmp_path / "real.duckdb"
         alias = tmp_path / "alias.duckdb"
@@ -941,17 +939,20 @@ class TestCompact:
                     "INSERT INTO pkts (frame_number, frame_time) "
                     "VALUES (7, TIMESTAMP '2024-01-01 00:00:00')"
                 )
-        os.symlink(real, alias)
+        try:
+            os.symlink(real, alias)
+        except OSError as exc:  # Windows without Developer Mode / SeCreateSymbolicLinkPrivilege
+            pytest.skip(f"cannot create a symlink here: {exc}")
         with Workspace(alias, mode="rw") as ws:
             ws.compact()
             # Compaction happened at the resolved target, so the alias is
             # still a symlink to it rather than an independent regular file
-            # left over from an os.replace onto the link itself.
+            # left over from renaming the temp onto the link itself.
             with ws.read() as con:
                 rows = con.execute("SELECT frame_number FROM pkts").fetchall()
             assert rows == [(7,)]
         assert alias.is_symlink()
-        assert os.readlink(alias) == str(real)
+        assert os.path.samefile(alias, real)
         assert real.exists()
         assert not real.is_symlink()
         leftovers = sorted(
