@@ -12,6 +12,7 @@ import pytest
 
 import remora.workspace.attach as attach_module
 import remora.workspace.workspace as workspace_module
+from conftest import duckdb_shares_delete
 from remora.workspace.attach import (
     RESERVED_ALIASES,
     Attachment,
@@ -31,13 +32,6 @@ if TYPE_CHECKING:
     from duckdb import DuckDBPyConnection
 
 duckdb = pytest.importorskip("duckdb")
-
-
-def _duckdb_shares_delete() -> bool:
-    # duckdb opens its database with FILE_SHARE_DELETE from 1.5.0 on
-    # (duckdb/duckdb#19782); before that a live handle blocks the rename.
-    major, minor = (int(part) for part in duckdb.__version__.split(".")[:2])
-    return (major, minor) >= (1, 5)
 
 
 def make_peer(path: Path, version: str | None = None) -> Path:
@@ -765,7 +759,7 @@ class TestLiveAliasBindsToTheAttachedFile:
     """
 
     @pytest.mark.skipif(
-        sys.platform == "win32" and not _duckdb_shares_delete(),
+        sys.platform == "win32" and not duckdb_shares_delete(),
         reason="needs duckdb >= 1.5.0 (opens with FILE_SHARE_DELETE)",
     )
     def test_a_live_alias_keeps_serving_the_file_it_was_attached_to(self, tmp_path: Path) -> None:

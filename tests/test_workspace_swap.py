@@ -8,22 +8,11 @@ from pathlib import Path
 
 import pytest
 
+from conftest import duckdb_shares_delete
 from remora.workspace.errors import WorkspaceError
 from remora.workspace.swap import explain_rename_error, replace_file
 
 windows_only = pytest.mark.skipif(sys.platform != "win32", reason="Windows rename semantics")
-
-
-def _duckdb_shares_delete() -> bool:
-    # duckdb opens its database with FILE_SHARE_DELETE from 1.5.0 on
-    # (duckdb/duckdb#19782). Evaluated at collection time, so a missing
-    # duckdb must not skip the platform-neutral tests above: return False.
-    try:
-        import duckdb
-    except ImportError:
-        return False
-    major, minor = (int(part) for part in duckdb.__version__.split(".")[:2])
-    return (major, minor) >= (1, 5)
 
 
 def test_replace_file_renames_over_the_destination(tmp_path: Path) -> None:
@@ -63,7 +52,7 @@ class TestExplainRenameError:
 @windows_only
 class TestWindowsRename:
     @pytest.mark.skipif(
-        not _duckdb_shares_delete(), reason="needs duckdb >= 1.5.0 (opens with FILE_SHARE_DELETE)"
+        not duckdb_shares_delete(), reason="needs duckdb >= 1.5.0 (opens with FILE_SHARE_DELETE)"
     )
     def test_replaces_file_held_open_by_duckdb(self, tmp_path: Path) -> None:
         duckdb = pytest.importorskip("duckdb")
@@ -99,8 +88,25 @@ class TestWindowsRename:
         assert target.read_bytes() == b"old"
         assert tmp.read_bytes() == b"new"
 
+    def test_temp_without_delete_sharing_is_not_classified(self, tmp_path: Path) -> None:
+        target = tmp_path / "ws.duckdb"
+        tmp = tmp_path / "ws.duckdb.compacting"
+        target.write_bytes(b"old")
+        tmp.write_bytes(b"new")
+        # Held here is the SOURCE: opening it for the rename fails, and that
+        # is not a refusal on the workspace file, so it must not be explained
+        # as one. It propagates as the OSError it is, naming the temp.
+        with open(tmp, "rb"), pytest.raises(OSError) as excinfo:
+            replace_file(tmp, target)
+        assert not isinstance(excinfo.value, WorkspaceError)
+        # getattr: typeshed declares OSError.winerror only for win32.
+        assert getattr(excinfo.value, "winerror", None) == 32  # ERROR_SHARING_VIOLATION
+        assert os.path.normcase(excinfo.value.filename) == os.path.normcase(os.path.abspath(tmp))
+        assert target.read_bytes() == b"old"
+        assert tmp.read_bytes() == b"new"
+
     @pytest.mark.skipif(
-        not _duckdb_shares_delete(), reason="needs duckdb >= 1.5.0 (opens with FILE_SHARE_DELETE)"
+        not duckdb_shares_delete(), reason="needs duckdb >= 1.5.0 (opens with FILE_SHARE_DELETE)"
     )
     def test_os_replace_cannot_replace_an_open_file(self, tmp_path: Path) -> None:
         # Pins why swap.py exists: the stdlib rename is the legacy MoveFileExW,
@@ -120,7 +126,7 @@ class TestWindowsRename:
             con.close()
 
     @pytest.mark.skipif(
-        not _duckdb_shares_delete(), reason="needs duckdb >= 1.5.0 (opens with FILE_SHARE_DELETE)"
+        not duckdb_shares_delete(), reason="needs duckdb >= 1.5.0 (opens with FILE_SHARE_DELETE)"
     )
     def test_replace_file_with_non_bmp_directory_name(self, tmp_path: Path) -> None:
         # FileNameLength must count UTF-16 units, not code points. A non-BMP
@@ -147,3 +153,17 @@ class TestWindowsRename:
             assert check.execute("SELECT x FROM t").fetchall() == [(2,)]
         finally:
             check.close()
+
+    def test_replace_file_with_lone_surrogate_directory_name(self, tmp_path: Path) -> None:
+        # NTFS names are arbitrary UTF-16, so a directory may hold an unpaired
+        # surrogate. FileNameLength must count it as the one unit ctypes
+        # stores, not refuse to encode it.
+        data_dir = tmp_path / "data-\udcff"
+        data_dir.mkdir()
+        target = data_dir / "old"
+        tmp = data_dir / "new"
+        target.write_bytes(b"old")
+        tmp.write_bytes(b"new")
+        replace_file(tmp, target)
+        assert not tmp.exists()
+        assert target.read_bytes() == b"new"

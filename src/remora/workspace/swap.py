@@ -15,8 +15,9 @@ rename must ask for *POSIX semantics*: the legacy ``MoveFileExW`` behind
 ``os.replace`` refuses to replace a file that has any open handle at all,
 while ``SetFileInformationByHandle(FileRenameInfoEx)`` with
 ``FILE_RENAME_FLAG_POSIX_SEMANTICS`` (Windows 10 1607 / Server 2016 and
-later, on NTFS or ReFS) renames over it and leaves the superseded file
-alive, unnamed, until its last handle closes — the POSIX picture exactly.
+later, on NTFS; ReFS is unverified) renames over it and leaves the
+superseded file alive, unnamed, until its last handle closes — the POSIX
+picture exactly.
 :func:`replace_file` is that rename on Windows and ``os.replace`` elsewhere,
 so compact has one swap primitive with one failure contract.
 
@@ -71,8 +72,8 @@ def explain_rename_error(winerror: int | None, dst: Path) -> str | None:
         return (
             f"compact() could not swap the rewritten file over {dst}: this Windows or "
             "volume does not support a POSIX-semantics rename (Windows error "
-            f"{winerror}); compact needs Windows 10 1607 / Server 2016 or later on NTFS "
-            "or ReFS. The workspace is unchanged"
+            f"{winerror}); compact needs Windows 10 1607 / Server 2016 or later on an "
+            "NTFS volume. The workspace is unchanged"
         )
     return None
 
@@ -113,13 +114,12 @@ if sys.platform == "win32":
     _kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
     _kernel32.CloseHandle.restype = wintypes.BOOL
 
-    def _rename_posix_semantics(src: Path, dst: Path) -> None:
-        """Rename ``src`` over ``dst`` with POSIX semantics; raises ``OSError``."""
+    def _open_for_rename(src: Path) -> int:
+        """Open ``src`` for a rename and return the handle; raises ``OSError``."""
         src_abs = os.path.abspath(os.fspath(src))
-        dst_abs = os.path.abspath(os.fspath(dst))
         # DELETE is the access a rename needs on the file being moved; full
         # sharing so this handle never blocks anyone else for its short life.
-        handle = _kernel32.CreateFileW(
+        handle: int = _kernel32.CreateFileW(
             src_abs,
             _DELETE,
             _FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
@@ -132,34 +132,41 @@ if sys.platform == "win32":
             err = ctypes.WinError(ctypes.get_last_error())
             err.filename = src_abs
             raise err
-        try:
-            # FILE_RENAME_INFO with the Flags member of its leading union and
-            # the name inline, sized for this one target. FileName is UTF-16.
-            encoded = dst_abs.encode("utf-16-le")
-            units = len(encoded) // 2  # UTF-16 code units, excluding the NUL
+        return handle
 
-            class _FileRenameInfo(ctypes.Structure):
-                _fields_ = (
-                    ("Flags", wintypes.DWORD),
-                    ("RootDirectory", wintypes.HANDLE),
-                    ("FileNameLength", wintypes.DWORD),
-                    ("FileName", wintypes.WCHAR * (units + 1)),
-                )
+    def _rename_handle(handle: int, dst: Path) -> None:
+        """Rename the file behind ``handle`` over ``dst`` with POSIX semantics.
 
-            info = _FileRenameInfo()
-            info.Flags = _FILE_RENAME_FLAG_REPLACE_IF_EXISTS | _FILE_RENAME_FLAG_POSIX_SEMANTICS
-            info.RootDirectory = None
-            info.FileNameLength = len(encoded)  # bytes, excluding the NUL
-            info.FileName = dst_abs
-            ok = _kernel32.SetFileInformationByHandle(
-                handle, _FILE_RENAME_INFO_EX, ctypes.byref(info), ctypes.sizeof(info)
+        Raises ``OSError`` naming ``dst``. The caller owns ``handle``.
+        """
+        dst_abs = os.path.abspath(os.fspath(dst))
+        # FILE_RENAME_INFO with the Flags member of its leading union and
+        # the name inline, sized for this one target. FileName is UTF-16.
+        # NTFS names are arbitrary UTF-16 and may hold an unpaired surrogate;
+        # ctypes stores it as one unit, so count it as one.
+        encoded = dst_abs.encode("utf-16-le", "surrogatepass")
+        units = len(encoded) // 2  # UTF-16 code units, excluding the NUL
+
+        class _FileRenameInfo(ctypes.Structure):
+            _fields_ = (
+                ("Flags", wintypes.DWORD),
+                ("RootDirectory", wintypes.HANDLE),
+                ("FileNameLength", wintypes.DWORD),
+                ("FileName", wintypes.WCHAR * (units + 1)),
             )
-            if not ok:
-                err = ctypes.WinError(ctypes.get_last_error())
-                err.filename = dst_abs
-                raise err
-        finally:
-            _kernel32.CloseHandle(handle)
+
+        info = _FileRenameInfo()
+        info.Flags = _FILE_RENAME_FLAG_REPLACE_IF_EXISTS | _FILE_RENAME_FLAG_POSIX_SEMANTICS
+        info.RootDirectory = None
+        info.FileNameLength = len(encoded)  # bytes, excluding the NUL
+        info.FileName = dst_abs
+        ok = _kernel32.SetFileInformationByHandle(
+            handle, _FILE_RENAME_INFO_EX, ctypes.byref(info), ctypes.sizeof(info)
+        )
+        if not ok:
+            err = ctypes.WinError(ctypes.get_last_error())
+            err.filename = dst_abs
+            raise err
 
 
 def replace_file(src: Path, dst: Path) -> None:
@@ -175,15 +182,24 @@ def replace_file(src: Path, dst: Path) -> None:
             delete sharing (a DuckDB older than 1.5.0, or a scanner that has
             the file for a moment), or when this Windows or volume cannot
             perform a POSIX-semantics rename. See :func:`explain_rename_error`.
-        OSError: Anything else the rename reports, unchanged.
+        OSError: On Windows, when ``src`` cannot be opened for the rename:
+            the error as the system reported it, naming ``src``, unclassified,
+            with both files unchanged. Anything else the rename reports,
+            unchanged.
     """
     if sys.platform == "win32":
+        # Opening the temp is outside the classifying try: its failure is
+        # about src, and explain_rename_error only describes refusals on dst.
+        handle = _open_for_rename(src)
         try:
-            _rename_posix_semantics(src, dst)
-        except OSError as exc:
-            message = explain_rename_error(exc.winerror, Path(exc.filename or dst))
-            if message is None:
-                raise
-            raise WorkspaceError(message) from exc
+            try:
+                _rename_handle(handle, dst)
+            except OSError as exc:
+                message = explain_rename_error(exc.winerror, dst)
+                if message is None:
+                    raise
+                raise WorkspaceError(message) from exc
+        finally:
+            _kernel32.CloseHandle(handle)
     else:
         os.replace(src, dst)
