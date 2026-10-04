@@ -17,6 +17,9 @@ and atomically swapping it in, holding the source's exclusive lock
 across both steps so a concurrent writer cannot slip a commit into the
 gap, and so an interrupted compact always leaves the original intact.
 
+The swap primitive lives in :mod:`remora.workspace.swap`, which is where the
+Windows rename semantics are explained.
+
 The file lock cannot arbitrate *within* one process — same-process
 connections to one file share DuckDB's database instance — so a
 module-level registry keyed by the file's *identity* (``st_dev`` and
@@ -82,6 +85,7 @@ from remora.workspace.materialize import (
 from remora.workspace.query import Query
 from remora.workspace.schema import check_compatible, create_schema
 from remora.workspace.streams import StreamsResult, build_streams
+from remora.workspace.swap import replace_file
 
 if TYPE_CHECKING:
     from duckdb import DuckDBPyConnection
@@ -1136,10 +1140,11 @@ class Workspace:
         large after scattered deletes; this copies every schema, table and
         row into ``<name>.compacting`` beside the original (same directory,
         so the final rename never crosses a filesystem) and atomically
-        swaps it in with :func:`os.replace`. The original is only ever
-        replaced whole: an interruption at any point leaves it intact, and
-        at worst a stale temp file — plus the ``.wal`` sidecar a hard kill
-        mid-copy can leave beside it — that the next compact removes.
+        swaps it in by renaming the temp over the open original. The
+        original is only ever replaced whole: an interruption at any point
+        leaves it intact, and at worst a stale temp file — plus the ``.wal``
+        sidecar a hard kill mid-copy can leave beside it — that the next
+        compact removes.
 
         A workspace addressed through a symlink is compacted at its
         *resolved* target: the temp lives beside the real file and the swap
@@ -1157,13 +1162,21 @@ class Workspace:
         file with umask defaults, so the source's mode is copied onto it
         before the rename. Ownership and other metadata follow the fresh
         file — changing them would need privileges compact does not assume.
+        On Windows only the read-only attribute is carried over, and the
+        file's access control list is the fresh temp's, inherited from the
+        directory, so an ACL tightened on the workspace file alone does not
+        survive compaction (#132).
 
-        The swap is POSIX-first (#85): on Windows a rename over a file this
-        process holds open is refused, and compact raises
-        :class:`WorkspaceError` naming that limitation rather than a bare
-        :class:`PermissionError`. That wrapping is narrow — only
-        :class:`PermissionError` is translated; any other :class:`OSError`
-        from the rename propagates unchanged.
+        The swap is :func:`remora.workspace.swap.replace_file`: ``os.replace``
+        on POSIX, and on Windows a POSIX-semantics rename
+        (``FileRenameInfoEx``), which can replace the file while this
+        process's connection holds it open because DuckDB 1.5.0 and later
+        open their database with ``FILE_SHARE_DELETE`` (#85). An older
+        duckdb, a scanner holding the file for a moment, or a Windows or
+        volume without POSIX rename semantics makes the swap raise
+        :class:`WorkspaceError` naming the requirement, with the workspace
+        unchanged; any other :class:`OSError` from the rename propagates
+        as itself.
 
         The copy runs on a read-write connection to the source and the
         swap happens while that connection is still open, so the source's
@@ -1196,8 +1209,8 @@ class Workspace:
         closed. Writers on the far side of the swap therefore stat the new
         inode and still find the flag, and writers that stat before it
         re-validate their key once their slot is held, so neither can slip
-        through and commit into a file :func:`os.replace` has already
-        discarded (DuckDB's instance cache keys on the path, so an admitted
+        through and commit into a file the swap has already discarded
+        (DuckDB's instance cache keys on the path, so an admitted
         writer would have joined the pre-swap instance). The flag's own
         claim is validated under the exclusive lock too: another process's
         compact can swap the inode between this compact's stat and its
@@ -1222,9 +1235,9 @@ class Workspace:
                 :meth:`compact` is already running, if the exclusive lock
                 cannot be taken (another process, or an ro-mode
                 :class:`Workspace` on this file in this process), or if the
-                swap raises :class:`PermissionError` — on Windows a rename
-                over a file held open by this process is refused, a known
-                POSIX-first limitation (#85). Every other :class:`OSError`
+                Windows swap is refused (a handle without delete sharing —
+                duckdb older than 1.5.0 or a scanner — or a Windows/volume
+                without POSIX rename semantics, #85). Every other :class:`OSError`
                 from the swap propagates as itself.
         """
         self._require_open()
@@ -1261,7 +1274,7 @@ class Workspace:
                 # the swap: a writer in another process either commits
                 # before the lock is taken (and is copied) or cannot connect
                 # until the swap is done, so no commit can land between the
-                # snapshot and os.replace and be silently discarded.
+                # snapshot and the swap and be silently discarded.
                 try:
                     con = _connect(str(target), read_only=False)
                 except ImportError:
@@ -1307,17 +1320,12 @@ class Workspace:
                         claimed_new_key = new_key
                     # The temp was created fresh under this process's umask,
                     # so it would otherwise silently widen the workspace's
-                    # permissions across the swap. Ownership and the rest
-                    # follow the new file: chown needs privileges.
+                    # permissions across the swap (on Windows this is only
+                    # the read-only attribute; the ACL is the directory's
+                    # default, #132). Ownership and the rest follow the new
+                    # file: chown needs privileges.
                     os.chmod(tmp, stat.S_IMODE(os.stat(target).st_mode))
-                    try:
-                        os.replace(tmp, target)
-                    except PermissionError as exc:
-                        raise WorkspaceError(
-                            f"compact() could not swap the rewritten file into place: {exc}; "
-                            "on Windows this is a known limitation of the swap-under-lock "
-                            "design (#85)"
-                        ) from exc
+                    replace_file(tmp, target)
                 finally:
                     con.close()
             except BaseException:
@@ -1331,7 +1339,7 @@ class Workspace:
             # inner finally closed the source connection: DuckDB's instance
             # cache keys on the path, so releasing earlier could admit a
             # writer that joins the pre-swap instance and commits into the
-            # file os.replace has already thrown away.
+            # file the swap has already thrown away.
             try:
                 if claimed_new_key is not None:
                     _end_compact(claimed_new_key)

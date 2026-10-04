@@ -8,6 +8,7 @@ import stat
 import subprocess
 import sys
 import threading
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -16,9 +17,55 @@ import pytest
 import remora.workspace.workspace as workspace_module
 from remora.workspace.errors import SchemaVersionError, WorkspaceError, WorkspaceModeError
 from remora.workspace.schema import SCHEMA_VERSION
+from remora.workspace.swap import replace_file
 from remora.workspace.workspace import Workspace
 
 duckdb = pytest.importorskip("duckdb")
+
+
+@contextlib.contextmanager
+def _held_without_delete_sharing(path: Path) -> Iterator[None]:
+    """Hold ``path`` open on Windows the one way that refuses only a rename over it.
+
+    The handle asks for DELETE access alone and shares read and write but not
+    delete. A CRT ``open()`` would not do: it asks for read access, and
+    DuckDB opens a read-write database sharing nothing but delete, so the
+    workspace's own connect would fail on the CRT handle before compact ever
+    reached the swap. DELETE is shared by DuckDB and data access is not
+    asked for, so the connect succeeds beside this handle; the missing
+    delete sharing then refuses the rename, as a pre-1.5.0 duckdb's own
+    handle would.
+    """
+    if sys.platform != "win32":
+        raise NotImplementedError("Windows share modes only")
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    delete_access = 0x00010000
+    share_read_write = 0x00000001 | 0x00000002  # FILE_SHARE_READ | FILE_SHARE_WRITE
+    open_existing = 3
+    handle: int = kernel32.CreateFileW(
+        str(path), delete_access, share_read_write, None, open_existing, 0x80, None
+    )
+    if handle == wintypes.HANDLE(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        yield
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 class TestLifecycle:
@@ -262,13 +309,15 @@ class TestLockDiscipline:
 # written and the source's exclusive lock still held, so the parent can
 # SIGKILL it at exactly the point a hard interruption hurts most.
 _BLOCK_AT_SWAP = """
-import os, sys
+import sys
+
+import remora.workspace.workspace as workspace_module
 
 def hook(src, dst):
     print("SWAP", flush=True)
     sys.stdin.readline()
 
-os.replace = hook
+workspace_module.replace_file = hook
 
 from remora.workspace import Workspace
 
@@ -373,10 +422,10 @@ class TestCompact:
                     "VALUES (7, TIMESTAMP '2024-01-01 00:00:00')"
                 )
 
-            def boom(src: object, dst: object) -> None:
+            def boom(src: Path, dst: Path) -> None:
                 raise OSError("simulated crash before the swap")
 
-            monkeypatch.setattr("remora.workspace.workspace.os.replace", boom)
+            monkeypatch.setattr(workspace_module, "replace_file", boom)
             with pytest.raises(OSError, match="simulated crash"):
                 ws.compact()
             monkeypatch.undo()
@@ -409,10 +458,10 @@ class TestCompact:
                     "INSERT INTO pkts (frame_number, frame_time) "
                     "VALUES (1, TIMESTAMP '2024-01-01 00:00:00')"
                 )
-            real_replace = os.replace
+            real_replace = replace_file
             probed: list[bytes] = []
 
-            def probing_replace(src: object, dst: object) -> None:
+            def probing_replace(src: Path, dst: Path) -> None:
                 # A second-process writer must be locked out at the moment
                 # of the swap; otherwise its commit could be overwritten.
                 result = subprocess.run(
@@ -426,11 +475,15 @@ class TestCompact:
                     timeout=60,
                 )
                 assert result.returncode != 0
-                assert b"lock" in result.stderr.lower()
+                if sys.platform == "win32":
+                    # "The process cannot access the file ... File is already open in ..."
+                    assert b"already open in" in result.stderr.lower()
+                else:
+                    assert b"lock" in result.stderr.lower()
                 probed.append(result.stderr)
-                real_replace(src, dst)  # type: ignore[arg-type]
+                real_replace(src, dst)
 
-            monkeypatch.setattr("remora.workspace.workspace.os.replace", probing_replace)
+            monkeypatch.setattr(workspace_module, "replace_file", probing_replace)
             ws.compact()
             monkeypatch.undo()
             assert len(probed) == 1
@@ -449,11 +502,11 @@ class TestCompact:
                     "INSERT INTO pkts (frame_number, frame_time) "
                     "VALUES (1, TIMESTAMP '2024-01-01 00:00:00')"
                 )
-            real_replace = os.replace
+            real_replace = replace_file
             probed: list[str] = []
 
-            def probing_replace(src: object, dst: object) -> None:
-                real_replace(src, dst)  # type: ignore[arg-type]
+            def probing_replace(src: Path, dst: Path) -> None:
+                real_replace(src, dst)
                 # The rename, not the return, is the cross-process
                 # linearization point: it installs a new inode the old
                 # file's lock does not cover, so a second process may
@@ -479,7 +532,7 @@ class TestCompact:
                 assert result.returncode == 0, result.stderr
                 probed.append("committed")
 
-            monkeypatch.setattr("remora.workspace.workspace.os.replace", probing_replace)
+            monkeypatch.setattr(workspace_module, "replace_file", probing_replace)
             ws.compact()
             monkeypatch.undo()
             assert probed == ["committed"]
@@ -505,10 +558,10 @@ class TestCompact:
                     "INSERT INTO pkts (frame_number, frame_time) "
                     "VALUES (1, TIMESTAMP '2024-01-01 00:00:00')"
                 )
-            real_replace = os.replace
+            real_replace = replace_file
             probed: list[str] = []
 
-            def probing_replace(src: object, dst: object) -> None:
+            def probing_replace(src: Path, dst: Path) -> None:
                 # A second Workspace on the same file shares this process's
                 # DuckDB instance, so it never hits the file lock: without
                 # process-wide coordination its commit would land between
@@ -519,9 +572,9 @@ class TestCompact:
                         "VALUES (2, TIMESTAMP '2024-01-01 00:00:01')"
                     )
                 probed.append("rejected")
-                real_replace(src, dst)  # type: ignore[arg-type]
+                real_replace(src, dst)
 
-            monkeypatch.setattr("remora.workspace.workspace.os.replace", probing_replace)
+            monkeypatch.setattr(workspace_module, "replace_file", probing_replace)
             ws1.compact()
             monkeypatch.undo()
             assert probed == ["rejected"]
@@ -545,17 +598,17 @@ class TestCompact:
                     "INSERT INTO pkts (frame_number, frame_time) "
                     "VALUES (1, TIMESTAMP '2024-01-01 00:00:00')"
                 )
-            real_replace = os.replace
+            real_replace = replace_file
             probed: list[str] = []
 
-            def swapping_replace(src: object, dst: object) -> None:
-                real_replace(src, dst)  # type: ignore[arg-type]
+            def swapping_replace(src: Path, dst: Path) -> None:
+                real_replace(src, dst)
                 # Past the swap the path stats to the *new* inode, so a
                 # registry keyed only on the pre-swap identity has no entry
                 # for it and admits this writer — which then joins the
                 # pre-swap DuckDB instance (its cache keys on the path, and
                 # compact's source connection still holds it open) and
-                # commits into the file os.replace has already discarded.
+                # commits into the file replace_file has already discarded.
                 with pytest.raises(WorkspaceError, match="compact"), ws2.write() as con:
                     con.execute(
                         "INSERT INTO pkts (frame_number, frame_time) "
@@ -563,7 +616,7 @@ class TestCompact:
                     )
                 probed.append("rejected")
 
-            monkeypatch.setattr("remora.workspace.workspace.os.replace", swapping_replace)
+            monkeypatch.setattr(workspace_module, "replace_file", swapping_replace)
             ws1.compact()
             monkeypatch.undo()
             assert probed == ["rejected"]
@@ -583,22 +636,22 @@ class TestCompact:
     ) -> None:
         """Assert ``ws.write()`` is refused at the moment of the swap.
 
-        Installed as the ``os.replace`` hook: at that point the temp is
+        Installed as the ``replace_file`` hook: at that point the temp is
         written but the source has not been replaced yet, so an alias still
         resolves to compact's inode and the rejection is deterministic.
         """
-        real_replace = os.replace
+        real_replace = replace_file
 
-        def probing_replace(src: object, dst: object) -> None:
+        def probing_replace(src: Path, dst: Path) -> None:
             with pytest.raises(WorkspaceError, match="compact"), ws.write() as con:
                 con.execute(
                     "INSERT INTO pkts (frame_number, frame_time) "
                     "VALUES (2, TIMESTAMP '2024-01-01 00:00:01')"
                 )
             probed.append("rejected")
-            real_replace(src, dst)  # type: ignore[arg-type]
+            real_replace(src, dst)
 
-        monkeypatch.setattr("remora.workspace.workspace.os.replace", probing_replace)
+        monkeypatch.setattr(workspace_module, "replace_file", probing_replace)
 
     def test_write_from_hardlink_alias_during_compact_raises(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -709,7 +762,7 @@ class TestCompact:
                     "INSERT INTO pkts (frame_number, frame_time) "
                     "VALUES (1, TIMESTAMP '2024-01-01 00:00:00')"
                 )
-            real_replace = os.replace
+            real_replace = replace_file
             outcome: list[BaseException | None] = []
 
             def attempt_write() -> None:
@@ -724,7 +777,7 @@ class TestCompact:
                 else:
                     outcome.append(None)
 
-            def probing_replace(src: object, dst: object) -> None:
+            def probing_replace(src: Path, dst: Path) -> None:
                 # The registry guards threads, not just Workspace objects:
                 # a writer on another thread must be refused for compact's
                 # whole duration exactly as a second process is.
@@ -732,9 +785,9 @@ class TestCompact:
                 thread.start()
                 thread.join(timeout=60)
                 assert not thread.is_alive()
-                real_replace(src, dst)  # type: ignore[arg-type]
+                real_replace(src, dst)
 
-            monkeypatch.setattr("remora.workspace.workspace.os.replace", probing_replace)
+            monkeypatch.setattr(workspace_module, "replace_file", probing_replace)
             ws1.compact()
             monkeypatch.undo()
             assert len(outcome) == 1
@@ -745,7 +798,10 @@ class TestCompact:
                 rows = con.execute("SELECT frame_number FROM pkts").fetchall()
             assert rows == [(1,)]
 
-    @pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits")
+    @pytest.mark.skipif(
+        os.name != "posix",
+        reason="mode bits are a POSIX concept; Windows has only the read-only attribute",
+    )
     def test_compact_preserves_permission_bits(self, tmp_path: Path) -> None:
         path = tmp_path / "ws.duckdb"
         with Workspace(path, mode="rw") as ws:
@@ -776,16 +832,16 @@ class TestCompact:
     ) -> None:
         path = tmp_path / "ws.duckdb"
         with Workspace(path, mode="rw") as ws1, Workspace(path, mode="rw") as ws2:
-            real_replace = os.replace
+            real_replace = replace_file
             probed: list[str] = []
 
-            def probing_replace(src: object, dst: object) -> None:
+            def probing_replace(src: Path, dst: Path) -> None:
                 with pytest.raises(WorkspaceError, match="already in progress"):
                     ws2.compact()
                 probed.append("rejected")
-                real_replace(src, dst)  # type: ignore[arg-type]
+                real_replace(src, dst)
 
-            monkeypatch.setattr("remora.workspace.workspace.os.replace", probing_replace)
+            monkeypatch.setattr(workspace_module, "replace_file", probing_replace)
             ws1.compact()
             monkeypatch.undo()
             assert probed == ["rejected"]
@@ -853,7 +909,7 @@ class TestCompact:
         assert not decoy.exists()
         assert not decoy_wal.exists()
 
-    def test_windows_swap_failure_is_wrapped(
+    def test_swap_refusal_leaves_original_intact(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         path = tmp_path / "ws.duckdb"
@@ -864,19 +920,46 @@ class TestCompact:
                     "VALUES (7, TIMESTAMP '2024-01-01 00:00:00')"
                 )
 
-            def denied(src: object, dst: object) -> None:
-                # What a Windows rename over a file this process holds open
-                # raises; POSIX-first is tracked in #85.
-                raise PermissionError("Access is denied")
+            def refused(src: Path, dst: Path) -> None:
+                # What replace_file raises on Windows for a handle without
+                # delete sharing (duckdb < 1.5.0, a scanner) or a volume
+                # without POSIX rename semantics; see tests/test_workspace_swap.py.
+                raise WorkspaceError("simulated swap refusal")
 
-            monkeypatch.setattr("remora.workspace.workspace.os.replace", denied)
-            with pytest.raises(WorkspaceError, match=r"#85"):
+            monkeypatch.setattr(workspace_module, "replace_file", refused)
+            with pytest.raises(WorkspaceError, match="simulated swap refusal"):
                 ws.compact()
             monkeypatch.undo()
             with ws.read() as con:
                 row = con.execute("SELECT count(*) FROM pkts").fetchone()
                 assert row is not None
                 assert row[0] == 1
+            ws.compact()
+        leftovers = [p.name for p in tmp_path.iterdir() if p.name != path.name]
+        assert leftovers == []
+
+    @pytest.mark.skipif(
+        sys.platform != "win32", reason="exercises the Windows rename refusal through compact()"
+    )
+    def test_real_swap_refusal_leaves_original_intact(self, tmp_path: Path) -> None:
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw") as ws:
+            with ws.write() as con:
+                con.execute(
+                    "INSERT INTO pkts (frame_number, frame_time) "
+                    "VALUES (7, TIMESTAMP '2024-01-01 00:00:00')"
+                )
+            # No monkeypatching: the real POSIX-semantics rename is refused
+            # while a handle without delete sharing is open on the workspace.
+            with _held_without_delete_sharing(path):  # noqa: SIM117
+                with pytest.raises(WorkspaceError, match="delete sharing"):
+                    ws.compact()
+            assert not (tmp_path / "ws.duckdb.compacting").exists()
+            with ws.read() as con:
+                row = con.execute("SELECT count(*) FROM pkts").fetchone()
+                assert row is not None
+                assert row[0] == 1
+            ws.compact()  # succeeds once the holder is gone
         leftovers = [p.name for p in tmp_path.iterdir() if p.name != path.name]
         assert leftovers == []
 
@@ -928,17 +1011,24 @@ class TestCompact:
                     "INSERT INTO pkts (frame_number, frame_time) "
                     "VALUES (7, TIMESTAMP '2024-01-01 00:00:00')"
                 )
-        os.symlink(real, alias)
+        try:
+            os.symlink(real, alias)
+        except OSError as exc:  # Windows without Developer Mode / SeCreateSymbolicLinkPrivilege
+            pytest.skip(f"cannot create a symlink here: {exc}")
         with Workspace(alias, mode="rw") as ws:
             ws.compact()
             # Compaction happened at the resolved target, so the alias is
             # still a symlink to it rather than an independent regular file
-            # left over from an os.replace onto the link itself.
+            # left over from renaming the temp onto the link itself.
             with ws.read() as con:
                 rows = con.execute("SELECT frame_number FROM pkts").fetchall()
             assert rows == [(7,)]
         assert alias.is_symlink()
-        assert os.readlink(alias) == str(real)
+        if sys.platform == "win32":
+            # os.readlink may hand back a \\?\-prefixed path here.
+            assert os.path.samefile(alias, real)
+        else:
+            assert os.readlink(alias) == str(real)
         assert real.exists()
         assert not real.is_symlink()
         leftovers = sorted(
