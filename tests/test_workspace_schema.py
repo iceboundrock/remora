@@ -70,6 +70,7 @@ DDL_TARGET = re.compile(
 # it creates on a bare in-memory connection; test_workspace_lifecycle.py plants
 # foreign objects (a view, a schema) in throwaway files precisely to pin that
 # rw open() refuses a foreign database instead of grafting the layout onto it.
+# test_workspace_swap.py's Windows tests create a throwaway table on a scratch database.
 DDL_SCRATCH_FILES = frozenset(
     {
         REPO_ROOT / "tests" / "test_workspace_lifecycle.py",

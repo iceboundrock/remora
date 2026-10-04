@@ -853,7 +853,7 @@ class TestCompact:
         assert not decoy.exists()
         assert not decoy_wal.exists()
 
-    def test_windows_swap_failure_is_wrapped(
+    def test_swap_refusal_leaves_original_intact(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         path = tmp_path / "ws.duckdb"
@@ -864,26 +864,21 @@ class TestCompact:
                     "VALUES (7, TIMESTAMP '2024-01-01 00:00:00')"
                 )
 
-            def denied(src: object, dst: object) -> None:
-                # What a Windows rename over a file this process holds open
-                # raises; POSIX-first is tracked in #85. On POSIX this error
-                # propagates as-is; only Windows-specific errors are wrapped.
-                raise PermissionError("Access is denied")
+            def refused(src: Path, dst: Path) -> None:
+                # What replace_file raises on Windows for a handle without
+                # delete sharing (duckdb < 1.5.0, a scanner) or a volume
+                # without POSIX rename semantics; see tests/test_workspace_swap.py.
+                raise WorkspaceError("simulated swap refusal")
 
-            monkeypatch.setattr("remora.workspace.swap.os.replace", denied)
-            if sys.platform == "win32":
-                # On Windows, the error is wrapped in WorkspaceError
-                with pytest.raises(WorkspaceError, match=r"#85"):
-                    ws.compact()
-            else:
-                # On POSIX, PermissionError propagates as-is
-                with pytest.raises(PermissionError):
-                    ws.compact()
+            monkeypatch.setattr(workspace_module, "replace_file", refused)
+            with pytest.raises(WorkspaceError, match="simulated swap refusal"):
+                ws.compact()
             monkeypatch.undo()
             with ws.read() as con:
                 row = con.execute("SELECT count(*) FROM pkts").fetchone()
                 assert row is not None
                 assert row[0] == 1
+            ws.compact()
         leftovers = [p.name for p in tmp_path.iterdir() if p.name != path.name]
         assert leftovers == []
 

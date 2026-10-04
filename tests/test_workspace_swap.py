@@ -118,3 +118,32 @@ class TestWindowsRename:
                 os.replace(tmp, target)
         finally:
             con.close()
+
+    @pytest.mark.skipif(
+        not _duckdb_shares_delete(), reason="needs duckdb >= 1.5.0 (opens with FILE_SHARE_DELETE)"
+    )
+    def test_replace_file_with_non_bmp_directory_name(self, tmp_path: Path) -> None:
+        # FileNameLength must count UTF-16 units, not code points. A non-BMP
+        # character (an emoji in a directory name) has one more UTF-16 unit
+        # than code points. Test that the swap completes correctly.
+        duckdb = pytest.importorskip("duckdb")
+        data_dir = tmp_path / "data-😀"
+        data_dir.mkdir()
+        target = data_dir / "ws.duckdb"
+        tmp = data_dir / "ws.duckdb.compacting"
+        con = duckdb.connect(str(target), read_only=False)
+        con.execute("CREATE TABLE t AS SELECT 1 AS x")
+        other = duckdb.connect(str(tmp))
+        other.execute("CREATE TABLE t AS SELECT 2 AS x")
+        other.close()
+        # The swap must complete correctly with non-BMP characters in the path.
+        replace_file(tmp, target)
+        assert not tmp.exists()
+        assert con.execute("SELECT x FROM t").fetchall() == [(1,)]
+        con.close()
+        # The path now holds the new file.
+        check = duckdb.connect(str(target), read_only=True)
+        try:
+            assert check.execute("SELECT x FROM t").fetchall() == [(2,)]
+        finally:
+            check.close()
