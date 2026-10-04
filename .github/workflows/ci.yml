@@ -104,6 +104,7 @@ jobs:
         run: uv run mypy --strict src tests
       - name: Probe the swap primitives (temporary, #85)
         run: uv run python .github/scripts/windows_swap_probe.py
+        continue-on-error: true
       - name: Test
         run: uv run pytest -m "not integration"
         env:

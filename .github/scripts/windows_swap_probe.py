@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import subprocess
 import sys
 import tempfile
 from ctypes import wintypes
@@ -118,15 +119,32 @@ def main() -> None:
         f.write("new")
     with open(target):
         attempt("Q5 posix-semantics rename over CRT open() handle", posix_rename, tmp, target)
+        with open(tmp, "w") as f:
+            f.write("new")
         attempt("Q5 os.replace over CRT open() handle", os.replace, tmp, target)
 
     # Q6: what a second process sees while an rw connection is open (lock error text).
     target = fresh(d, "q6.duckdb", 1)
     con = duckdb.connect(target, read_only=False)
-    try:
-        duckdb.connect(target, read_only=False)
-    except Exception as exc:
-        print("Q6 second rw connect error:", repr(str(exc))[:400])
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import duckdb, sys; duckdb.connect(sys.argv[1], read_only=False)",
+            target,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if result.returncode == 0:
+        print("Q6 second-process rw connect while rw handle open: returncode=0 (no error)")
+    else:
+        stderr_tail = result.stderr[-400:] if result.stderr else ""
+        print(
+            f"Q6 second-process rw connect while rw handle open: returncode={result.returncode}"
+            f" stderr={stderr_tail!r}"
+        )
     con.close()
 
 
