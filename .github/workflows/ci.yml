@@ -106,7 +106,7 @@ jobs:
         # Codegen suites are test-only broken on Windows (locale-encoded writes,
         # /usr/bin/true fake tshark); tracked in #129. Everything else runs.
         run: >-
-          uv run pytest -m "not integration"
+          uv run pytest -rs -m "not integration"
           --ignore=tests/test_codegen_emit.py
           --ignore=tests/test_codegen_cli.py
           --ignore=tests/test_codegen_fingerprint.py
