@@ -1162,6 +1162,10 @@ class Workspace:
         file with umask defaults, so the source's mode is copied onto it
         before the rename. Ownership and other metadata follow the fresh
         file — changing them would need privileges compact does not assume.
+        On Windows only the read-only attribute is carried over, and the
+        file's access control list is the fresh temp's, inherited from the
+        directory, so an ACL tightened on the workspace file alone does not
+        survive compaction (#132).
 
         The swap is :func:`remora.workspace.swap.replace_file`: ``os.replace``
         on POSIX, and on Windows a POSIX-semantics rename
@@ -1316,8 +1320,10 @@ class Workspace:
                         claimed_new_key = new_key
                     # The temp was created fresh under this process's umask,
                     # so it would otherwise silently widen the workspace's
-                    # permissions across the swap. Ownership and the rest
-                    # follow the new file: chown needs privileges.
+                    # permissions across the swap (on Windows this is only
+                    # the read-only attribute; the ACL is the directory's
+                    # default, #132). Ownership and the rest follow the new
+                    # file: chown needs privileges.
                     os.chmod(tmp, stat.S_IMODE(os.stat(target).st_mode))
                     replace_file(tmp, target)
                 finally:
