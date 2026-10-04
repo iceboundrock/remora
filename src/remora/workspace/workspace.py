@@ -1140,10 +1140,11 @@ class Workspace:
         large after scattered deletes; this copies every schema, table and
         row into ``<name>.compacting`` beside the original (same directory,
         so the final rename never crosses a filesystem) and atomically
-        swaps it in with :func:`os.replace`. The original is only ever
-        replaced whole: an interruption at any point leaves it intact, and
-        at worst a stale temp file — plus the ``.wal`` sidecar a hard kill
-        mid-copy can leave beside it — that the next compact removes.
+        swaps it in by renaming the temp over the open original. The
+        original is only ever replaced whole: an interruption at any point
+        leaves it intact, and at worst a stale temp file — plus the ``.wal``
+        sidecar a hard kill mid-copy can leave beside it — that the next
+        compact removes.
 
         A workspace addressed through a symlink is compacted at its
         *resolved* target: the temp lives beside the real file and the swap
@@ -1204,8 +1205,8 @@ class Workspace:
         closed. Writers on the far side of the swap therefore stat the new
         inode and still find the flag, and writers that stat before it
         re-validate their key once their slot is held, so neither can slip
-        through and commit into a file :func:`os.replace` has already
-        discarded (DuckDB's instance cache keys on the path, so an admitted
+        through and commit into a file the swap has already discarded
+        (DuckDB's instance cache keys on the path, so an admitted
         writer would have joined the pre-swap instance). The flag's own
         claim is validated under the exclusive lock too: another process's
         compact can swap the inode between this compact's stat and its
@@ -1269,7 +1270,7 @@ class Workspace:
                 # the swap: a writer in another process either commits
                 # before the lock is taken (and is copied) or cannot connect
                 # until the swap is done, so no commit can land between the
-                # snapshot and os.replace and be silently discarded.
+                # snapshot and the swap and be silently discarded.
                 try:
                     con = _connect(str(target), read_only=False)
                 except ImportError:
@@ -1332,7 +1333,7 @@ class Workspace:
             # inner finally closed the source connection: DuckDB's instance
             # cache keys on the path, so releasing earlier could admit a
             # writer that joins the pre-swap instance and commits into the
-            # file os.replace has already thrown away.
+            # file the swap has already thrown away.
             try:
                 if claimed_new_key is not None:
                     _end_compact(claimed_new_key)

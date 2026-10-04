@@ -302,7 +302,9 @@ therefore shrinks the file mostly by itself, while *scattered* deletes — delet
 annotations, re-running `build_streams()` over and over — leave interior free
 blocks the file keeps forever. `compact()` is what reclaims those: it rewrites
 every schema, table and row into a sibling `<name>.compacting` file and swaps it
-in atomically by renaming over the open original — `os.replace` on POSIX, a POSIX-semantics `FileRenameInfoEx` rename on Windows (`remora.workspace.swap.replace_file`).
+in atomically by renaming over the open original — `os.replace` on POSIX, a
+POSIX-semantics `FileRenameInfoEx` rename on Windows
+(`remora.workspace.swap.replace_file`).
 
 | Property | Behaviour |
 | --- | --- |
@@ -649,7 +651,7 @@ operations the peer opens read-write fine.
 | Cache key components and the fingerprint blind spot | `tests/test_workspace_cachekey.py`, `tests/test_workspace_cache.py` |
 | Hit / backfill / refuse | `tests/test_workspace_materialize.py`, `tests/test_workspace_cache.py` |
 | Modes, locking, `compact()` coordination | `tests/test_workspace_lifecycle.py` |
-| compact()'s swap primitive, Windows rename semantics | `tests/test_workspace_swap.py` |
+| `compact()`'s swap primitive, Windows rename semantics | `tests/test_workspace_swap.py` |
 | Export destination safety and the two type rewrites | `tests/test_workspace_export.py` |
 | The three query-time refusals, at both the moments they fire | `tests/test_workspace_query.py` |
 | Pcap-path / cache-path parity | `tests/integration/workspace/test_parity_matrix.py` |
