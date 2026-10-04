@@ -102,9 +102,6 @@ jobs:
         run: uv sync
       - name: Typecheck (win32 branches are only reachable here)
         run: uv run mypy --strict src tests
-      - name: Probe the swap primitives (temporary, #85)
-        run: uv run python .github/scripts/windows_swap_probe.py
-        continue-on-error: true
       - name: Test
         # Codegen suites are test-only broken on Windows (locale-encoded writes,
         # /usr/bin/true fake tshark); tracked in #129. Everything else runs.
