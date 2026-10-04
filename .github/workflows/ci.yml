@@ -82,6 +82,33 @@ jobs:
           REMORA_REQUIRE_TSHARK: "1"
           REMORA_REQUIRE_DUCKDB: "1"
 
+  # Issue #85: compact() swaps the rewritten file over the original while the
+  # original's exclusive DuckDB connection is still open. That is ordinary on
+  # POSIX and the whole question on Windows, so this leg runs the suite that
+  # does not need tshark (the runner has none) on windows-latest. It is also
+  # the only leg on which mypy sees the `sys.platform == "win32"` branches and
+  # pytest runs the Windows-only tests, so Windows code is covered here or not
+  # at all. The tshark integration suite stays Linux-only for now.
+  windows:
+    name: workspace and unit suites on Windows (#85)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: uv sync
+      - name: Typecheck (win32 branches are only reachable here)
+        run: uv run mypy --strict src tests
+      - name: Probe the swap primitives (temporary, #85)
+        run: uv run python .github/scripts/windows_swap_probe.py
+      - name: Test
+        run: uv run pytest -m "not integration"
+        env:
+          REMORA_REQUIRE_DUCKDB: "1"
+
   codegen-drift:
     runs-on: ubuntu-latest
     steps:
