@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -23,12 +24,20 @@ from remora.workspace.attach import (
 )
 from remora.workspace.errors import SchemaVersionError, WorkspaceAliasError, WorkspaceError
 from remora.workspace.schema import SCHEMA_VERSION, check_compatible, create_schema
+from remora.workspace.swap import replace_file
 from remora.workspace.workspace import Mode, Workspace
 
 if TYPE_CHECKING:
     from duckdb import DuckDBPyConnection
 
 duckdb = pytest.importorskip("duckdb")
+
+
+def _duckdb_shares_delete() -> bool:
+    # duckdb opens its database with FILE_SHARE_DELETE from 1.5.0 on
+    # (duckdb/duckdb#19782); before that a live handle blocks the rename.
+    major, minor = (int(part) for part in duckdb.__version__.split(".")[:2])
+    return (major, minor) >= (1, 5)
 
 
 def make_peer(path: Path, version: str | None = None) -> Path:
@@ -755,6 +764,10 @@ class TestLiveAliasBindsToTheAttachedFile:
     refusal would hold in one mode and not the other.
     """
 
+    @pytest.mark.skipif(
+        sys.platform == "win32" and not _duckdb_shares_delete(),
+        reason="needs duckdb >= 1.5.0 (opens with FILE_SHARE_DELETE)",
+    )
     def test_a_live_alias_keeps_serving_the_file_it_was_attached_to(self, tmp_path: Path) -> None:
         peer = make_workspace(tmp_path / "peer.duckdb")
         primary = make_workspace(tmp_path / "ws.duckdb")
@@ -771,7 +784,7 @@ class TestLiveAliasBindsToTheAttachedFile:
                 # different thing entirely — DuckDB reads them through its own
                 # open descriptor — and nothing here can defend against a raw
                 # write into a database file that is open.)
-                os.replace(make_peer(tmp_path / "v1.duckdb", version="1"), peer)
+                replace_file(make_peer(tmp_path / "v1.duckdb", version="1"), peer)
                 # Replay leaves the live alias alone, and it still serves the
                 # validated file rather than the replacement now at that path.
                 with ws.read() as connection:

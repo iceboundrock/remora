@@ -349,6 +349,7 @@ class TestAtomicReplace:
         assert out.read_bytes() == good
         assert sorted(p.name for p in tmp_path.iterdir()) == ["kept.parquet", "ws.duckdb"]
 
+    @pytest.mark.skipif(os.name != "posix", reason="mode bits are POSIX-only")
     def test_temp_directory_is_private_and_beside_the_target(self, tmp_path: Path) -> None:
         # 0700 is the whole point: a temp *file* only has an unpredictable
         # name, which stops protecting the moment the name is in the directory
@@ -366,6 +367,7 @@ class TestAtomicReplace:
             first.rmdir()
             second.rmdir()
 
+    @pytest.mark.skipif(os.name != "posix", reason="mode bits are POSIX-only")
     def test_copy_writes_inside_a_private_directory(self, ro_ws: Workspace, tmp_path: Path) -> None:
         # Checked while the COPY is running, since the directory is gone by the
         # time the export returns.
@@ -422,7 +424,7 @@ class TestAtomicReplace:
         copies = [sql for sql in statements if sql.lstrip().upper().startswith("COPY ")]
         assert len(copies) == 1
         assert f"TO '{out}'" not in copies[0]
-        assert f"/{export_module._TEMP_FILE_NAME}'" in copies[0]
+        assert f"{os.sep}{export_module._TEMP_FILE_NAME}'" in copies[0]
         assert out.exists()
 
 
