@@ -302,7 +302,7 @@ therefore shrinks the file mostly by itself, while *scattered* deletes — delet
 annotations, re-running `build_streams()` over and over — leave interior free
 blocks the file keeps forever. `compact()` is what reclaims those: it rewrites
 every schema, table and row into a sibling `<name>.compacting` file and swaps it
-in atomically with `os.replace`.
+in atomically by renaming over the open original — `os.replace` on POSIX, a POSIX-semantics `FileRenameInfoEx` rename on Windows (`remora.workspace.swap.replace_file`).
 
 | Property | Behaviour |
 | --- | --- |
@@ -312,7 +312,7 @@ in atomically with `os.replace`.
 | Interruption | The original is replaced whole, so a crash at any point leaves it intact, and at worst a stale temp file the next compact removes |
 | Symlinks | Compacts the *resolved* target, so a symlink survives as a symlink. A **hard link** cannot survive an atomic swap: the replaced name gets the new inode, the other name keeps the old one, and the two diverge |
 | Permissions | Mode bits are copied onto the temp before the swap, so a `0o640` workspace is not widened to `0o644`. Ownership follows the fresh file |
-| Platform | **POSIX-only today.** Windows refuses a rename over a file the process holds open, and `compact()` raises `WorkspaceError` naming that limitation (#85) |
+| Platform | POSIX, and **Windows with duckdb ≥ 1.5.0** (which opens its database with `FILE_SHARE_DELETE`, so the file can be renamed over while compact's exclusive connection holds it) on Windows 10 1607 / Server 2016 or later, NTFS or ReFS. An older duckdb, a scanner holding the file for a moment, or a volume without POSIX rename semantics makes `compact()` raise `WorkspaceError` naming the requirement, with the workspace unchanged (#85). Paths longer than 260 characters are unverified on Windows |
 
 When to run it: after deleting a lot of annotations, after repeated
 re-materialization cycles, or before archiving a workspace — not routinely, and
@@ -649,6 +649,7 @@ operations the peer opens read-write fine.
 | Cache key components and the fingerprint blind spot | `tests/test_workspace_cachekey.py`, `tests/test_workspace_cache.py` |
 | Hit / backfill / refuse | `tests/test_workspace_materialize.py`, `tests/test_workspace_cache.py` |
 | Modes, locking, `compact()` coordination | `tests/test_workspace_lifecycle.py` |
+| compact()'s swap primitive, Windows rename semantics | `tests/test_workspace_swap.py` |
 | Export destination safety and the two type rewrites | `tests/test_workspace_export.py` |
 | The three query-time refusals, at both the moments they fire | `tests/test_workspace_query.py` |
 | Pcap-path / cache-path parity | `tests/integration/workspace/test_parity_matrix.py` |
