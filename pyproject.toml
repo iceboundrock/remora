@@ -64,7 +64,7 @@ dev = [
     # Shipped to users as the optional "arrow" extra; here unconditionally,
     # because the Arrow tests must run whether or not a user would install it.
     "pyarrow>=16",
-    "pytest>=8.0",
+    "pytest>=9.2.0",
     "ruff>=0.16.9",
     "tomli>=2.0",
     "typing-extensions>=4.4",
