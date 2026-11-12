@@ -103,6 +103,45 @@ def _dacl(path: Path) -> _Dacl:
     return _Dacl(protected="P" in flags, entries=tuple(re.findall(r"\(([^)]*)\)", sddl)))
 
 
+def _read_open_error(path: Path) -> int:
+    """Open ``path`` for reading as any other reader would; return the Win32 error, 0 if it opened.
+
+    Python's ``open()`` goes through the CRT, which folds a sharing violation
+    and an access denial into the same ``errno`` 13 and drops the Win32 code,
+    so the code is taken from ``CreateFileW`` itself. The probe shares
+    everything, so only the holder's share mode can refuse it.
+    """
+    if sys.platform != "win32":
+        raise NotImplementedError("Windows share modes only")
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    generic_read, share_all, open_existing, attribute_normal = 0x80000000, 0x7, 3, 0x80
+    handle = kernel32.CreateFileW(
+        str(path), generic_read, share_all, None, open_existing, attribute_normal, None
+    )
+    if handle == wintypes.HANDLE(-1).value:
+        return ctypes.get_last_error()
+    kernel32.CloseHandle(handle)
+    return 0
+
+
+_ERROR_SHARING_VIOLATION = 32
+
+
 def _icacls(path: Path, *args: str) -> None:
     if sys.platform != "win32":
         raise NotImplementedError("Windows ACLs only")
@@ -262,9 +301,7 @@ class TestCompactPermissions:
             if sys.platform == "win32":
                 # DuckDB holds the temp without read sharing, so nobody the
                 # directory's ACL admits could open it before the DACL landed.
-                with pytest.raises(PermissionError) as excinfo, open(tmp, "rb"):
-                    pass
-                assert excinfo.value.winerror == 32  # ERROR_SHARING_VIOLATION
+                assert _read_open_error(tmp) == _ERROR_SHARING_VIOLATION
 
         def at_detach() -> None:
             if sys.platform == "win32":
@@ -272,9 +309,7 @@ class TestCompactPermissions:
                 # held the same way while it holds rows.
                 wal = tmp.with_name(tmp.name + ".wal")
                 assert wal.exists()
-                with pytest.raises(PermissionError) as excinfo, open(wal, "rb"):
-                    pass
-                assert excinfo.value.winerror == 32
+                assert _read_open_error(wal) == _ERROR_SHARING_VIOLATION
 
         with Workspace(path, mode="rw") as ws:
             _probe_compact(
