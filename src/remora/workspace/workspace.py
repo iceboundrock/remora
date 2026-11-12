@@ -1175,8 +1175,10 @@ class Workspace:
         duckdb, a scanner holding the file for a moment, or a Windows or
         volume without POSIX rename semantics makes the swap raise
         :class:`WorkspaceError` naming the requirement, with the workspace
-        unchanged; any other :class:`OSError` from the rename propagates
-        as itself.
+        unchanged. Access denied (Windows error 5) may mean missing delete
+        permission rather than a sharing conflict, so its original
+        :class:`PermissionError` propagates unchanged, as does any other
+        unclassified :class:`OSError` from the rename.
 
         The copy runs on a read-write connection to the source and the
         swap happens while that connection is still open, so the source's
@@ -1237,8 +1239,10 @@ class Workspace:
                 :class:`Workspace` on this file in this process), or if the
                 Windows swap is refused (a handle without delete sharing —
                 duckdb older than 1.5.0 or a scanner — or a Windows/volume
-                without POSIX rename semantics, #85). Every other :class:`OSError`
-                from the swap propagates as itself.
+                without POSIX rename semantics, #85).
+            OSError: An unclassified failure from the swap, unchanged. This
+                includes :class:`PermissionError` for Windows access denied
+                (error 5), which may mean missing delete permission.
         """
         self._require_open()
         if self._mode == "ro":

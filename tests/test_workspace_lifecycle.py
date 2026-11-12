@@ -411,8 +411,9 @@ class TestCompact:
         leftovers = [p.name for p in tmp_path.iterdir() if p.name != path.name]
         assert leftovers == []
 
+    @pytest.mark.parametrize("error_type", [OSError, PermissionError])
     def test_interrupted_compact_leaves_original_intact(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error_type: type[OSError]
     ) -> None:
         path = tmp_path / "ws.duckdb"
         with Workspace(path, mode="rw") as ws:
@@ -422,18 +423,24 @@ class TestCompact:
                     "VALUES (7, TIMESTAMP '2024-01-01 00:00:00')"
                 )
 
+            error = error_type("simulated crash before the swap")
+
             def boom(src: Path, dst: Path) -> None:
-                raise OSError("simulated crash before the swap")
+                raise error
 
             monkeypatch.setattr(workspace_module, "replace_file", boom)
-            with pytest.raises(OSError, match="simulated crash"):
+            with pytest.raises(error_type, match="simulated crash") as excinfo:
                 ws.compact()
+            assert excinfo.value is error
             monkeypatch.undo()
             # Original untouched, temp cleaned up.
             with ws.read() as con:
                 row = con.execute("SELECT count(*) FROM pkts").fetchone()
                 assert row is not None
                 assert row[0] == 1
+            assert not path.with_name(path.name + ".compacting").exists()
+            assert not path.with_name(path.name + ".compacting.wal").exists()
+            ws.compact()  # the refusal must release both identity flags and the connection
         leftovers = [p.name for p in tmp_path.iterdir() if p.name != path.name]
         assert leftovers == []
 

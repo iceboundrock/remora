@@ -39,7 +39,6 @@ __all__ = ["explain_rename_error", "replace_file"]
 # Win32 error codes the rename is expected to meet. Two environmental
 # refusals get a WorkspaceError that says what to do; everything else
 # propagates as the OSError it is.
-_ERROR_ACCESS_DENIED = 5
 _ERROR_SHARING_VIOLATION = 32
 _ERROR_NOT_SUPPORTED = 50
 _ERROR_INVALID_PARAMETER = 87
@@ -48,19 +47,22 @@ _ERROR_INVALID_PARAMETER = 87
 def explain_rename_error(winerror: int | None, dst: Path) -> str | None:
     """Return the :class:`WorkspaceError` message for a classified swap refusal.
 
-    ``ERROR_ACCESS_DENIED`` and ``ERROR_SHARING_VIOLATION`` mean a handle on
-    ``dst`` was opened without delete sharing: a DuckDB older than 1.5.0, or
-    a scanner that has the file for a moment. ``ERROR_INVALID_PARAMETER``
-    and ``ERROR_NOT_SUPPORTED`` mean this Windows or volume cannot perform a
+    ``ERROR_SHARING_VIOLATION`` means a handle on ``dst`` was opened without
+    delete sharing: a DuckDB older than 1.5.0, or a scanner that has the file
+    for a moment. ``ERROR_INVALID_PARAMETER`` and ``ERROR_NOT_SUPPORTED``
+    mean this Windows or volume cannot perform a
     POSIX-semantics rename at all. Both leave the workspace unchanged, and
     the message says so. Any other code — including ``None`` — returns
-    ``None``, and the caller re-raises the original error.
+    ``None``, and the caller re-raises the original error. In particular,
+    ``ERROR_ACCESS_DENIED`` (5) does not establish a sharing conflict: it can
+    also mean missing delete permission on the file and its directory, so
+    the original :class:`PermissionError` propagates unchanged.
 
     Args:
         winerror: The Win32 error code from the failed rename, or ``None``.
         dst: The workspace file the swap was going to replace.
     """
-    if winerror in (_ERROR_ACCESS_DENIED, _ERROR_SHARING_VIOLATION):
+    if winerror == _ERROR_SHARING_VIOLATION:
         return (
             f"compact() could not swap the rewritten file over {dst}: the file is held "
             f"open by a handle without delete sharing (Windows error {winerror}). DuckDB "
@@ -184,8 +186,10 @@ def replace_file(src: Path, dst: Path) -> None:
             perform a POSIX-semantics rename. See :func:`explain_rename_error`.
         OSError: On Windows, when ``src`` cannot be opened for the rename:
             the error as the system reported it, naming ``src``, unclassified,
-            with both files unchanged. Anything else the rename reports,
-            unchanged.
+            with both files unchanged. Unclassified rename errors also
+            propagate unchanged, including :class:`PermissionError` for
+            access denied (Windows error 5), which may mean missing delete
+            permission rather than a sharing conflict.
     """
     if sys.platform == "win32":
         # Opening the temp is outside the classifying try: its failure is

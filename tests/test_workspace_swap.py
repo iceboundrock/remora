@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import remora.workspace.swap as swap_module
 from conftest import duckdb_shares_delete
 from remora.workspace.errors import WorkspaceError
 from remora.workspace.swap import explain_rename_error, replace_file
@@ -26,16 +27,19 @@ def test_replace_file_renames_over_the_destination(tmp_path: Path) -> None:
 
 
 class TestExplainRenameError:
-    @pytest.mark.parametrize("code", [5, 32])
-    def test_no_delete_sharing_names_duckdb_floor_and_retry(
-        self, code: int, tmp_path: Path
-    ) -> None:
-        message = explain_rename_error(code, tmp_path / "ws.duckdb")
+    def test_no_delete_sharing_names_duckdb_floor_and_retry(self, tmp_path: Path) -> None:
+        message = explain_rename_error(32, tmp_path / "ws.duckdb")
         assert message is not None
         assert "delete sharing" in message
         assert "1.5.0" in message
         assert "retry" in message
         assert "ws.duckdb" in message
+
+    def test_access_denied_is_not_diagnosed_as_a_sharing_conflict(self, tmp_path: Path) -> None:
+        # ERROR_ACCESS_DENIED can mean missing delete rights on the target
+        # and its directory. Preserve the OS error rather than advise a retry
+        # or DuckDB upgrade that cannot fix those permissions.
+        assert explain_rename_error(5, tmp_path / "ws.duckdb") is None
 
     @pytest.mark.parametrize("code", [50, 87])
     def test_unsupported_names_the_platform_requirement(self, code: int, tmp_path: Path) -> None:
@@ -51,6 +55,39 @@ class TestExplainRenameError:
 
 @windows_only
 class TestWindowsRename:
+    def test_access_denied_from_rename_propagates_unchanged(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        if sys.platform != "win32":
+            pytest.fail("Windows rename semantics only")
+        import ctypes
+
+        target = tmp_path / "old"
+        tmp = tmp_path / "new"
+        target.write_bytes(b"old")
+        tmp.write_bytes(b"new")
+        error = ctypes.WinError(5)
+        error.filename = str(target)
+
+        def denied(handle: int, dst: Path) -> None:
+            assert dst == target
+            raise error
+
+        # Inject only the rename's OS error: opening and closing the source
+        # handle still use the real Windows implementation.
+        with monkeypatch.context() as patch:
+            patch.setattr(swap_module, "_rename_handle", denied)
+            with pytest.raises(PermissionError) as excinfo:
+                replace_file(tmp, target)
+        assert excinfo.value is error
+        assert excinfo.value.winerror == 5
+        assert excinfo.value.filename == str(target)
+        assert target.read_bytes() == b"old"
+        assert tmp.read_bytes() == b"new"
+        replace_file(tmp, target)
+        assert target.read_bytes() == b"new"
+        assert not tmp.exists()
+
     @pytest.mark.skipif(
         not duckdb_shares_delete(), reason="needs duckdb >= 1.5.0 (opens with FILE_SHARE_DELETE)"
     )
