@@ -1,6 +1,6 @@
 # remora-fingerprint: v1
-# tshark: 4.6.6
-# dump-sha256: 630382087156e14bd89d187b03f348d56b4e3b966b05d17d41fc2ec9c09f008e
+# tshark: 4.6.9
+# dump-sha256: cc1997a091bc54fed0977474101bcff6e86a8f39122e1e6da416c24516dab324
 # env: plugins=sha256:8654174b828b
 # generator: remora 0.1.0
 
@@ -142,8 +142,6 @@ class DNS(ProtocolBase):
     kx_key_exchange: Field[str]
     key_key_id: Field[int]
     dnskey_flags_key_revoked: Field[bool]
-    dnskey_flags_reserved: Field[int]
-    dnskey_flags_secure_entry_point: Field[bool]
     tkey_key_size: Field[int]
     cert_key_tag: Field[int]
     rrsig_key_tag: Field[int]
@@ -275,6 +273,7 @@ class DNS(ProtocolBase):
     flags_rcode: Field[int]
     caa_iodef: Field[str]
     response_to: Field[int]
+    dnskey_flags_reserved: Field[int]
     resp_z_reserved: Field[int]
     dnscrypt_resolver_public_key: Field[bytes]
     flags_response: Field[bool]
@@ -296,6 +295,7 @@ class DNS(ProtocolBase):
     dsync_scheme: Field[int]
     zonemd_scheme: Field[int]
     opt_client_scope: Field[int]
+    dnskey_flags_secure_entry_point: Field[bool]
     tlsa_selector: Field[int]
     zonemd_serial: Field[int]
     dnscrypt_serial_number: Field[bytes]
