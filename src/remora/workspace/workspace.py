@@ -45,7 +45,6 @@ the claim retried against the new file on a mismatch.
 from __future__ import annotations
 
 import os
-import stat
 import threading
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -82,6 +81,7 @@ from remora.workspace.materialize import (
     detect_tshark_version,
     materialize_into,
 )
+from remora.workspace.permissions import copy_permissions
 from remora.workspace.query import Query
 from remora.workspace.schema import check_compatible, create_schema
 from remora.workspace.streams import StreamsResult, build_streams
@@ -1158,14 +1158,21 @@ class Workspace:
         whole duration), but a hardlinked alias goes on referring to the
         pre-compact file.
 
-        Permission bits are preserved across the swap: the temp is a fresh
-        file with umask defaults, so the source's mode is copied onto it
-        before the rename. Ownership and other metadata follow the fresh
-        file — changing them would need privileges compact does not assume.
-        On Windows only the read-only attribute is carried over, and the
-        file's access control list is the fresh temp's, inherited from the
-        directory, so an ACL tightened on the workspace file alone does not
-        survive compaction (#132).
+        Access restrictions survive the swap, and the temp has them before
+        it holds any data. DuckDB creates the temp with this process's
+        defaults (the umask on POSIX, the directory's inherited ACL on
+        Windows). As soon as the temp exists, while it is still an empty
+        database, :func:`remora.workspace.permissions.copy_permissions`
+        gives it the source's mode bits and, on Windows, the source's DACL
+        and its inheritance setting. A ``0o640`` workspace stays ``0o640``,
+        and a Windows workspace made private inside a shared directory stays
+        private (#132). If the restrictions cannot be carried over, compact
+        raises :class:`WorkspaceError` before copying any row, and the
+        workspace is unchanged. Ownership and other metadata follow the
+        fresh file, because changing them would need privileges compact does
+        not assume. DuckDB creates its ``.wal`` sidecars, the temp's
+        included, with the defaults, so the directory's permissions protect
+        a workspace's data and the file's alone do not (#147).
 
         The swap is :func:`remora.workspace.swap.replace_file`: ``os.replace``
         on POSIX, and on Windows a POSIX-semantics rename
@@ -1236,7 +1243,9 @@ class Workspace:
                 this file is in flight in this process, if another
                 :meth:`compact` is already running, if the exclusive lock
                 cannot be taken (another process, or an ro-mode
-                :class:`Workspace` on this file in this process), or if the
+                :class:`Workspace` on this file in this process), if the
+                workspace file's access restrictions cannot be carried onto
+                the temp (refused before any row is copied), or if the
                 Windows swap is refused (a handle without delete sharing —
                 duckdb older than 1.5.0 or a scanner — or a Windows/volume
                 without POSIX rename semantics, #85).
@@ -1311,6 +1320,23 @@ class Workspace:
                     row = con.execute("SELECT current_database()").fetchone()
                     assert row is not None
                     con.execute(f"ATTACH '{_quote_path(str(tmp))}' AS compact_dst")
+                    # DuckDB has just created the temp with this process's
+                    # defaults (the umask; on Windows the directory's
+                    # inherited ACL), which may be wider than the workspace
+                    # file's own restrictions. Carry those over while the
+                    # temp is still an empty database, so no row is ever
+                    # written into it while it is more open than the
+                    # workspace (its .wal sidecar is out of reach, #147). If
+                    # that is impossible, refuse before copying anything.
+                    try:
+                        copy_permissions(target, tmp)
+                    except OSError as exc:
+                        raise WorkspaceError(
+                            f"compact() could not give the rewritten file the access "
+                            f"restrictions of {target} ({exc}), and refuses rather than copy "
+                            "the workspace into a file other users may be able to open. "
+                            "The workspace is unchanged"
+                        ) from exc
                     con.execute(f"COPY FROM DATABASE {_quote_ident(str(row[0]))} TO compact_dst")
                     con.execute("DETACH compact_dst")
                     new_key = _file_key(tmp)
@@ -1322,13 +1348,6 @@ class Workspace:
                         # after the swap but before this compact fully ends.
                         _begin_compact(new_key, target)
                         claimed_new_key = new_key
-                    # The temp was created fresh under this process's umask,
-                    # so it would otherwise silently widen the workspace's
-                    # permissions across the swap (on Windows this is only
-                    # the read-only attribute; the ACL is the directory's
-                    # default, #132). Ownership and the rest follow the new
-                    # file: chown needs privileges.
-                    os.chmod(tmp, stat.S_IMODE(os.stat(target).st_mode))
                     replace_file(tmp, target)
                 finally:
                     con.close()
