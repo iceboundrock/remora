@@ -6,8 +6,18 @@ on:
   pull_request:
 
 jobs:
+  # Every job that installs tshark pins its image instead of using
+  # `ubuntu-latest`, because the image decides which tshark the tests meet.
+  # The stock build here must stay 4.2.2 (noble), the pre-4.4 escaper that
+  # `tshark-ppa` is measured against, and the PPA jobs need a series where
+  # `ppa:wireshark-dev/stable` actually reaches the runner. When `ubuntu-latest`
+  # rolled to 26.04 (resolute), stock tshark became 4.6.4, the PPA had no tshark
+  # binaries for that image's amd64v3 package architecture (so the PPA jobs got
+  # 4.6.4 too), and tshark could no longer read the checkout's fixtures. Moving
+  # these jobs to a newer image means re-checking the 4.2.2 assumptions in
+  # AGENTS.md and the `codegen.toml` pin's availability there.
   checks:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -58,7 +68,7 @@ jobs:
   # One Python version is enough: what varies here is the tshark build.
   tshark-ppa:
     name: tests against pinned tshark (>= 4.4 unescape path)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.2.0
@@ -83,7 +93,7 @@ jobs:
           REMORA_REQUIRE_DUCKDB: "1"
 
   codegen-drift:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.2.0
