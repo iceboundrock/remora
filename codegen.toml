@@ -4,10 +4,11 @@
 # docs point here. The pinned tshark version appears nowhere else.
 
 [tshark]
-# Pinned tshark: the version ppa:wireshark-dev/stable ships for ubuntu-latest.
+# Pinned tshark: the version ppa:wireshark-dev/stable ships for noble, the
+# ubuntu-24.04 image the CI tshark jobs pin.
 # Bumping it requires regenerating all committed artifacts
 # (`uv run python -m remora.codegen write`).
-version = "4.6.6"
+version = "4.6.9"
 
 [generate]
 # tshark protocol abbrevs generated and committed under src/remora/proto/

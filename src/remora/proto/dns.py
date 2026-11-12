@@ -1,6 +1,6 @@
 # remora-fingerprint: v1
-# tshark: 4.6.6
-# dump-sha256: 630382087156e14bd89d187b03f348d56b4e3b966b05d17d41fc2ec9c09f008e
+# tshark: 4.6.9
+# dump-sha256: cc1997a091bc54fed0977474101bcff6e86a8f39122e1e6da416c24516dab324
 # env: plugins=sha256:8654174b828b
 # generator: remora 0.1.0
 
@@ -149,8 +149,6 @@ class DNS(ProtocolBase):
         "kx_key_exchange": ("dns.kx.key_exchange", "FT_STRING", 0),
         "key_key_id": ("dns.key.key_id", "FT_UINT16", 0),
         "dnskey_flags_key_revoked": ("dns.dnskey.flags.key_revoked", "FT_BOOLEAN", 0),
-        "dnskey_flags_reserved": ("dns.dnskey.flags.reserved", "FT_UINT16", 0),
-        "dnskey_flags_secure_entry_point": ("dns.dnskey.flags.secure_entry_point", "FT_BOOLEAN", 0),
         "tkey_key_size": ("dns.tkey.key_size", "FT_UINT16", 0),
         "cert_key_tag": ("dns.cert.key_tag", "FT_UINT16", 0),
         "rrsig_key_tag": ("dns.rrsig.key_tag", "FT_UINT16", 0),
@@ -282,6 +280,7 @@ class DNS(ProtocolBase):
         "flags_rcode": ("dns.flags.rcode", "FT_UINT16", 0),
         "caa_iodef": ("dns.caa.iodef", "FT_STRING", 0),
         "response_to": ("dns.response_to", "FT_FRAMENUM", 0),
+        "dnskey_flags_reserved": ("dns.dnskey.flags.reserved", "FT_UINT16", 0),
         "resp_z_reserved": ("dns.resp.z.reserved", "FT_UINT16", 0),
         "dnscrypt_resolver_public_key": ("dns.dnscrypt.resolver_public_key", "FT_BYTES", 0),
         "flags_response": ("dns.flags.response", "FT_BOOLEAN", 0),
@@ -303,6 +302,7 @@ class DNS(ProtocolBase):
         "dsync_scheme": ("dns.dsync.scheme", "FT_UINT8", 0),
         "zonemd_scheme": ("dns.zonemd.scheme", "FT_UINT8", 0),
         "opt_client_scope": ("dns.opt.client.scope", "FT_UINT8", 0),
+        "dnskey_flags_secure_entry_point": ("dns.dnskey.flags.secure_entry_point", "FT_BOOLEAN", 0),
         "tlsa_selector": ("dns.tlsa.selector", "FT_UINT8", 0),
         "zonemd_serial": ("dns.zonemd.serial", "FT_UINT32", 0),
         "dnscrypt_serial_number": ("dns.dnscrypt.serial_number", "FT_BYTES", 0),

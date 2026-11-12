@@ -4,7 +4,7 @@ Everything under `src/remora/proto/` except `_meta.py` and `__init__.py` — and
 
 ```text
 # remora-fingerprint: v1
-# tshark: 4.6.6
+# tshark: 4.6.9
 # dump-sha256: <sha256 of the canonicalized `tshark -G fields` dump>
 # env: plugins=sha256:<12 hex of the `tshark -G plugins` name/version/type columns>
 # generator: remora <version>
@@ -14,7 +14,7 @@ Everything under `src/remora/proto/` except `_meta.py` and `__init__.py` — and
 
 The single source of truth for the toolchain is **`codegen.toml`** at the repo root:
 
-- `[tshark] version` — the pinned tshark (tracks what `ppa:wireshark-dev/stable` ships for `ubuntu-latest`). The pin appears nowhere else; CI and the docs defer to it.
+- `[tshark] version` — the pinned tshark (tracks what `ppa:wireshark-dev/stable` ships for noble, the `ubuntu-24.04` image CI pins). The pin appears nowhere else; CI and the docs defer to it.
 - `[generate] protocols` — the committed core protocol set; `multi` — the hand-curated multi-value field abbrevs (`-G fields` carries no multiplicity signal).
 - `[extras.<name>] protocols` — protocols shipped by the separate `remora-<name>` distributions under `packages/` (`wireless`, `industrial`, `telecom` are the only accepted names). A protocol may be assigned to core *or* to one extra, never both.
 
@@ -36,9 +36,9 @@ That is the expected outcome on a developer machine — your Wireshark is almost
 
 Past the pin check, `check` exits 1 and prints a unified diff per drifted file (plus a line for any missing file, and for any *orphan* — a fingerprinted file still on disk that the current `codegen.toml` no longer generates). `write` overwrites every destination and exits 0 — except that a protocol abbrev in `codegen.toml` that the dump does not contain fails both commands loudly with exit 2 rather than being skipped. Both accept `--config`, `--proto-dir`, `--packages-dir`, and `--tshark` if you need to point them somewhere else; the defaults assume you run from the repository root.
 
-Regeneration is **architecture-neutral** (issue #97): run it natively on whatever your host is. Two things make it so. The canonicalized `-G fields` dump is the same text on either architecture under one pinned tshark — a native arm64 run of the pinned 4.6.6 reproduces the `dump-sha256` of the committed artifacts, which CI's amd64 `codegen-drift` job independently keeps green. And the `env:` line hashes only the `(name, version, type)` columns of each `-G plugins` record — never the fourth, path column, which embeds the multiarch triplet (`/usr/lib/x86_64-linux-gnu/...` vs `aarch64-linux-gnu`) and used to confine reproduction to amd64 by itself. The PPA publishes the same tshark revision for both architectures, so the pin is reachable either way.
+Regeneration is **architecture-neutral** (issue #97): run it natively on whatever your host is. Two things make it so. The canonicalized `-G fields` dump is the same text on either architecture under one pinned tshark — a native arm64 run of the pinned tshark reproduces the `dump-sha256` of the committed artifacts (first measured on 4.6.6), which CI's amd64 `codegen-drift` job independently keeps green. And the `env:` line hashes only the `(name, version, type)` columns of each `-G plugins` record — never the fourth, path column, which embeds the multiarch triplet (`/usr/lib/x86_64-linux-gnu/...` vs `aarch64-linux-gnu`) and used to confine reproduction to amd64 by itself. The PPA publishes the same tshark revision for both architectures, so the pin is reachable either way.
 
-`.github/workflows/codegen-arch-verify.yml` is what measures this directly: a matrix `probe` job running natively on GitHub-managed `ubuntu-latest` (x86_64) and `ubuntu-24.04-arm` (aarch64), plus a `compare` job that diffs the two results so the verdict is the job status. Only the two matrix legs run `.github/scripts/codegen_arch_probe.py` — each on its own architecture, uploading its report as an artifact; `compare` runs no tshark and no probe of its own, it downloads both reports and fails unless their `tshark`, `dump-sha256` and `env` lines are identical (`machine:` is expected to differ). The probe reads the pin from `codegen.toml` and **exits 2 rather than probing** if the installed tshark is not that version — evidence collected under an unpinned toolchain would compare two builds that were never the same.
+`.github/workflows/codegen-arch-verify.yml` is what measures this directly: a matrix `probe` job running natively on GitHub-managed `ubuntu-24.04` (x86_64) and `ubuntu-24.04-arm` (aarch64), plus a `compare` job that diffs the two results so the verdict is the job status. Only the two matrix legs run `.github/scripts/codegen_arch_probe.py` — each on its own architecture, uploading its report as an artifact; `compare` runs no tshark and no probe of its own, it downloads both reports and fails unless their `tshark`, `dump-sha256` and `env` lines are identical (`machine:` is expected to differ). The probe reads the pin from `codegen.toml` and **exits 2 rather than probing** if the installed tshark is not that version — evidence collected under an unpinned toolchain would compare two builds that were never the same.
 
 It has two triggers. `workflow_dispatch` runs it on demand, against any ref. A paths-filtered `pull_request` trigger runs it automatically on pull requests that touch what the architecture claim rests on — `src/remora/codegen/fingerprint.py`, the probe script, `codegen.toml`, or the workflow file — so a change to the fingerprint scheme or the pin re-proves the claim on both architectures before it merges. Every other pull request leaves it idle. It is evidence-gathering, not the guard on committed bytes: `codegen-drift` in `ci.yml` is that.
 
