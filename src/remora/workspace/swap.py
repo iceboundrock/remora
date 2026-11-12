@@ -179,6 +179,11 @@ def replace_file(src: Path, dst: Path) -> None:
     has delete sharing — true of DuckDB 1.5.0 and later. ``dst`` is replaced
     whole or not at all; on failure both files are as they were.
 
+    This primitive is intended for compact's freshly created regular temp
+    file, not as a general replacement for ``os.replace``. If ``src`` is a
+    symlink, Windows follows it and renames its target, whereas POSIX renames
+    the link itself. Compact never passes a source symlink.
+
     Raises:
         WorkspaceError: On Windows, when ``dst`` is held by a handle without
             delete sharing (a DuckDB older than 1.5.0, or a scanner that has
