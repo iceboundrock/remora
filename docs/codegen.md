@@ -78,7 +78,7 @@ uv run ruff check . && uv run ruff format --check . \
 
 | You changed | Remediation |
 |---|---|
-| The emitter (`src/remora/codegen/emit.py`) or the mangle policy (`mangle.py`) | Regenerate everything with `write` (Docker recipe above); commit the regenerated tree in the same PR. Both files are frozen contracts — changing them rewrites every artifact, so expect a large diff. |
+| The emitter (`src/remora/codegen/emit.py`), the mangle policy (`mangle.py`), or the field order `fingerprint.py` hands the emitter (abbrev-sorted since #70) | Regenerate everything with `write` (Docker recipe above); commit the regenerated tree in the same PR. All three are frozen contracts — changing any of them rewrites every artifact, so expect a large diff. |
 | `codegen.toml`: added a protocol, curated a `multi` entry, moved a protocol between core and an extra | Same: regenerate with `write` and commit. A protocol moved between destinations leaves the old file behind — `git rm` it, or `check` reports it as an orphan. |
 | `codegen.toml`: removed a protocol | `write` does not delete anything. Delete the stale `.py`/`.pyi` pair by hand, then re-run `check` until the orphan report is empty. |
 | `[tshark] version`, deliberately | Regenerate with `write` under the new pin; pin bump and regenerated artifacts land as one PR, never separately. |

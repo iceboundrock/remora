@@ -441,6 +441,34 @@ class TestGenerateArtifacts:
         assert '"srcport": ("udp.srcport", "FT_UINT16", 0),' in py
         assert '"stream": ("udp.stream", "FT_UINT32", 0),' in py
 
+    def test_fields_are_emitted_in_abbrev_order(self) -> None:
+        """Stub order follows the abbrev column, not the display-name-led record lines.
+
+        The canonical dump sorts whole lines, which start with the display
+        name, so it would put ``udp.srcport`` ("Source Port") between
+        ``udp.length`` ("Length") and ``udp.stream`` ("Stream index") and pull
+        ``udp.length.bad`` ("Bad length") to the front. Sorted by abbrev, the
+        ``length*`` attrs sit together (#70).
+        """
+        dump = canonicalize_dump(
+            "P\tUser Datagram Protocol\tudp\n"
+            "F\tSource Port\tudp.srcport\tFT_UINT16\tudp\tBASE_PT_UDP\t0x0\t\n"
+            "F\tStream index\tudp.stream\tFT_UINT32\tudp\tBASE_DEC\t0x0\t\n"
+            "F\tLength\tudp.length\tFT_UINT16\tudp\tBASE_DEC\t0x0\t\n"
+            "F\tBad length\tudp.length.bad\tFT_NONE\tudp\t\t0x0\t\n"
+        )
+        artifacts, _ = generate_artifacts(_config(), dump)
+        py, pyi = (artifact.content for artifact in artifacts)
+        expected = ["length", "length_bad", "srcport", "stream"]
+        table_attrs = [
+            line.strip().split('"')[1] for line in py.splitlines() if line.startswith('        "')
+        ]
+        assert table_attrs == expected
+        stub_attrs = [
+            line.strip().split(":")[0] for line in pyi.splitlines() if line.startswith("    ")
+        ]
+        assert stub_attrs == expected
+
     def test_multi_flag_flows_through(self) -> None:
         artifacts, _ = generate_artifacts(_config(multi=frozenset({"udp.stream"})), SAMPLE_DUMP)
         assert '"stream": ("udp.stream", "FT_UINT32", 1),' in artifacts[0].content
@@ -487,7 +515,9 @@ class TestGenerateArtifacts:
         assert isinstance(first, ParseWarning)
         assert first.line_no == 4
         assert isinstance(second, EmitWarning)
-        assert second.abbrev == "udp.a-b"
+        # Fields reach the emitter in abbrev order (#70): "-" (0x2D) sorts before
+        # "." (0x2E), so udp.a-b takes the attr and udp.a.b is the skipped one.
+        assert second.abbrev == "udp.a.b"
 
     def test_colliding_module_names_raise(self) -> None:
         # Create a dump with two protocols that mangle to the same name:
@@ -741,7 +771,8 @@ class TestMain:
         assert main(self._argv("write", config_file, proto_dir)) == 0
         captured = capsys.readouterr()
         assert "warning: -G fields line 4: unknown record type 'Z'" in captured.err
-        assert "warning: udp.a-b: attribute name 'a_b' already taken" in captured.err
+        # Abbrev order (#70): udp.a-b sorts first and keeps the attr.
+        assert "warning: udp.a.b: attribute name 'a_b' already taken by 'udp.a-b'" in captured.err
 
     def test_write_creates_missing_proto_dir(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]

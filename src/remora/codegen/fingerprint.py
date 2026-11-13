@@ -305,7 +305,15 @@ def _emit_protocols(
         protocol = by_abbrev.get(abbrev)
         if protocol is None:
             raise ValueError(f"protocol {abbrev!r} not found in the -G fields dump")
-        fields = [field for field in dictionary.fields if field.parent == abbrev]
+        # Abbrev order, not dump order: the canonical dump is sorted by whole
+        # record lines, which start with the display name, so dump order would
+        # scatter ``tcp.flags.*`` across the stub alphabetically by description.
+        # Sorting by abbrev groups related attrs (#70). Field abbrevs are unique
+        # after parsing, so the key is total and the order needs no tie-break.
+        fields = sorted(
+            (field for field in dictionary.fields if field.parent == abbrev),
+            key=lambda field: field.abbrev,
+        )
         module = emit_protocol(protocol, fields, multi)
         if module.module_name in module_name_to_abbrev:
             prior_abbrev = module_name_to_abbrev[module.module_name]

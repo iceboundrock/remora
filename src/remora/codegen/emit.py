@@ -33,8 +33,8 @@ exception: a non-``FT_NONE`` field displaces an already-selected
 expert/structural markers with no extractable value, so binding the shared
 attr to the data field is always the better trade, and the preference makes
 the winner of a marker/data pair independent of dump ordering. The losing
-field is skipped and recorded as an :class:`EmitWarning`; no collision is
-ever silent.
+field is skipped and recorded as an :class:`EmitWarning` naming the field the
+attr is finally bound to; no collision is ever silent.
 
 Line length: emitted lines can exceed the repo's 100-column ruff limit when
 field abbrevs or mangled attr names are long. A ``.py`` table entry line is
@@ -47,10 +47,12 @@ one line by design; the shipped tree (issue #19) ignores E501 for
 ``src/remora/proto/*`` and excludes the directory from ruff format, so the
 committed bytes match this emitter exactly.
 
-Determinism: output is byte-deterministic *in input field order*, so
-reproducible bytes require the canonicalized dump order produced at the
-``_tshark_dumps`` seam in :mod:`remora.codegen.fingerprint` (issue #68) —
-tshark's own ``-G fields`` emission order varies between runs.
+Determinism: output is byte-deterministic *in input field order*, and the
+input order is the output order. The generator in
+:mod:`remora.codegen.fingerprint` passes each protocol's fields sorted by
+abbrev (issue #70), which keeps related attributes together in the stubs and
+makes the output independent of tshark's ``-G fields`` emission order, which
+varies between runs (issue #68).
 """
 
 from __future__ import annotations
@@ -118,11 +120,17 @@ def _resolve_attrs(
     ``FT_NONE`` one, in place, keeping the attr at its original output
     position. That makes the winner of a marker/data pair independent of dump
     ordering. Every other collision stays first-wins, and no collision is ever
-    silent — the losing field always gets an :class:`EmitWarning`.
+    silent — the losing field always gets an :class:`EmitWarning`, whose text
+    names the field that finally holds the attr, not whichever held it when
+    the loser was met.
     """
     attrs: list[tuple[str, FieldDef]] = []
     index_by_name: dict[str, int] = {}
-    warnings: list[EmitWarning] = []
+    # Each loser in event order, as (field, attr, displaced). Messages are rendered
+    # only once every field is resolved, so a skipped field names the *final*
+    # binding: in a three-way collision (marker m1, marker m2, data d), m2 is
+    # skipped while m1 holds the attr, but d displaces m1 afterwards (#70).
+    losers: list[tuple[FieldDef, str, bool]] = []
     for field in fields:
         # Strip against the module's protocol abbrev, not ``field.parent``: the attribute
         # namespace belongs to the module. Fields registered under a different parent
@@ -133,23 +141,23 @@ def _resolve_attrs(
             prior = attrs[prior_index][1]
             if prior.ftype == "FT_NONE" and field.ftype != "FT_NONE":
                 attrs[prior_index] = (attr, field)
-                warnings.append(
-                    EmitWarning(
-                        prior.abbrev,
-                        f"attribute name {attr!r} reassigned to data field "
-                        f"{field.abbrev!r}; FT_NONE marker field skipped",
-                    )
-                )
+                losers.append((prior, attr, True))
             else:
-                warnings.append(
-                    EmitWarning(
-                        field.abbrev,
-                        f"attribute name {attr!r} already taken by {prior.abbrev!r}; field skipped",
-                    )
-                )
+                losers.append((field, attr, False))
             continue
         index_by_name[attr] = len(attrs)
         attrs.append((attr, field))
+    warnings: list[EmitWarning] = []
+    for loser, attr, displaced in losers:
+        winner = attrs[index_by_name[attr]][1]
+        if displaced:
+            message = (
+                f"attribute name {attr!r} reassigned to data field "
+                f"{winner.abbrev!r}; FT_NONE marker field skipped"
+            )
+        else:
+            message = f"attribute name {attr!r} already taken by {winner.abbrev!r}; field skipped"
+        warnings.append(EmitWarning(loser.abbrev, message))
     return attrs, warnings
 
 
