@@ -6,6 +6,7 @@
 
 from datetime import datetime
 from ipaddress import IPv4Address, IPv6Address
+from uuid import UUID
 
 from remora.fields import Field
 from remora.proto._meta import ProtocolBase
@@ -36,7 +37,7 @@ class DHCP(ProtocolBase):
     client_id_time: Field[int]
     client_id_type: Field[int]
     client_id_undef: Field[str]
-    client_id_uuid: Field[str]
+    client_id_uuid: Field[UUID]
     client_network_id_major: Field[int]
     client_network_id_minor: Field[int]
     cookie: Field[IPv4Address]

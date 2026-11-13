@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from ipaddress import IPv4Address, IPv6Address
 from typing import TypeAlias
+from uuid import UUID
 
 import pytest
 
@@ -49,6 +50,10 @@ TIME = FieldRef[datetime]("frame.time", "FT_ABSOLUTE_TIME", False)
 QNAME = FieldRef[str]("dns.qry.name", "FT_STRING", True)
 PAYLOAD = FieldRef[bytes]("tcp.payload", "FT_BYTES", False)
 RESP = FieldRef[float]("icmp.resptime", "FT_DOUBLE", False)
+CLIENT_UUID = FieldRef[UUID]("dhcp.client_id.uuid", "FT_GUID", False)
+# Declared multi here only to exercise the LIST path; shipped scalar.
+SESSION_UUID = FieldRef[UUID]("sip.Session-ID.local_uuid", "FT_GUID", True)
+EUI64 = FieldRef[bytes]("dns.eui64", "FT_EUI64", False)
 
 EMPTY = FakePacket({})
 
@@ -86,6 +91,17 @@ class Case:
 
 
 _MOMENT = datetime(2021, 7, 1, tzinfo=timezone.utc)  # epoch 1625097600
+
+#: dhcp.client_id.uuid in tests/fixtures/guid_eui64.pcap, as tshark prints it.
+_GUID_A = "33221100-5544-7766-8899-aabbccddeeff"
+_GUID_B = "ab30317f-1a78-4dc4-8ff8-24d0d3715d86"
+#: Below _GUID_A by text (and uuid.UUID) order, above it by tshark 4.2.2's
+#: host-endian struct order, which is why ordered GUID comparisons stay off -Y.
+_GUID_LOW = "00000034-0000-0000-0000-000000000000"
+_GUID_A_UPPER = _GUID_A.upper()
+_UUID_A = UUID(_GUID_A)
+_UUID_B = UUID(_GUID_B)
+_EUI64_FLOOR = bytes.fromhex("0200000000000000")
 
 CASES: tuple[Case, ...] = (
     Case(
@@ -469,6 +485,125 @@ CASES: tuple[Case, ...] = (
             (FakePacket({"ip.ttl": ("65",)}), False),
             (EMPTY, False),
         ),
+    ),
+    # GUIDs and EUI-64s (#69). The dfilter goldens are fed to a real tshark by
+    # tests/test_dfilter_validation.py; tests/integration/test_guid_eui64.py
+    # compares the row sets against one.
+    Case(
+        # An upper-case literal is the same UUID, rendered bare and canonical.
+        id="guid-eq",
+        expr=CLIENT_UUID == _GUID_A_UPPER,
+        dfilter=f"dhcp.client_id.uuid == {_GUID_A}",
+        rows=(
+            (FakePacket({"dhcp.client_id.uuid": (_GUID_A,)}), True),
+            (FakePacket({"dhcp.client_id.uuid": (_GUID_B,)}), False),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
+        id="not-guid-eq-absent-is-true",
+        expr=CLIENT_UUID != _UUID_A,
+        dfilter=f"!(dhcp.client_id.uuid == {_GUID_A})",
+        rows=(
+            (FakePacket({"dhcp.client_id.uuid": (_GUID_A,)}), False),
+            (FakePacket({"dhcp.client_id.uuid": (_GUID_B,)}), True),
+            (EMPTY, True),
+        ),
+    ),
+    Case(
+        id="guid-in-set",
+        expr=CLIENT_UUID.in_([_UUID_A, _GUID_B]),
+        dfilter=f"dhcp.client_id.uuid in {{{_GUID_A}, {_GUID_B}}}",
+        rows=(
+            (FakePacket({"dhcp.client_id.uuid": (_GUID_B,)}), True),
+            (FakePacket({"dhcp.client_id.uuid": (_GUID_LOW,)}), False),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
+        # Refused on -Y: tshark 4.2.2 orders GUIDs by their host-endian struct.
+        id="guid-gt-refused",
+        expr=CLIENT_UUID > _GUID_LOW,
+        dfilter=None,
+        rows=(
+            (FakePacket({"dhcp.client_id.uuid": (_GUID_A,)}), True),
+            (FakePacket({"dhcp.client_id.uuid": (_GUID_LOW,)}), False),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
+        id="guid-range-refused",
+        expr=CLIENT_UUID.in_([(_GUID_LOW, _GUID_A)]),
+        dfilter=None,
+        rows=(
+            (FakePacket({"dhcp.client_id.uuid": (_GUID_A,)}), True),
+            (FakePacket({"dhcp.client_id.uuid": (_GUID_B,)}), False),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
+        id="guid-multi-value-eq-any-occurrence",
+        expr=SESSION_UUID == _GUID_B,
+        dfilter=f"sip.Session-ID.local_uuid == {_GUID_B}",
+        rows=(
+            (FakePacket({"sip.Session-ID.local_uuid": (_GUID_A, _GUID_B)}), True),
+            (FakePacket({"sip.Session-ID.local_uuid": (_GUID_A,)}), False),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
+        id="guid-multi-value-lt-any-occurrence",
+        expr=SESSION_UUID < _GUID_A,
+        dfilter=None,
+        rows=(
+            (FakePacket({"sip.Session-ID.local_uuid": (_GUID_B, _GUID_LOW)}), True),
+            (FakePacket({"sip.Session-ID.local_uuid": (_GUID_A, _GUID_B)}), False),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
+        id="eui64-eq",
+        expr=EUI64 == "0211223344556677",
+        dfilter="dns.eui64 == 02:11:22:33:44:55:66:77",
+        rows=(
+            (FakePacket({"dns.eui64": ("02:11:22:33:44:55:66:77",)}), True),
+            (FakePacket({"dns.eui64": ("02:11:22:33:44:55:66:78",)}), False),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
+        # Byte order is printed order on every engine, so ordering pushes down.
+        id="eui64-gt",
+        expr=EUI64 > _EUI64_FLOOR,
+        dfilter="dns.eui64 > 02:00:00:00:00:00:00:00",
+        rows=(
+            (FakePacket({"dns.eui64": ("02:11:22:33:44:55:66:77",)}), True),
+            (FakePacket({"dns.eui64": ("01:ff:ff:ff:ff:ff:ff:ff",)}), False),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
+        id="eui64-range",
+        expr=EUI64.in_([("02:00:00:00:00:00:00:00", "02:ff:00:00:00:00:00:00")]),
+        dfilter="dns.eui64 in {02:00:00:00:00:00:00:00 .. 02:ff:00:00:00:00:00:00}",
+        rows=(
+            (FakePacket({"dns.eui64": ("02:11:22:33:44:55:66:77",)}), True),
+            (FakePacket({"dns.eui64": ("fe:00:00:00:00:00:a1:b2",)}), False),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
+        # Refused on -Y (tshark 4.2.2 rejects contains on an EUI-64) and in SQL
+        # (BLOB); the predicate backend runs it as a byte subsequence.
+        id="eui64-contains-refused",
+        expr=EUI64.contains(b"\x11\x22"),
+        dfilter=None,
+        rows=(
+            (FakePacket({"dns.eui64": ("02:11:22:33:44:55:66:77",)}), True),
+            (FakePacket({"dns.eui64": ("02:22:11:33:44:55:66:77",)}), False),
+            (EMPTY, False),
+        ),
+        sql_refusal="BLOB",
     ),
 )
 
@@ -854,6 +989,12 @@ _SAMPLE_LITERALS: dict[type, LiteralValue] = {
     IPv6Address: IPv6Address("2001:db8::1"),
     datetime: datetime(2026, 1, 1, tzinfo=timezone.utc),
     timedelta: timedelta(seconds=1),
+    UUID: UUID("ab30317f-1a78-4dc4-8ff8-24d0d3715d86"),
+}
+
+#: Ftypes whose literal check refuses the py_type's generic sample.
+_SAMPLE_LITERAL_OVERRIDES: dict[str, LiteralValue] = {
+    "FT_EUI64": bytes(8),  # exactly 8 bytes (#69)
 }
 
 
@@ -871,6 +1012,6 @@ def test_every_ftype_py_type_is_a_valid_comparison_literal(ftype: str) -> None:
         f"no sample literal for py_type {info.py_type.__name__}; "
         "add it to _SAMPLE_LITERALS (and to expr.LiteralValue if needed)"
     )
-    sample = _SAMPLE_LITERALS[info.py_type]
+    sample = _SAMPLE_LITERAL_OVERRIDES.get(ftype, _SAMPLE_LITERALS[info.py_type])
     expr = Comparison(CompareOp.EQ, FieldRef[object]("x.sample", ftype, False), sample)
     compile_predicate(expr)  # coerce_literal must accept the ftype's own py_type

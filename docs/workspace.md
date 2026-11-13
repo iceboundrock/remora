@@ -173,6 +173,14 @@ attached. That refuses every version 2 file, including those whose captures
 have no pre-1970 frames, because the stored rows cannot vouch for themselves:
 re-materialize the capture into a fresh workspace file.
 
+Issue #69 is the same case with a column type instead of a parse. It typed
+`FT_GUID` fields as `uuid.UUID`, stored in a `UUID` column, and `FT_EUI64` fields
+as 8 `bytes`, stored in a `BLOB` column; version 3 stored both as `VARCHAR`
+text. A version 3 file's field registry and its columns agree with each other,
+so nothing but the version row tells it apart, and reusing it would hand back
+text where the protocol stubs now promise a `UUID` or `bytes`. The schema
+version went to 4, and a version 3 file is refused the same way.
+
 ### The fingerprint's blind spot
 
 Fingerprinting is `size + mtime_ns + 64 KiB from each end` because materializing
@@ -377,8 +385,8 @@ database onto the destination path mid-export is not defended against.
 ### Two deliberate type divergences
 
 Types pass through as themselves — `UINTEGER` IPv4 stays `uint32`, narrow ints
-keep their width, `TIMESTAMP` is `timestamp[us]`, `BLOB` is `binary`, a
-multi-value `T[]` stays `list<T>`. Exactly two stored types cannot be represented
+keep their width, `TIMESTAMP` is `timestamp[us]`, `BLOB` is `binary`, `UUID`
+keeps Parquet's `UUID` logical type, a multi-value `T[]` stays `list<T>`. Exactly two stored types cannot be represented
 exactly by DuckDB's Parquet writer, and a documented type change beats a silent
 corruption:
 
@@ -401,7 +409,10 @@ handled there the same way — DuckDB exports `UHUGEINT` through Arrow as
 `decimal128(38, 0)` read as **signed**, so every address with the high bit set
 (all of `fe80::/10` and `ff00::/8`) would come back negative. `arrow()` casts
 those columns to `VARCHAR` in the SELECT list; the stored type is untouched, and
-the DuckDB-native iteration path decodes straight to `IPv6Address`.
+the DuckDB-native iteration path decodes straight to `IPv6Address`. An `FT_GUID`
+column needs no cast but does change type on the way: DuckDB exports `UUID`
+through Arrow as its canonical text, so `arrow()` returns a `string` column
+where iteration returns `uuid.UUID`.
 
 ## Semantics: NULL and regex
 

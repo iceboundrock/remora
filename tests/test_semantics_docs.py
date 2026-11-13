@@ -11,6 +11,7 @@ from __future__ import annotations
 import re
 from datetime import datetime, timezone
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 
@@ -36,6 +37,9 @@ ESCAPES_END = "<!-- fields-escapes:end -->"
 
 ABS_TIME_START = "<!-- abs-time-forms:start -->"
 ABS_TIME_END = "<!-- abs-time-forms:end -->"
+
+GUID_EUI64_START = "<!-- guid-eui64-forms:start -->"
+GUID_EUI64_END = "<!-- guid-eui64-forms:end -->"
 
 
 def read_doc() -> str:
@@ -170,6 +174,38 @@ def test_each_absolute_time_form_reads_as_the_doc_says(printed: str, reading: st
             convert("FT_ABSOLUTE_TIME", printed)
         return
     assert convert("FT_ABSOLUTE_TIME", printed) == _ABS_TIME_READINGS[reading]
+
+
+def guid_eui64_rows() -> list[tuple[str, str, str]]:
+    """Parse the marked GUID/EUI-64 table into (ftype, printed, reads as) triples."""
+    body = read_doc().split(GUID_EUI64_START, 1)[1].split(GUID_EUI64_END, 1)[0]
+    rows: list[tuple[str, str, str]] = []
+    for raw in body.splitlines():
+        line = raw.strip()
+        if not line.startswith("|") or set(line) <= set("|-: "):
+            continue
+        cells = [cell.strip() for cell in line.strip("|").split("|")]
+        if len(cells) != 4 or cells[0] == "ftype":
+            continue
+        rows.append((cells[0].strip("`"), cells[2].strip("`"), cells[3]))
+    return rows
+
+
+def test_the_guid_eui64_table_covers_every_measured_field() -> None:
+    # Two GUID and two EUI-64 fields of tests/fixtures/guid_eui64.pcap (#69).
+    assert len(guid_eui64_rows()) == 4
+
+
+@pytest.mark.parametrize(("ftype", "printed", "reading"), guid_eui64_rows())
+def test_each_guid_eui64_form_reads_as_the_doc_says(ftype: str, printed: str, reading: str) -> None:
+    value = convert(ftype, printed)
+    if reading == "`UUID`":
+        assert isinstance(value, UUID)
+        assert str(value) == printed
+    else:
+        assert reading == "8 `bytes`"
+        assert isinstance(value, bytes)
+        assert value.hex(":") == printed
 
 
 def test_the_doc_names_the_zone_tshark_is_pinned_to() -> None:

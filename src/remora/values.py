@@ -32,17 +32,37 @@ FT_ABSOLUTE_TIME          datetime (aware, UTC)       epoch seconds (``"16250976
                                                       (``"Jul  1, 2021 00:00:00.123456789 UTC"``);
                                                       ``"NULL"`` (the zero time) -> the epoch
 FT_RELATIVE_TIME          timedelta                   seconds, e.g. ``"0.000123"``
+FT_EUI64                  bytes (exactly 8)           ``"02:11:22:33:44:55:66:77"`` or
+                                                      ``"0211223344556677"``
+FT_GUID                   uuid.UUID                   ``"ab30317f-1a78-4dc4-8ff8-24d0d3715d86"``
+                                                      (either case)
 FT_DOUBLE, FT_FLOAT       float                       anything :func:`float` accepts
 FT_STRING, FT_STRINGZ,    str                         identity (returned unchanged)
 FT_NONE, FT_STRINGZPAD,
-FT_UINT_STRING, FT_EUI64,
-FT_OID, FT_GUID, FT_AX25
+FT_UINT_STRING, FT_OID,
+FT_AX25
 ========================  ==========================  =======================================
 
-The last six are carried as ``str`` deliberately, not for lack of a better
-idea: richer typing (EUI-64/GUID as bytes, OID as a tuple of ints) is tracked
-in issue #69, and would change the shipped static type of every field using
-them.
+GUIDs and EUI-64s (issue #69)
+-----------------------------
+Both are read from the text tshark prints, never from wire bytes: a GUID is
+the 8-4-4-4-12 hex form and an EUI-64 is eight colon-separated hex pairs, in
+``-T fields`` and ``-T ek`` alike, on 4.2.2 and 4.6.9. A dissector that reads a
+little-endian GUID off the wire (``dhcp.client_id.uuid``) has already swapped
+it into the printed form, so the :class:`uuid.UUID` is the one Wireshark shows.
+An EUI-64's bytes are in printed order, first pair first, which is also the
+order that makes ``bytes`` comparison agree with Wireshark's.
+
+Only those forms (plus contiguous hex for an EUI-64, as for ``FT_ETHER``) are
+accepted. :class:`uuid.UUID` itself would also take braces, a ``urn:uuid:``
+prefix and hyphens anywhere, and :meth:`bytes.fromhex` takes spaces between
+pairs; none of those is a rendering tshark produces, so they raise. A ``bytes``
+literal for an EUI-64 field must be exactly 8 bytes long, the same check the
+text form gets.
+
+``FT_OID``, ``FT_UINT_STRING``, ``FT_STRINGZPAD`` and ``FT_AX25`` stay ``str``
+by decision (#69): an OID's richer form is an open question (#149), and the
+other three are text on the wire or in the display.
 
 Unknown ftypes fall back to ``str`` (identity), so new or exotic dissector
 types degrade gracefully instead of failing.
@@ -93,6 +113,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from ipaddress import IPv4Address, IPv6Address
 from typing import Any, Generic, TypeVar
+from uuid import UUID
 
 __all__ = ["FTYPE_TABLE", "FTypeInfo", "coerce_literal", "convert", "get_info"]
 
@@ -110,6 +131,10 @@ class FTypeInfo(Generic[T]):
     """User literal text -> value, where it must read differently from what
     tshark prints; ``None`` means :attr:`parse` serves both. Only
     ``FT_ABSOLUTE_TIME`` needs it: see :func:`_parse_absolute_time_literal`."""
+    check_literal: Callable[[T], T] | None = None
+    """Validates a user literal that is already of :attr:`py_type`; raises
+    ValueError. ``None`` accepts any value of the type. Only ``FT_EUI64`` needs
+    it, because ``bytes`` alone does not say how many."""
 
 
 def _identity(raw: str) -> str:
@@ -140,6 +165,44 @@ def _parse_ether(raw: str) -> bytes:
     if len(value) != 6:
         raise ValueError(f"invalid MAC address (need 6 bytes, got {len(value)}): {raw!r}")
     return value
+
+
+#: An EUI-64 as tshark prints it (eight colon-separated pairs), or as 16
+#: contiguous hex digits. Nothing looser: see the module docstring.
+_EUI64_TEXT = re.compile(r"[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){7}|[0-9A-Fa-f]{16}", re.ASCII)
+
+_EUI64_LENGTH = 8
+
+
+def _parse_eui64(raw: str) -> bytes:
+    """Parse an EUI-64 (``"02:11:22:33:44:55:66:77"``) into exactly 8 bytes."""
+    text = raw.strip()
+    if _EUI64_TEXT.fullmatch(text) is None:
+        raise ValueError(
+            f"invalid EUI-64 (need 8 colon-separated hex pairs or 16 hex digits): {raw!r}"
+        )
+    return bytes.fromhex(text.replace(":", ""))
+
+
+def _check_eui64(value: bytes) -> bytes:
+    """Refuse a ``bytes`` EUI-64 literal that is not exactly 8 bytes long."""
+    if len(value) != _EUI64_LENGTH:
+        raise ValueError(f"invalid EUI-64 (need 8 bytes, got {len(value)}): {value!r}")
+    return value
+
+
+#: A GUID as tshark prints it: 8-4-4-4-12 hex digits, in either case.
+_GUID_TEXT = re.compile(
+    r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}", re.ASCII
+)
+
+
+def _parse_guid(raw: str) -> UUID:
+    """Parse a GUID (``"ab30317f-1a78-4dc4-8ff8-24d0d3715d86"``) into a UUID."""
+    text = raw.strip()
+    if _GUID_TEXT.fullmatch(text) is None:
+        raise ValueError(f"invalid GUID (need 8-4-4-4-12 hex digits): {raw!r}")
+    return UUID(text)
 
 
 _TRUE_LITERALS = frozenset({"1", "True", "true"})
@@ -349,16 +412,14 @@ _INT_FTYPES = (
 )
 
 _STR_FTYPES = (
-    # Surfaced by the issue #19 core protocol set. These already resolved to
-    # ``str`` through the unknown-ftype fallback; listing them makes the choice
-    # deliberate rather than accidental, so `test_every_ftype_is_known` can hold
-    # the line on genuinely unrecognized ftypes. Richer typing (EUI-64 and GUID
-    # as bytes, OID as a tuple of ints) is tracked in issue #69 — changing them
-    # changes the shipped static type of every field that uses them.
-    "FT_EUI64",  # dns, icmpv6
+    # Surfaced by the issue #19 core protocol set, and kept as ``str`` by the
+    # issue #69 decision: listing them makes the choice deliberate rather than
+    # accidental, so `test_every_ftype_is_known` can hold the line on genuinely
+    # unrecognized ftypes. A richer OID type is researched in #149; the other
+    # three are text. Changing any of them changes the shipped static type of
+    # every field that uses it.
     "FT_OID",  # snmp, tls
     "FT_UINT_STRING",  # ssh
-    "FT_GUID",  # dhcp, sip
     "FT_STRINGZPAD",  # dhcp, stp
     "FT_AX25",  # arp
 )
@@ -368,6 +429,8 @@ FTYPE_TABLE: Mapping[str, FTypeInfo[Any]] = {
     "FT_IPv6": FTypeInfo(IPv6Address, IPv6Address),
     "FT_ETHER": FTypeInfo(bytes, _parse_ether),
     "FT_BYTES": FTypeInfo(bytes, _parse_bytes),
+    "FT_EUI64": FTypeInfo(bytes, _parse_eui64, check_literal=_check_eui64),
+    "FT_GUID": FTypeInfo(UUID, _parse_guid),
     "FT_BOOLEAN": FTypeInfo(bool, _parse_bool),
     "FT_ABSOLUTE_TIME": FTypeInfo(datetime, _parse_absolute_time, _parse_absolute_time_literal),
     "FT_RELATIVE_TIME": FTypeInfo(timedelta, _parse_relative_time),
@@ -397,7 +460,9 @@ def convert(ftype: str, raw: str) -> object:
 def coerce_literal(ftype: str, value: object) -> object:
     """Normalize a user-supplied comparison literal to the field's Python type.
 
-    - Values already of the field's Python type pass through unchanged.
+    - Values already of the field's Python type pass through unchanged, once
+      the ftype's literal check accepts them (an ``FT_EUI64`` ``bytes`` literal
+      must be 8 bytes long; ValueError otherwise).
     - ``str`` values are parsed with the field's literal parse function, which
       is its parse function except where a user literal must read differently
       from tshark's rendering (``FT_ABSOLUTE_TIME``'s negative epoch seconds);
@@ -414,7 +479,7 @@ def coerce_literal(ftype: str, value: object) -> object:
             f"bool literal {value!r} is not valid for {ftype} (expects {py_type.__name__})"
         )
     if isinstance(value, py_type):
-        return value
+        return value if info.check_literal is None else info.check_literal(value)
     if isinstance(value, str):
         return (info.parse_literal or info.parse)(value)
     if py_type is float and isinstance(value, int):

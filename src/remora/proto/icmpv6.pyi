@@ -11,7 +11,7 @@ from remora.fields import Field
 from remora.proto._meta import ProtocolBase
 
 class ICMPV6(ProtocolBase):
-    f_6lowpannd_da_eui64: Field[str]
+    f_6lowpannd_da_eui64: Field[bytes]
     f_6lowpannd_da_lifetime: Field[int]
     f_6lowpannd_da_reg_addr: Field[IPv6Address]
     f_6lowpannd_da_rsv: Field[int]
@@ -132,7 +132,7 @@ class ICMPV6(ProtocolBase):
     opt_abro_version_high: Field[int]
     opt_abro_version_low: Field[int]
     opt_advertisement_interval: Field[int]
-    opt_aro_eui64: Field[str]
+    opt_aro_eui64: Field[bytes]
     opt_aro_registration_lifetime: Field[int]
     opt_aro_status: Field[int]
     opt_captive_portal: Field[str]
@@ -178,7 +178,7 @@ class ICMPV6(ProtocolBase):
     opt_ipv6_address: Field[IPv6Address]
     opt_length: Field[int]
     opt_linkaddr: Field[bytes]
-    opt_linkaddr_eui64: Field[str]
+    opt_linkaddr_eui64: Field[bytes]
     opt_lla_bytes: Field[bytes]
     opt_lla_option_code: Field[int]
     opt_map_distance: Field[int]
@@ -236,9 +236,9 @@ class ICMPV6(ProtocolBase):
     opt_route_lifetime: Field[int]
     opt_rsa_key_hash: Field[bytes]
     opt_src_linkaddr: Field[bytes]
-    opt_src_linkaddr_eui64: Field[str]
+    opt_src_linkaddr_eui64: Field[bytes]
     opt_target_linkaddr: Field[bytes]
-    opt_target_linkaddr_eui64: Field[str]
+    opt_target_linkaddr_eui64: Field[bytes]
     opt_timestamp: Field[datetime]
     opt_type: Field[int]
     pointer: Field[int]

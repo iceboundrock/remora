@@ -216,3 +216,65 @@ class TestInfinityLiterals:
 
     def test_string_literal_parsed_to_infinity_renders(self) -> None:
         assert compile_dfilter(RESPTIME == "inf") == "icmp.resptime == inf"
+
+
+CLIENT_UUID = StubField("dhcp.client_id.uuid", "FT_GUID")
+EUI64 = StubField("dns.eui64", "FT_EUI64")
+GUID_TEXT = "33221100-5544-7766-8899-aabbccddeeff"
+GUID_TEXT_UPPER = GUID_TEXT.upper()
+EUI48 = bytes.fromhex("021122334455")
+
+
+class TestGuidAndEui64:
+    """What #69's two richer ftypes push down, and what they refuse.
+
+    The refusals are tshark version differences (4.2.2 vs 4.6.9), recorded in
+    the module docstring of remora.compile.dfilter; the row sets are compared
+    against a live tshark in tests/integration/test_guid_eui64.py.
+    """
+
+    def test_guid_literal_renders_bare_and_lower_case(self) -> None:
+        # A quoted GUID is a dfilter error; the bare form is accepted in either case.
+        assert compile_dfilter(CLIENT_UUID == GUID_TEXT_UPPER) == (
+            f"dhcp.client_id.uuid == {GUID_TEXT}"
+        )
+
+    @pytest.mark.parametrize("op", ["lt", "le", "gt", "ge"])
+    def test_ordered_guid_comparisons_are_refused(self, op: str) -> None:
+        expr = getattr(CLIENT_UUID, f"__{op}__")(GUID_TEXT)
+        with pytest.raises(UnsupportedExprError, match="FT_GUID"):
+            compile_dfilter(expr)
+
+    def test_guid_range_is_refused_but_a_set_is_not(self) -> None:
+        low = "00000034-0000-0000-0000-000000000000"
+        with pytest.raises(UnsupportedExprError, match="FT_GUID"):
+            compile_dfilter(CLIENT_UUID.in_([(low, GUID_TEXT)]))
+        assert compile_dfilter(CLIENT_UUID.in_([low, GUID_TEXT])) == (
+            f"dhcp.client_id.uuid in {{{low}, {GUID_TEXT}}}"
+        )
+
+    def test_user_errors_surface_before_the_refusal(self) -> None:
+        # Refusing would hand the expression to the predicate backend, which
+        # raises the same error; raising it here keeps the timing identical.
+        with pytest.raises(ValueError, match="GUID"):
+            compile_dfilter(CLIENT_UUID > "not-a-guid")
+        with pytest.raises(ValueError, match="inverted"):
+            compile_dfilter(CLIENT_UUID.in_([(GUID_TEXT, "00000034-0000-0000-0000-000000000000")]))
+        with pytest.raises(TypeError):
+            compile_dfilter(EUI64.contains("11:22"))
+        with pytest.raises(TypeError):
+            compile_dfilter(CLIENT_UUID.contains(b"\x33"))
+
+    def test_eui64_orders_and_ranges_push_down(self) -> None:
+        assert compile_dfilter(EUI64 >= "0211223344556677") == (
+            "dns.eui64 >= 02:11:22:33:44:55:66:77"
+        )
+
+    def test_eui64_contains_is_refused(self) -> None:
+        with pytest.raises(UnsupportedExprError, match="FT_EUI64"):
+            compile_dfilter(EUI64.contains(b"\x11\x22"))
+
+    def test_eui64_literal_of_the_wrong_length_is_a_user_error(self) -> None:
+        # Wireshark rejects "02:11" for an EUI-64 field; so does every backend.
+        with pytest.raises(ValueError, match="EUI-64"):
+            compile_dfilter(EUI64 == EUI48)

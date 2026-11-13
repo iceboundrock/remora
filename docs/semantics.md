@@ -368,6 +368,72 @@ asserting the ek and `-T fields` values equal each other and the instants the
 fixtures were built with, including when the caller's own zone is not UTC and
 for pre-epoch frames, whose residual predicates it also runs in both modes.
 
+## Reader representation: GUIDs and EUI-64s
+
+Issue #69 typed `FT_GUID` fields as `uuid.UUID` and `FT_EUI64` fields as exactly
+8 `bytes`; before it both were the text tshark prints. Unlike absolute times,
+each has one rendering: the same text in `-T fields` and `-T ek`, on 4.2.2 (the
+Ubuntu 24.04 package) and 4.6.9 (Homebrew), measured over
+`tests/fixtures/guid_eui64.pcap`.
+
+<!-- guid-eui64-forms:start -->
+
+| ftype | field | prints | reads as |
+| --- | --- | --- | --- |
+| `FT_GUID` | `dhcp.client_id.uuid` | `33221100-5544-7766-8899-aabbccddeeff` | `UUID` |
+| `FT_GUID` | `sip.Session-ID.local_uuid` | `ab30317f-1a78-4dc4-8ff8-24d0d3715d86` | `UUID` |
+| `FT_EUI64` | `dns.eui64` | `02:11:22:33:44:55:66:77` | 8 `bytes` |
+| `FT_EUI64` | `icmpv6.opt.src_linkaddr_eui64` | `fe:00:00:00:00:00:a1:b2` | 8 `bytes` |
+
+<!-- guid-eui64-forms:end -->
+
+The value is the printed text, never the wire bytes. `dhcp.client_id.uuid` is
+`00 11 22 .. ff` on the wire, and the dissector reads the first three groups
+little-endian, so the `UUID` is `33221100-...`, the one Wireshark shows. The SIP
+header carries `AB30317F...` in upper case without hyphens; tshark prints it
+lower-case and hyphenated. An EUI-64's bytes are in printed order.
+
+`values.py` accepts only those forms for tshark text and for user literals,
+plus 16 contiguous hex digits for an EUI-64, as for `FT_ETHER`. `uuid.UUID`
+alone would also take braces, a `urn:uuid:` prefix and hyphens anywhere, and
+`bytes.fromhex` spaces between pairs; none is a tshark rendering, so they raise
+`ValueError`. A `bytes` literal for an EUI-64 field that is not 8 bytes long
+raises `ValueError` too, which is what Wireshark does with
+`dns.eui64 == 02:11` ("too few bytes").
+
+What reaches each engine:
+
+| shape | `FT_GUID` | `FT_EUI64` |
+| --- | --- | --- |
+| `==`, `!=`, `in {a, b}` | pushed to `-Y`; SQL on a `UUID` column | pushed to `-Y`; SQL on a `BLOB` column |
+| `<`, `<=`, `>`, `>=`, `in {lo .. hi}` | refused on `-Y`, residual in Python; SQL | pushed to `-Y`; SQL |
+| `contains` | `TypeError` on every backend | refused on `-Y`, residual in Python; `UnsupportedSqlExprError` |
+| `matches` | `TypeError` on every backend | `TypeError` on every backend |
+
+Every engine that runs an ordered comparison orders these values the same way:
+a `UUID` by its 128-bit value, which is the order of its printed text, and an
+EUI-64 byte by byte. Python, DuckDB (`UUID` and `BLOB`) and tshark 4.6.9 agree.
+tshark 4.2.2 does not for GUIDs: it compares the in-memory struct, whose first
+three groups are host-endian, so on the fixture
+`dhcp.client_id.uuid > 00000034-0000-0000-0000-000000000000` selects
+`33221100-...` on 4.6.9 and nothing on 4.2.2. The dfilter backend therefore
+never sends tshark an ordered GUID comparison. `contains` on an EUI-64 is the
+other version split: 4.6.9 runs it as a byte subsequence, as the predicate
+backend does, and 4.2.2 rejects the filter (`cannot participate in contains
+comparison`), which would fail the whole capture rather than one conjunct.
+
+`tests/test_values.py` pins the accepted and refused forms,
+`tests/test_semantics_docs.py` runs the table above through the parser, the
+`guid-*` and `eui64-*` rows of `tests/test_semantics_table.py` run the three
+backends, and `tests/integration/test_guid_eui64.py` reads the fixture through
+a live tshark in both modes and a real workspace, asserting the readers agree
+and that pushdown, both residuals and the workspace's SQL select the same frames.
+
+Changing a column's type changes what a workspace stores, so #69 raised the
+workspace schema version to 4, and a version 3 file is refused at open and at
+attach (`docs/workspace.md`, "A parser change can change what a stored value
+means").
+
 ## What is still divergent
 
 - **`matches` on non-string fields** is a `TypeError` on all three backends —
@@ -375,6 +441,10 @@ for pre-epoch frames, whose residual predicates it also runs in both modes.
 - **Time literals** (`datetime`/`timedelta`) are not pushed to display filters
   (M1 decision); the planner keeps them as residual Python predicates. The row
   set is unchanged; only the execution path differs.
+- **Ordered GUID comparisons and `contains` on an EUI-64** are not pushed to
+  display filters either (#69, measured above), because tshark's answer
+  depends on its version. The planner keeps them as residual Python
+  predicates; the row set is unchanged.
 - **IEEE-754 NaN literals** reach the same row set three different ways, so this
   is a mechanism difference rather than a semantic one. Python's comparisons
   with NaN are all false, which is what `predicate.py` evaluates directly and
@@ -419,7 +489,8 @@ for pre-epoch frames, whose residual predicates it also runs in both modes.
   match over `BLOB` — its `contains()` is substring on `VARCHAR` and element
   membership on `LIST`, so a multi-value `BLOB[]` column would even be accepted,
   with the wrong meaning. The refusal names the column type the query would have
-  run against, `BLOB[]` included. The pcap path runs it.
+  run against, `BLOB[]` included. `FT_EUI64` columns are `BLOB` since #69, so it
+  covers them too. The pcap path runs it.
 - **Control bytes in `-T fields` values on tshark < 4.4** stay escaped: that
   build's escaping is not invertible (see above), so the reader refuses to
   guess and the fields-mode residual keeps diverging from the pushdown and ek

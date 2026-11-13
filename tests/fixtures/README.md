@@ -60,3 +60,16 @@ and as the epoch in `-T ek`. The capture is dated 2023-11-05, so tshark before
 |---|-------|---------------|-----------|-----------|-----------|
 | 1 | NTP client request `10.0.3.1:123 → 10.0.3.123:123` | zero | zero | zero | `00:00:05.5` |
 | 2 | NTP server reply `10.0.3.123:123 → 10.0.3.1:123` | `2023-11-04 23:59:05` | `00:00:05.5` | `00:00:06.25` | `00:00:06.75` |
+
+## guid_eui64.pcap
+
+`FT_GUID` and `FT_EUI64` values (issue #69). tshark prints each the same way in
+`-T fields` and `-T ek`, on 4.2.2 and 4.6.9.
+
+| # | Frame | Field values |
+|---|-------|--------------|
+| 1 | DHCP DISCOVER, option 97 client UUID `00 11 22 .. ff` on the wire | `dhcp.client_id.uuid` = `33221100-5544-7766-8899-aabbccddeeff` (the dissector reads the first three groups little-endian) |
+| 2 | SIP OPTIONS `10.0.4.1:5060 → 10.0.4.2:5060`, `Session-ID: AB30317F1a78...;remote=47755a9d...` | `sip.Session-ID.local_uuid` = `ab30317f-1a78-4dc4-8ff8-24d0d3715d86`, `.remote_uuid` = `47755a9d-e779-4ba3-8765-3f2099600ef2` |
+| 3 | DNS response, one EUI64 (type 109) record | `dns.eui64` = `02:11:22:33:44:55:66:77` |
+| 4 | ICMPv6 Neighbor Solicitation with a 16-byte SLLA option and an ARO | `icmpv6.opt.src_linkaddr_eui64` = `fe:00:00:00:00:00:a1:b2`, `icmpv6.opt.aro.eui64` = `02:11:22:33:44:55:66:77` |
+| 5 | DHCP DISCOVER, client UUID `34 00 .. 00` on the wire | `dhcp.client_id.uuid` = `00000034-0000-0000-0000-000000000000`: below frame 1's by text order, above it by tshark 4.2.2's host-endian struct order |

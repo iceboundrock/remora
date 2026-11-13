@@ -5,6 +5,7 @@
 # generator: remora 0.1.0
 
 from datetime import datetime
+from uuid import UUID
 
 from remora.fields import Field
 from remora.proto._meta import ProtocolBase
@@ -156,10 +157,10 @@ class SIP(ProtocolBase):
     Service_Route_user: Field[str]
     Session_Expires: Field[str]
     Session_ID: Field[str]
-    Session_ID_local_uuid: Field[str]
+    Session_ID_local_uuid: Field[UUID]
     Session_ID_logme: Field[bool]
     Session_ID_param: Field[str]
-    Session_ID_remote_uuid: Field[str]
+    Session_ID_remote_uuid: Field[UUID]
     Session_ID_sess_id: Field[bytes]
     Session_ID_sess_id_invalid: Field[str]
     Status_Code: Field[int]

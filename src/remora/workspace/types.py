@@ -15,7 +15,9 @@ ftype                     DuckDB       Arrow (for #31)            Encoded (bound
 ========================  ===========  =========================  ==================
 FT_IPv4                   UINTEGER     uint32                     int(address)
 FT_IPv6                   UHUGEINT     decimal128(38, 0)          str(int(address))
-FT_ETHER, FT_BYTES        BLOB         binary                     bytes
+FT_ETHER, FT_BYTES,       BLOB         binary                     bytes
+FT_EUI64
+FT_GUID                   UUID         string                     uuid.UUID
 FT_BOOLEAN                BOOLEAN      bool                       bool
 FT_ABSOLUTE_TIME          TIMESTAMP    timestamp[us]              naive UTC datetime
 FT_RELATIVE_TIME          INTERVAL     month_day_nano_interval    timedelta
@@ -31,8 +33,8 @@ FT_INT24, FT_INT32        INTEGER      int32                      int
 FT_INT40 .. FT_INT64      BIGINT       int64                      int
 FT_STRING, FT_STRINGZ,    VARCHAR      string                     str
 FT_NONE, FT_STRINGZPAD,
-FT_UINT_STRING, FT_EUI64,
-FT_OID, FT_GUID, FT_AX25
+FT_UINT_STRING, FT_OID,
+FT_AX25
 ========================  ===========  =========================  ==================
 
 A multi-value field's column is the scalar type's DuckDB ``LIST`` (``T[]``,
@@ -95,6 +97,18 @@ and would be a lossy, unit-erased column.
 **FT_ETHER is BLOB.** :mod:`remora.values` yields exactly 6 raw bytes, not
 text; ``BLOB`` stores them as they are, so equality and ordering stay byte-exact
 without re-formatting on every read.
+
+**FT_EUI64 is BLOB, FT_GUID is UUID (#69).** An EUI-64 is 8 raw bytes, stored
+as ``FT_ETHER``'s 6 are, and ``BLOB`` order is byte order, the order Python's
+``bytes`` and Wireshark give it. DuckDB's native ``UUID`` binds and returns
+:class:`uuid.UUID` as it is, round-trips every value exactly, and orders as
+:class:`uuid.UUID` does, by the 128-bit value (both pinned across the sign
+boundaries in ``tests/test_workspace_types.py``, measured on duckdb 1.5.6).
+``VARCHAR`` would have held the canonical text just as losslessly, but every
+read would need a parse and every bound literal a ``str()``. A Parquet export
+keeps the ``UUID`` logical type; DuckDB's Arrow export renders it as the
+canonical text, so :meth:`remora.workspace.Query.arrow` returns a ``string``
+column for it.
 
 **Timestamps are TIMESTAMP, never TIMESTAMPTZ.** DuckDB renders
 ``TIMESTAMPTZ`` through the session time zone, so one file would print
@@ -247,6 +261,8 @@ COLUMN_TYPES: Final[Mapping[str, ColumnType]] = {
     "FT_IPv6": ColumnType("UHUGEINT", _ipv6_to_decimal_text, _to_ipv6),
     "FT_ETHER": _BLOB,
     "FT_BYTES": _BLOB,
+    "FT_EUI64": _BLOB,
+    "FT_GUID": ColumnType("UUID", _identity, _identity),
     "FT_BOOLEAN": ColumnType("BOOLEAN", _identity, _identity),
     "FT_ABSOLUTE_TIME": ColumnType("TIMESTAMP", to_db_timestamp, from_db_timestamp),
     "FT_RELATIVE_TIME": ColumnType("INTERVAL", _identity, _identity),

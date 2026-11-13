@@ -4,7 +4,7 @@ Three backends lower one `Expr`, and `docs/semantics.md` states where they agree
 
 ## `dfilter.py`
 
-Renders Wireshark display-filter strings. `!=` renders `!(f == v)`. A NaN literal is refused wherever a float reaches the renderer, because Wireshark lexes `nan` as a literal whose matching is ftype- and version-dependent (#90); `inf`/`-inf` push down unchanged.
+Renders Wireshark display-filter strings. `!=` renders `!(f == v)`. A NaN literal is refused wherever a float reaches the renderer, because Wireshark lexes `nan` as a literal whose matching is ftype- and version-dependent (#90); `inf`/`-inf` push down unchanged. Ordered comparisons and ranges on `FT_GUID`, and `contains` on `FT_EUI64`, are refused too (#69): tshark 4.2.2 orders GUIDs by a host-endian struct and rejects `contains` on an EUI-64, where 4.6.9 agrees with Python. Refusals come after literal coercion and range-inversion checks, so user errors surface identically on every backend.
 
 ## `predicate.py`
 

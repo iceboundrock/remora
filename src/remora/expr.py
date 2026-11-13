@@ -46,6 +46,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from ipaddress import IPv4Address, IPv6Address
 from typing import NoReturn, Protocol, TypeAlias, cast, runtime_checkable
+from uuid import UUID
 
 __all__ = [
     "And",
@@ -94,7 +95,9 @@ class FieldLike(Protocol):
 
 # Literal values are restricted to a closed union of hashable types so that
 # every Expr node is hashable by construction (lists/dicts are rejected).
-LiteralValue = int | float | bool | str | bytes | IPv4Address | IPv6Address | datetime | timedelta
+LiteralValue = (
+    int | float | bool | str | bytes | IPv4Address | IPv6Address | datetime | timedelta | UUID
+)
 _LITERAL_TYPES: tuple[type, ...] = (
     int,
     float,
@@ -105,6 +108,7 @@ _LITERAL_TYPES: tuple[type, ...] = (
     IPv6Address,
     datetime,
     timedelta,
+    UUID,
 )
 
 
