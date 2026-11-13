@@ -349,6 +349,12 @@ parser for `FT_ABSOLUTE_TIME`. A `-` before a zero whole part (`-0.5`) can only
 be the fraction's own sign, and both read it as negative. An ISO offset whose
 minutes exceed 59 (`+0060`) raises rather than carrying into the hour.
 
+Earlier remoras read `-1.500000000` as -1.5 s, and a workspace stores
+`frame.time_epoch` read this way, so the fix raised the workspace schema
+version to 3 and a workspace written before it is refused at open and at attach
+rather than queried with the old instants (`docs/workspace.md`, "A parser
+change can change what a stored value means").
+
 `NULL` is what the NTP display base prints for the zero time in `-T fields`,
 and `-T ek` prints the same value as the epoch, so reading `NULL` as the epoch
 is what keeps the two readers equal. It is only ever the zero time: an NTP
