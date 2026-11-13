@@ -302,7 +302,9 @@ therefore shrinks the file mostly by itself, while *scattered* deletes — delet
 annotations, re-running `build_streams()` over and over — leave interior free
 blocks the file keeps forever. `compact()` is what reclaims those: it rewrites
 every schema, table and row into a sibling `<name>.compacting` file and swaps it
-in atomically with `os.replace`.
+in atomically by renaming over the open original — `os.replace` on POSIX, a
+POSIX-semantics `FileRenameInfoEx` rename on Windows
+(`remora.workspace.swap.replace_file`).
 
 | Property | Behaviour |
 | --- | --- |
@@ -311,8 +313,8 @@ in atomically with `os.replace`.
 | In-process | A `write()` or rw-mode `read()` in flight on *any* `Workspace` for this file raises `WorkspaceError`, and for compaction's duration writers and rw-mode readers fail fast the same way |
 | Interruption | The original is replaced whole, so a crash at any point leaves it intact, and at worst a stale temp file the next compact removes |
 | Symlinks | Compacts the *resolved* target, so a symlink survives as a symlink. A **hard link** cannot survive an atomic swap: the replaced name gets the new inode, the other name keeps the old one, and the two diverge |
-| Permissions | Mode bits are copied onto the temp before the swap, so a `0o640` workspace is not widened to `0o644`. Ownership follows the fresh file |
-| Platform | **POSIX-only today.** Windows refuses a rename over a file the process holds open, and `compact()` raises `WorkspaceError` naming that limitation (#85) |
+| Permissions | The temp gets the workspace file's restrictions as soon as DuckDB creates it and before any row is copied into it: the mode bits, and on Windows also the DACL and whether it inherits (#132). A `0o640` workspace stays `0o640`, and a Windows file made private inside a shared folder stays private. If they cannot be carried over, `compact()` raises `WorkspaceError` before copying anything and the workspace is unchanged. Ownership follows the fresh file. DuckDB creates its `.wal` sidecars, the temp's included, with the process defaults (on POSIX a `0o600` database gets a `0o644` `.wal` holding committed rows), so the directory's permissions protect a workspace's data and the file's alone do not (#147) |
+| Platform | POSIX, and **Windows with duckdb ≥ 1.5.0** (which opens its database with `FILE_SHARE_DELETE`, so the file can be renamed over while compact's exclusive connection holds it) on Windows 10 1607 / Server 2016 or later, NTFS (ReFS unverified). A sharing violation (Windows error 32, such as an older duckdb or a handle without delete sharing) or a volume without POSIX rename semantics makes `compact()` raise `WorkspaceError` naming the requirement, with the workspace unchanged (#85). Access denied (Windows error 5) propagates as the original `PermissionError`: it may mean missing delete permission on the workspace file and its directory, not a sharing conflict. Paths longer than 260 characters are unverified on Windows |
 
 When to run it: after deleting a lot of annotations, after repeated
 re-materialization cycles, or before archiving a workspace — not routinely, and
@@ -649,6 +651,8 @@ operations the peer opens read-write fine.
 | Cache key components and the fingerprint blind spot | `tests/test_workspace_cachekey.py`, `tests/test_workspace_cache.py` |
 | Hit / backfill / refuse | `tests/test_workspace_materialize.py`, `tests/test_workspace_cache.py` |
 | Modes, locking, `compact()` coordination | `tests/test_workspace_lifecycle.py` |
+| `compact()`'s swap primitive, Windows rename semantics | `tests/test_workspace_swap.py` |
+| `compact()`'s permission carry-over, Windows DACLs | `tests/test_workspace_permissions.py` |
 | Export destination safety and the two type rewrites | `tests/test_workspace_export.py` |
 | The three query-time refusals, at both the moments they fire | `tests/test_workspace_query.py` |
 | Pcap-path / cache-path parity | `tests/integration/workspace/test_parity_matrix.py` |

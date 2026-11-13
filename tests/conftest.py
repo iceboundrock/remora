@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import importlib.metadata
 import os
 
 import pytest
@@ -34,6 +35,23 @@ def pytest_configure(config: pytest.Config) -> None:
             f"REMORA_REQUIRE_DUCKDB is set but duckdb is not importable ({error}); "
             "install it with: pip install 'remora[workspace]'"
         ) from error
+
+
+def duckdb_shares_delete() -> bool:
+    """Whether the installed duckdb opens its database with ``FILE_SHARE_DELETE``.
+
+    duckdb does so from 1.5.0 on (duckdb/duckdb#19782); before that a live
+    handle blocks compact()'s Windows rename. Read from the distribution
+    metadata so this module never imports duckdb, and evaluated at collection
+    time, so a missing duckdb returns False rather than skipping the
+    platform-neutral tests beside the callers.
+    """
+    try:
+        version = importlib.metadata.version("duckdb")
+    except importlib.metadata.PackageNotFoundError:
+        return False
+    major, minor = (int(part) for part in version.split(".")[:2])
+    return (major, minor) >= (1, 5)
 
 
 class FakePacket:
