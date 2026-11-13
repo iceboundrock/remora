@@ -603,6 +603,17 @@ class TestParseTsharkVersion:
             parse_tshark_version("not tshark output")
 
 
+class TestRunTsharkDecodesUtf8:
+    def test_non_ascii_output_reads_back_whatever_the_locale(self) -> None:
+        # tshark writes UTF-8 on every platform, and a -G fields dump carries
+        # non-ASCII descriptions. Decoded through the locale codec, this passes
+        # on a UTF-8 locale and fails on Windows: U+201D is E2 80 9D, and
+        # cp1252 leaves 0x9D undefined (#130).
+        text = "µs ”quoted”"
+        code = f"import sys; sys.stdout.buffer.write({text.encode('utf-8')!r})"
+        assert fingerprint_module._run_tshark(sys.executable, "-c", code) == text
+
+
 class TestMain:
     def _prepare(
         self,
