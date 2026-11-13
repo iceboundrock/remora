@@ -226,9 +226,49 @@ class TestAbsoluteTime:
     def test_integer_seconds(self) -> None:
         assert convert("FT_ABSOLUTE_TIME", "0") == datetime(1970, 1, 1, tzinfo=timezone.utc)
 
-    def test_pre_epoch(self) -> None:
-        value = convert("FT_ABSOLUTE_TIME", "-1.5")
-        assert value == datetime(1969, 12, 31, 23, 59, 58, 500000, tzinfo=timezone.utc)
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            # What tshark 4.6.9 prints in -T fields for a frame stamped 0.5 s
+            # before the epoch, where -T ek prints 1969-12-31T23:59:59.5Z: the
+            # whole seconds are signed and the fraction is added to them.
+            ("-1.500000000", datetime(1969, 12, 31, 23, 59, 59, 500000, tzinfo=timezone.utc)),
+            ("-1.000000000", datetime(1969, 12, 31, 23, 59, 59, tzinfo=timezone.utc)),
+            ("-3.250000000", datetime(1969, 12, 31, 23, 59, 57, 250000, tzinfo=timezone.utc)),
+            # 1 ns before the epoch: truncating the added fraction lands on the
+            # microsecond truncating ek's "23:59:59.999999999Z" lands on.
+            ("-1.999999999", datetime(1969, 12, 31, 23, 59, 59, 999999, tzinfo=timezone.utc)),
+            # A "-" before a zero whole part can only be the fraction's sign.
+            ("-0.500000000", datetime(1969, 12, 31, 23, 59, 59, 500000, tzinfo=timezone.utc)),
+            ("-.5", datetime(1969, 12, 31, 23, 59, 59, 500000, tzinfo=timezone.utc)),
+        ],
+    )
+    def test_pre_epoch_reads_as_tshark_prints_it(self, raw: str, expected: datetime) -> None:
+        assert convert("FT_ABSOLUTE_TIME", raw) == expected
+        assert get_info("FT_ABSOLUTE_TIME").parse(raw) == expected
+
+    @pytest.mark.parametrize(
+        ("literal", "expected"),
+        [
+            ("-1.5", datetime(1969, 12, 31, 23, 59, 58, 500000, tzinfo=timezone.utc)),
+            ("-1", datetime(1969, 12, 31, 23, 59, 59, tzinfo=timezone.utc)),
+            ("-0.5", datetime(1969, 12, 31, 23, 59, 59, 500000, tzinfo=timezone.utc)),
+            ("1.5", datetime(1970, 1, 1, 0, 0, 1, 500000, tzinfo=timezone.utc)),
+        ],
+    )
+    def test_pre_epoch_literal_is_a_signed_decimal(self, literal: str, expected: datetime) -> None:
+        # A user writing "-1.5" means 1.5 s before the epoch, whatever tshark
+        # would mean by printing the same text.
+        assert coerce_literal("FT_ABSOLUTE_TIME", literal) == expected
+
+    def test_only_negative_epoch_seconds_read_differently_as_a_literal(self) -> None:
+        for raw in ("1625097600.123456789", "0", "2023-11-14T22:13:20Z", "NULL"):
+            assert coerce_literal("FT_ABSOLUTE_TIME", raw) == convert("FT_ABSOLUTE_TIME", raw)
+
+    @pytest.mark.parametrize("raw", ["", ".", "-", "--1", "abc", "1.2.3", "-1e9"])
+    def test_malformed_literal_raises_value_error(self, raw: str) -> None:
+        with pytest.raises(ValueError, match="invalid absolute time"):
+            coerce_literal("FT_ABSOLUTE_TIME", raw)
 
     @pytest.mark.parametrize("raw", ["", ".", "abc", "1.2.3", "1e9", "0x10"])
     def test_malformed_raises_value_error(self, raw: str) -> None:
@@ -340,6 +380,45 @@ class TestAbsoluteTimeRenderings:
         # OverflowError, which would break the module's ValueError contract.
         with pytest.raises(ValueError, match="invalid absolute time"):
             convert("FT_ABSOLUTE_TIME", raw)
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "2023-11-14T22:13:20+0060",
+            "2023-11-14T22:13:20-0060",
+            "2023-11-14T22:13:20+00:60",
+            "2023-11-14T22:13:20-00:60",
+            "2023-11-14T22:13:20+1261",
+            "2023-11-14T22:13:20-1261",
+            "2023-11-14T22:13:20+12:99",
+            "2023-11-14T22:13:20-12:99",
+        ],
+    )
+    def test_offset_minutes_past_59_raise(self, raw: str) -> None:
+        # timedelta(minutes=60) is an hour, so "+0060" used to read as "+0100":
+        # an instant silently assigned to malformed text.
+        with pytest.raises(ValueError, match="offset minutes"):
+            convert("FT_ABSOLUTE_TIME", raw)
+        with pytest.raises(ValueError, match="offset minutes"):
+            coerce_literal("FT_ABSOLUTE_TIME", raw)
+
+    @pytest.mark.parametrize(
+        ("raw", "minutes"),
+        [
+            ("2023-11-14T22:13:20+0059", 59),
+            ("2023-11-14T22:13:20+00:59", 59),
+            ("2023-11-14T22:13:20-0059", -59),
+            ("2023-11-14T22:13:20-00:59", -59),
+            ("2023-11-14T22:13:20+0000", 0),
+            ("2023-11-14T22:13:20-23:59", -(23 * 60 + 59)),
+        ],
+    )
+    def test_offset_minutes_up_to_59_read(self, raw: str, minutes: int) -> None:
+        # The local wall clock is 22:13:20 at the given offset, so the instant
+        # is that wall clock minus the offset.
+        expected = _SAMPLE_FRAME_1 - timedelta(minutes=minutes)
+        assert convert("FT_ABSOLUTE_TIME", raw) == expected
+        assert coerce_literal("FT_ABSOLUTE_TIME", raw) == expected
 
     def test_coerce_literal_reads_an_iso_string(self) -> None:
         # coerce_literal parses str literals with the same function, so a user

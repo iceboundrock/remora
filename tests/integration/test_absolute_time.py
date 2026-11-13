@@ -19,14 +19,16 @@ from __future__ import annotations
 
 import os
 import shutil
-from collections.abc import Sequence
-from datetime import datetime, timezone
+import struct
+from collections.abc import Callable, Sequence
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 from typing_extensions import assert_type
 
 from remora import IP, Capture
+from remora.expr import Expr
 from remora.fields import FieldRef, Packet, RawPacket
 from remora.proto import NTP
 from remora.values import convert
@@ -67,6 +69,58 @@ NTP_EXPECTED = {
     NTP.xmt.name: [_utc(NTP_BASE, 500000), _utc(NTP_BASE + 1, 750000)],
 }
 NTP_TIMES_REFS = (NTP.reftime, NTP.org, NTP.rec, NTP.xmt)
+
+#: Pre-epoch frames: nanosecond pcapng stamps relative to an interface
+#: if_tsoffset of -1 s, so tshark's nstime_t has negative whole seconds and a
+#: non-negative fraction. 4.6.9 prints frame 1 as "-1.500000000" in -T fields
+#: and "1969-12-31T23:59:59.500000000Z" in -T ek.
+PRE_EPOCH_OFFSET = -1
+PRE_EPOCH_STAMPS_NS = (500_000_000, 0, 999_999_999, 1_250_000_000)
+PRE_EPOCH_TIMES = [
+    EPOCH - timedelta(microseconds=500000),
+    EPOCH - timedelta(seconds=1),
+    # 1 ns before the epoch, truncated to the microsecond at or before it.
+    EPOCH - timedelta(microseconds=1),
+    EPOCH + timedelta(microseconds=250000),
+]
+
+
+def _pcapng_block(block_type: int, body: bytes) -> bytes:
+    total = 12 + len(body)
+    return struct.pack("<II", block_type, total) + body + struct.pack("<I", total)
+
+
+def _pcapng_option(code: int, value: bytes) -> bytes:
+    return struct.pack("<HH", code, len(value)) + value + b"\x00" * (-len(value) % 4)
+
+
+def _pre_epoch_pcapng() -> bytes:
+    """One Ethernet interface (if_tsresol 9, if_tsoffset -1 s) and four frames."""
+    opt_end = struct.pack("<HH", 0, 0)
+    shb = _pcapng_block(0x0A0D0D0A, struct.pack("<IHHq", 0x1A2B3C4D, 1, 0, -1) + opt_end)
+    idb = _pcapng_block(
+        0x00000001,
+        struct.pack("<HHI", 1, 0, 65535)
+        + _pcapng_option(9, bytes([9]))  # if_tsresol: nanoseconds
+        + _pcapng_option(14, struct.pack("<q", PRE_EPOCH_OFFSET))  # if_tsoffset
+        + opt_end,
+    )
+    # A 60-byte broadcast frame with the local-experimental EtherType, so
+    # nothing above Ethernet dissects.
+    frame = b"\xff" * 6 + bytes(range(6)) + b"\x88\xb5" + b"\x00" * 46
+    blocks = [shb, idb]
+    for stamp in PRE_EPOCH_STAMPS_NS:
+        header = struct.pack("<IIIII", 0, stamp >> 32, stamp & 0xFFFFFFFF, len(frame), len(frame))
+        blocks.append(_pcapng_block(0x00000006, header + frame))
+    return b"".join(blocks)
+
+
+@pytest.fixture
+def pre_epoch(tmp_path: Path) -> Path:
+    path = tmp_path / "pre_epoch.pcapng"
+    path.write_bytes(_pre_epoch_pcapng())
+    return path
+
 
 # REMORA_REQUIRE_TSHARK (set in CI) turns "tshark missing" from a skip into a
 # hard failure, so a broken CI install can never silently skip the suite.
@@ -156,6 +210,52 @@ class TestEkAndFieldsAgree:
         assert fields.plan().residual is not None
         assert [pkt.get_raw("frame.number") for pkt in ek] == [("3",)]
         assert [pkt.get_raw("frame.number") for pkt in fields] == [("3",)]
+
+
+class TestPreEpoch:
+    """Times before the epoch, which -T fields prints as signed whole seconds
+    plus a non-negative fraction ("-1.500000000" is -0.5 s)."""
+
+    @pytest.mark.parametrize("ref", FRAME_TIMES, ids=lambda ref: ref.name)
+    def test_ek_and_fields_agree(self, ref: FieldRef[datetime], pre_epoch: Path) -> None:
+        assert _times(_ek(pre_epoch), ref) == PRE_EPOCH_TIMES
+        assert _times(_fields(pre_epoch, ref), ref) == PRE_EPOCH_TIMES
+
+    def test_fields_prints_the_signed_whole_seconds_form(self, pre_epoch: Path) -> None:
+        # The precondition, pinned so the parity above cannot pass by tshark
+        # having changed its rendering: the fraction is not the sign's.
+        packets = _fields(pre_epoch, FRAME_TIME_EPOCH)
+        assert packets[0].get_raw(FRAME_TIME_EPOCH.name) == ("-1.500000000",)
+
+    @pytest.mark.parametrize("ref", FRAME_TIMES, ids=lambda ref: ref.name)
+    @pytest.mark.parametrize(
+        ("term_of", "frames"),
+        [
+            (lambda ref: ref < EPOCH, [("1",), ("2",), ("3",)]),
+            (lambda ref: ref >= PRE_EPOCH_TIMES[0], [("1",), ("3",), ("4",)]),
+            (lambda ref: ref == PRE_EPOCH_TIMES[0], [("1",)]),
+            # A string literal is a signed decimal: "-1.5" is 1.5 s before
+            # the epoch, earlier than every frame.
+            (lambda ref: ref > "-1.5", [("1",), ("2",), ("3",), ("4",)]),
+            (lambda ref: ref > "-0.5", [("3",), ("4",)]),
+        ],
+        ids=["before-epoch", "from-frame-1", "frame-1", "after-str-1.5", "after-str-0.5"],
+    )
+    def test_a_residual_predicate_selects_the_same_frames(
+        self,
+        ref: FieldRef[datetime],
+        term_of: Callable[[FieldRef[datetime]], Expr],
+        frames: list[tuple[str]],
+        pre_epoch: Path,
+    ) -> None:
+        term = term_of(ref)
+        ek = Capture(pre_epoch).filter(term)
+        fields = Capture(pre_epoch).select(FRAME_NUMBER).filter(term)
+        assert ek.plan().mode == "ek"
+        assert fields.plan().mode == "fields"
+        assert fields.plan().residual is not None
+        assert [pkt.get_raw("frame.number") for pkt in ek] == frames
+        assert [pkt.get_raw("frame.number") for pkt in fields] == frames
 
 
 class TestCallerZoneDoesNotLeak:

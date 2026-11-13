@@ -23,7 +23,8 @@ FT_INT8..FT_INT64,
 FT_FRAMENUM, FT_CHAR
 FT_BOOLEAN                bool                        ``{"1", "True", "true"}`` -> ``True``;
                                                       ``{"0", "False", "false"}`` -> ``False``
-FT_ABSOLUTE_TIME          datetime (aware, UTC)       epoch seconds (``"1625097600.123456789"``);
+FT_ABSOLUTE_TIME          datetime (aware, UTC)       epoch seconds (``"1625097600.123456789"``,
+                                                      pre-epoch as tshark prints it; see below);
                                                       ISO 8601 with an explicit offset
                                                       (``"2021-07-01T00:00:00.123456789Z"``,
                                                       ``"...-0700"``, ``"...+05:30"``);
@@ -69,6 +70,16 @@ Each accepted form names its instant unambiguously, so accepting all of them
 loses nothing: a timestamp with no offset, or with a zone abbreviation other
 than ``UTC``, still raises.
 
+Pre-epoch times: tshark prints epoch seconds as the signed whole seconds of
+its normalized ``nstime_t`` followed by the non-negative nanoseconds, so
+``"-1.500000000"`` is -1 s + 0.5 s, half a second *before* the epoch, which is
+what ``-T ek`` prints as ``1969-12-31T23:59:59.500000000Z``. The reader path
+(:func:`convert`, and :attr:`FTypeInfo.parse`) reads it that way. A user
+literal is an ordinary signed decimal, so :func:`coerce_literal` reads the same
+``"-1.5"`` as one and a half seconds before the epoch. A ``-`` before a zero
+whole part (``"-0.5"``) can only be the fraction's own sign, and both read it
+as negative.
+
 Precision note: epoch timestamps may carry nanosecond precision; Python's
 :class:`datetime.datetime` and :class:`datetime.timedelta` resolve to
 microseconds, so sub-microsecond digits are **truncated** (not rounded).
@@ -95,6 +106,10 @@ class FTypeInfo(Generic[T]):
     py_type: type[T]
     parse: Callable[[str], T]
     """Raw tshark text -> value; raises ValueError on malformed input."""
+    parse_literal: Callable[[str], T] | None = None
+    """User literal text -> value, where it must read differently from what
+    tshark prints; ``None`` means :attr:`parse` serves both. Only
+    ``FT_ABSOLUTE_TIME`` needs it: see :func:`_parse_absolute_time_literal`."""
 
 
 def _identity(raw: str) -> str:
@@ -206,29 +221,53 @@ def _parse_absolute_time(raw: str) -> datetime:
 
     Accepted: epoch seconds, ISO 8601 with an explicit offset, tshark's pre-4.6
     ``"Mon D, YYYY HH:MM:SS.f UTC"`` text, and ``"NULL"``. See the module
-    docstring for which reader and version produce which. Microsecond precision.
+    docstring for which reader and version produce which, and for how a
+    pre-epoch ``"-1.500000000"`` reads. Microsecond precision.
     """
-    text = raw.strip()
+    return _absolute_time_or_value_error(raw, signed_decimal=False)
+
+
+def _parse_absolute_time_literal(raw: str) -> datetime:
+    """:func:`_parse_absolute_time` for a user literal: epoch seconds are a signed decimal.
+
+    tshark prints ``-1.500000000`` for the instant 0.5 s before the epoch
+    (signed whole seconds, then a non-negative fraction), but a user writing
+    ``"-1.5"`` means 1.5 s before it. Every other form reads the same in both.
+    """
+    return _absolute_time_or_value_error(raw, signed_decimal=True)
+
+
+def _absolute_time_or_value_error(raw: str, *, signed_decimal: bool) -> datetime:
     try:
-        return _absolute_time_of(text)
+        return _absolute_time_of(raw.strip(), signed_decimal=signed_decimal)
     except (ValueError, OverflowError) as exc:
         # OverflowError is a date outside datetime's years 1..9999: malformed
         # input all the same, and this module's contract is ValueError.
         raise ValueError(f"invalid absolute time {raw!r}: {exc}") from None
 
 
-def _absolute_time_of(text: str) -> datetime:
-    """:func:`_parse_absolute_time` on stripped text; raises without naming it."""
+def _offset_of(sign: str, hours: str, minutes: str) -> timedelta:
+    """An ISO 8601 ``±HH[:]MM`` offset, refusing minutes ``timedelta`` would carry."""
+    # timedelta(minutes=60) is silently an hour, so "+0060" would read as
+    # "+0100"; the regex admits two digits, so the range is checked here.
+    if int(minutes) > 59:
+        raise ValueError(f"offset minutes {minutes!r} out of range 00..59")
+    offset = timedelta(hours=int(hours), minutes=int(minutes))
+    return -offset if sign == "-" else offset
+
+
+def _absolute_time_of(text: str, *, signed_decimal: bool) -> datetime:
+    """Stripped text -> datetime; raises without naming the text.
+
+    *signed_decimal* reads negative epoch seconds as a user literal rather
+    than as tshark's rendering (see :func:`_parse_absolute_time_literal`).
+    """
     if text == _NULL_TIME:
         return _EPOCH
     iso = _ISO_TIME.fullmatch(text)
     if iso is not None:
         year, month, day, hour, minute, second, frac, zulu, sign, off_h, off_m = iso.groups()
-        offset = timedelta(0)
-        if not zulu:
-            offset = timedelta(hours=int(off_h), minutes=int(off_m))
-            if sign == "-":
-                offset = -offset
+        offset = timedelta(0) if zulu else _offset_of(sign, off_h, off_m)
         local = datetime(
             int(year),
             int(month),
@@ -268,7 +307,15 @@ def _absolute_time_of(text: str) -> datetime:
         raise ValueError(
             'expected epoch seconds, ISO 8601 with an offset, "Mon D, YYYY HH:MM:SS UTC" or "NULL"'
         ) from None
-    return _EPOCH + timedelta(seconds=sign * seconds, microseconds=sign * micros)
+    if sign > 0 or seconds == 0 or signed_decimal:
+        return _EPOCH + timedelta(seconds=sign * seconds, microseconds=sign * micros)
+    # tshark's rendering of a normalized nstime_t before the epoch: the whole
+    # seconds carry the sign and the fraction is added, so "-1.500000000" is
+    # -1 s + 0.5 s. Truncating the added fraction to microseconds moves the
+    # instant toward the past, as truncating the fraction of the ISO form ek
+    # prints for it does ("23:59:59.999999999Z" for "-1.999999999"), so the
+    # two readers agree to the microsecond.
+    return _EPOCH + timedelta(seconds=-seconds, microseconds=micros)
 
 
 def _parse_relative_time(raw: str) -> timedelta:
@@ -322,7 +369,7 @@ FTYPE_TABLE: Mapping[str, FTypeInfo[Any]] = {
     "FT_ETHER": FTypeInfo(bytes, _parse_ether),
     "FT_BYTES": FTypeInfo(bytes, _parse_bytes),
     "FT_BOOLEAN": FTypeInfo(bool, _parse_bool),
-    "FT_ABSOLUTE_TIME": FTypeInfo(datetime, _parse_absolute_time),
+    "FT_ABSOLUTE_TIME": FTypeInfo(datetime, _parse_absolute_time, _parse_absolute_time_literal),
     "FT_RELATIVE_TIME": FTypeInfo(timedelta, _parse_relative_time),
     "FT_DOUBLE": FTypeInfo(float, float),
     "FT_FLOAT": FTypeInfo(float, float),
@@ -351,8 +398,10 @@ def coerce_literal(ftype: str, value: object) -> object:
     """Normalize a user-supplied comparison literal to the field's Python type.
 
     - Values already of the field's Python type pass through unchanged.
-    - ``str`` values are parsed with the field's parse function (which raises
-      ValueError on malformed input).
+    - ``str`` values are parsed with the field's literal parse function, which
+      is its parse function except where a user literal must read differently
+      from tshark's rendering (``FT_ABSOLUTE_TIME``'s negative epoch seconds);
+      it raises ValueError on malformed input.
     - ``int`` values are widened to ``float`` for float fields.
     - Anything else raises TypeError. ``bool`` literals are rejected for
       non-boolean fields (``bool`` is a subclass of ``int``, but ``True`` is
@@ -367,7 +416,7 @@ def coerce_literal(ftype: str, value: object) -> object:
     if isinstance(value, py_type):
         return value
     if isinstance(value, str):
-        return info.parse(value)
+        return (info.parse_literal or info.parse)(value)
     if py_type is float and isinstance(value, int):
         return float(value)
     raise TypeError(

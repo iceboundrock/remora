@@ -336,6 +336,19 @@ host prints the same, so the fault is the C library's `%z` rather than tshark's.
 Nothing in the text can detect it, since it is a valid ISO timestamp. Under UTC
 there is no offset to get wrong.
 
+Before the epoch, `-T fields` prints Unix time as the signed whole seconds
+followed by a non-negative fraction, so `-1.500000000` is -1 s + 0.5 s: half a
+second before the epoch, which `-T ek` prints as
+`1969-12-31T23:59:59.500000000Z` (measured on 4.6.6 and 4.6.9 with a pcapng
+interface `if_tsoffset` of -1 s). The reader path reads it that way, and the
+added fraction truncates toward the past just as the ISO fraction does, so the
+two readers agree to the microsecond. A user literal is an ordinary signed
+decimal instead: `coerce_literal` reads the string `"-1.5"` as one and a half
+seconds before the epoch, which is why `FTypeInfo` carries a separate literal
+parser for `FT_ABSOLUTE_TIME`. A `-` before a zero whole part (`-0.5`) can only
+be the fraction's own sign, and both read it as negative. An ISO offset whose
+minutes exceed 59 (`+0060`) raises rather than carrying into the hour.
+
 `NULL` is what the NTP display base prints for the zero time in `-T fields`,
 and `-T ek` prints the same value as the epoch, so reading `NULL` as the epoch
 is what keeps the two readers equal. It is only ever the zero time: an NTP
@@ -346,7 +359,8 @@ the table above and checks every row against the parser, and
 `tests/integration/test_absolute_time.py` reads `frame.time`, `frame.time_utc`,
 `frame.time_epoch` and the NTP times through a live tshark in both modes,
 asserting the ek and `-T fields` values equal each other and the instants the
-fixtures were built with, including when the caller's own zone is not UTC.
+fixtures were built with, including when the caller's own zone is not UTC and
+for pre-epoch frames, whose residual predicates it also runs in both modes.
 
 ## What is still divergent
 
