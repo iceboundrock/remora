@@ -73,6 +73,12 @@ dev = [
     "remora-telecom",
 ]
 
+[tool.hatch.build.targets.wheel]
+# Agent guidance sits beside the code it describes (AGENTS.md plus its
+# CLAUDE.md import shim) but is repository documentation, not package data.
+# .github/scripts/check_wheel_contents.py fails the build if one leaks.
+exclude = ["AGENTS.md", "CLAUDE.md"]
+
 [tool.uv.workspace]
 members = ["packages/*"]
 

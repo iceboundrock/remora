@@ -15,7 +15,7 @@ jobs:
   # binaries for that image's amd64v3 package architecture (so the PPA jobs got
   # 4.6.4 too), and tshark could no longer read the checkout's fixtures. Moving
   # these jobs to a newer image means re-checking the 4.2.2 assumptions in
-  # AGENTS.md and the `codegen.toml` pin's availability there.
+  # tests/AGENTS.md and the `codegen.toml` pin's availability there.
   checks:
     runs-on: ubuntu-24.04
     strategy:

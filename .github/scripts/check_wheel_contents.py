@@ -22,6 +22,10 @@ def main() -> int:
     assert "remora/proto/tcp.py" in core and "remora/proto/tcp.pyi" in core
     assert "remora/proto/_extras.py" in core
     assert "remora/py.typed" in core
+    # Per-directory agent guidance is repository documentation (pyproject's
+    # wheel `exclude`), and hatchling packs every file under src/remora/.
+    leaked = [name for name in core if name.endswith(("/AGENTS.md", "/CLAUDE.md"))]
+    assert not leaked, f"agent guidance leaked into core: {leaked}"
     for modules in EXTRAS.values():
         for module in modules:
             assert f"remora/proto/{module}.py" not in core, f"{module} leaked into core"

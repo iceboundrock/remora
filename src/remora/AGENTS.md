@@ -1,0 +1,9 @@
+# src/remora/AGENTS.md
+
+The core modules: one expression IR and the contracts that every backend, reader and surface builds on. This file applies inside every subpackage too, and each subpackage's own `AGENTS.md` adds its invariants.
+
+- `expr.py` is the immutable expression IR and a leaf module that imports nothing from remora. `__bool__` raises so `and`/`or`/chained comparisons fail loudly (use `&`/`|`/`~`, and parenthesize comparisons). There is no `Ne` node: `!=` builds `Not(Comparison(EQ, ...))`, which makes Wireshark's multi-value `!=` pitfall unrepresentable. `FieldRef` is deliberately unhashable (`__eq__` returns an `Expr`), so dedup by `.name`.
+- `values.py` is the single mapping from tshark ftypes to Python types and parsers. Parse errors raise `ValueError`, and unknown ftypes fall back to `str`. `coerce_literal` normalizes user literals at compile time for every backend.
+- `fields.py` is the contract hub. `RawPacket` is the minimal packet protocol: `get_raw(name) -> tuple[str, ...]`, with `()` meaning absent. `Field`/`MultiField` are dual-mode descriptors. Class access returns a `FieldRef[T]`; instance access returns `T | None` (scalar) or `tuple[T, ...]` (multi). Multiplicity lives in the descriptor *class* because `@overload` can only express the return type per class.
+- `planner.py` is a pure two-level pushdown that never spawns tshark. Pushable conjuncts become `-Y`, a projection enables `-T fields`, and opaque lambdas force `-T ek`. Conjuncts that fail to push become residual Python predicates.
+- `capture.py` is the public pcap-path surface. `Capture` is an immutable builder: `filter()` accumulates terms, and `select()` sets the projection that makes fields mode reachable (#105). Iteration plans, spawns tshark, applies the residual predicate, and closes the subprocess however it ends.
