@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta, timezone
 from ipaddress import IPv4Address, IPv6Address
 
@@ -237,6 +238,114 @@ class TestAbsoluteTime:
     def test_round_trip(self) -> None:
         original = datetime(2021, 7, 1, 12, 34, 56, 789012, tzinfo=timezone.utc)
         assert convert("FT_ABSOLUTE_TIME", f"{original.timestamp():.6f}") == original
+
+
+#: The instant every rendering in TestAbsoluteTimeRenderings names: what
+#: tshark prints for frame 1 of tests/data/sample.pcap (epoch 1700000000).
+_SAMPLE_FRAME_1 = datetime(2023, 11, 14, 22, 13, 20, tzinfo=timezone.utc)
+
+
+class TestAbsoluteTimeRenderings:
+    """Every form tshark renders an absolute time in (issue #117).
+
+    Measured on 4.2.2, 4.4.19 and 4.6.9; docs/semantics.md has the table of
+    which reader, display base and version prints which.
+    """
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            # -T ek, every display base and version, frame.time_epoch included.
+            "2023-11-14T22:13:20.000000000Z",
+            # -T fields, UTC display base, 4.6.
+            "2023-11-14T22:13:20Z",
+            # -T fields, local display base, 4.6: the local offset, compact
+            # (America/Los_Angeles on that date, then TZ pinned to UTC).
+            "2023-11-14T14:13:20.000000000-0800",
+            "2023-11-14T22:13:20.000000000+0000",
+            # The extended offset spelling ISO 8601 also allows.
+            "2023-11-15T03:43:20.000000000+05:30",
+            # -T fields before 4.6, UTC display base or TZ pinned to UTC.
+            "Nov 14, 2023 22:13:20.000000000 UTC",
+            "Nov 14, 2023 22:13:20 UTC",
+            # -T fields, Unix display base, every version.
+            "1700000000.000000000",
+        ],
+    )
+    def test_each_rendering_reads_as_the_same_instant(self, raw: str) -> None:
+        assert convert("FT_ABSOLUTE_TIME", raw) == _SAMPLE_FRAME_1
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "2023-11-14T14:13:20.123456789-0800",
+            "Nov 14, 2023 22:13:20.123456789 UTC",
+        ],
+    )
+    def test_result_is_utc_and_truncated_to_micros(self, raw: str) -> None:
+        value = convert("FT_ABSOLUTE_TIME", raw)
+        assert isinstance(value, datetime)
+        assert value.tzinfo == timezone.utc
+        assert value == _SAMPLE_FRAME_1.replace(microsecond=123456)
+
+    def test_pre_46_rendering_space_pads_a_single_digit_day(self) -> None:
+        # tshark prints the day with %2d: "Nov  5", two spaces.
+        value = convert("FT_ABSOLUTE_TIME", "Nov  5, 2023 00:00:05.500000000 UTC")
+        assert value == datetime(2023, 11, 5, 0, 0, 5, 500000, tzinfo=timezone.utc)
+
+    def test_null_is_the_zero_time(self) -> None:
+        # The NTP display base prints the zero time as NULL in -T fields; -T ek
+        # prints the same value as the epoch, so that is what NULL reads as.
+        assert convert("FT_ABSOLUTE_TIME", "NULL") == datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+    @pytest.mark.parametrize("zone", ["MST", "MDT", "IST", "CET", "GMT", "America"])
+    def test_a_pre_46_local_zone_abbreviation_is_refused(self, zone: str) -> None:
+        # The abbreviation names no unique offset (IST is three), so reading it
+        # would be a guess; only UTC is unambiguous. "America" is what a zone
+        # name renders as where tzdata is missing.
+        with pytest.raises(ValueError, match=f"zone abbreviation '{zone}'"):
+            convert("FT_ABSOLUTE_TIME", f"Nov 14, 2023 15:13:20.000000000 {zone}")
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            # No offset: local time, which names no instant.
+            "2023-11-14T22:13:20",
+            "2023-11-14T22:13:20.000000000",
+            # Shapes tshark never prints for an absolute time.
+            "2023-11-14 22:13:20Z",
+            "2023-11-14T22:13:20+07",
+            "Nov 14 2023 22:13:20 UTC",
+            "Foo 14, 2023 22:13:20 UTC",
+            "null",
+            "Null",
+            # Field-level nonsense that matches a pattern's shape.
+            "2023-13-01T00:00:00Z",
+            "2023-02-30T00:00:00Z",
+            "2023-11-14T24:00:00Z",
+            "2023-11-14T22:13:20+2400",
+            "Nov 31, 2023 22:13:20 UTC",
+        ],
+    )
+    def test_malformed_raises_value_error_naming_the_text(self, raw: str) -> None:
+        with pytest.raises(ValueError, match=re.escape(repr(raw))):
+            convert("FT_ABSOLUTE_TIME", raw)
+
+    @pytest.mark.parametrize(
+        "raw",
+        ["0001-01-01T00:00:00+0100", "9999-12-31T23:59:59-0100", "99999999999999999"],
+    )
+    def test_out_of_range_is_value_error_not_overflow_error(self, raw: str) -> None:
+        # datetime spans years 1..9999; past either end the arithmetic raises
+        # OverflowError, which would break the module's ValueError contract.
+        with pytest.raises(ValueError, match="invalid absolute time"):
+            convert("FT_ABSOLUTE_TIME", raw)
+
+    def test_coerce_literal_reads_an_iso_string(self) -> None:
+        # coerce_literal parses str literals with the same function, so a user
+        # can write the form tshark prints.
+        literal = coerce_literal("FT_ABSOLUTE_TIME", "2023-11-14T22:13:20Z")
+        assert literal == _SAMPLE_FRAME_1
 
 
 class TestRelativeTime:

@@ -49,13 +49,10 @@ PCAP = DATA_DIR / "sample.pcap"
 #: fields`` declaration.
 FRAME_NUMBER = FieldRef[int]("frame.number", "FT_UINT32", False)
 
-#: ``frame.time_epoch``, not ``frame.time`` — and the distinction is load
-#: bearing rather than stylistic. The planner projects an abbrev verbatim, and
-#: ``-e frame.time`` renders a human-readable, locale- and timezone-shaped
-#: string ("Nov 14, 2023 14:13:20.000000000 PST") where ``FT_ABSOLUTE_TIME``'s
-#: parser reads epoch seconds, so a live ``frame.time`` column raises
-#: ``ValueError`` on conversion. ``materialize.py`` makes the same choice for
-#: the same reason.
+#: ``frame.time_epoch``, the one absolute-time abbrev whose ``-T fields``
+#: rendering is the same on every tshark version (epoch seconds), which keeps
+#: the projection assertions below version-agnostic. ``frame.time`` reads too
+#: since #117, in both modes; ``test_absolute_time.py`` covers that.
 FRAME_TIME = FieldRef[datetime]("frame.time_epoch", "FT_ABSOLUTE_TIME", False)
 
 #: Frame 3's arrival time (epoch 1700000002), used as a residual boundary that

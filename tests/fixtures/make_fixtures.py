@@ -50,6 +50,17 @@ same TCP SYN; only ``frame.comment`` differs:
    byte never arrives raw to split on, and an unescaped one is forgeable by
    the value. This frame witnesses that end to end.
 
+ntp_times.pcap (2 packets) — FT_ABSOLUTE_TIME renderings (issue #117). NTP
+carries absolute-time fields with the UTC display base, which renders the zero
+time as ``NULL`` in ``-T fields`` and as the epoch in ``-T ek``. The capture
+starts on the 5th of a month so a pre-4.6 ``-T fields`` rendering carries a
+space-padded day (``"Nov  5, 2023 ..."``):
+
+1. NTP client request  10.0.3.1:123 -> 10.0.3.123:123  only ``ntp.xmt`` set;
+   ``ntp.reftime``/``ntp.org``/``ntp.rec`` are the zero time
+2. NTP server reply    10.0.3.123:123 -> 10.0.3.1:123  all four set, with
+   fractional seconds
+
 Regenerate with::
 
     uv run python tests/fixtures/make_fixtures.py
@@ -323,6 +334,68 @@ def build_ctrl_comments() -> bytes:
     return pcapng_file(frames, base_ts=1700000300)
 
 
+#: 1900-01-01 (the NTP era origin) to 1970-01-01, in seconds.
+NTP_UNIX_OFFSET = 2_208_988_800
+
+#: The Unix instant ntp_times.pcap starts at: 2023-11-05T00:00:05Z.
+NTP_BASE_TS = 1699142405
+
+
+def ntp_timestamp(unix_seconds: int | None, fraction: int = 0) -> bytes:
+    """A 64-bit NTP timestamp; ``None`` is the all-zero "not set" value."""
+    if unix_seconds is None:
+        return b"\x00" * 8
+    return struct.pack("!II", unix_seconds + NTP_UNIX_OFFSET, fraction)
+
+
+def ntp_packet(mode: int, stratum: int, stamps: tuple[bytes, bytes, bytes, bytes]) -> bytes:
+    """An NTPv4 header: LI 0, *mode*, then reference/origin/receive/transmit stamps."""
+    header = struct.pack(
+        "!BBbbII4s",
+        (4 << 3) | mode,  # LI 0, VN 4
+        stratum,
+        6,  # poll: 64 s
+        -20,  # precision: ~1 us
+        0,  # root delay
+        0,  # root dispersion
+        b"GPS\x00" if stratum == 1 else b"\x00" * 4,
+    )
+    return header + b"".join(stamps)
+
+
+def build_ntp_times() -> bytes:
+    """An NTP request/reply pair whose absolute times exercise every rendering."""
+    client = bytes([10, 0, 3, 1])
+    server = bytes([10, 0, 3, 123])
+    request = ntp_packet(
+        3,
+        0,
+        (
+            ntp_timestamp(None),
+            ntp_timestamp(None),
+            ntp_timestamp(None),
+            ntp_timestamp(NTP_BASE_TS, 0x80000000),  # .5
+        ),
+    )
+    reply = ntp_packet(
+        4,
+        1,
+        (
+            ntp_timestamp(NTP_BASE_TS - 60),
+            ntp_timestamp(NTP_BASE_TS, 0x80000000),  # echoes the request's xmt
+            ntp_timestamp(NTP_BASE_TS + 1, 0x40000000),  # .25
+            ntp_timestamp(NTP_BASE_TS + 1, 0xC0000000),  # .75
+        ),
+    )
+    to_server = udp(client, server, 123, 123, request)
+    to_client = udp(server, client, 123, 123, reply)
+    frames = [
+        ether(MAC_B, MAC_A, 0x0800, ipv4(client, server, 17, to_server)),
+        ether(MAC_A, MAC_B, 0x0800, ipv4(server, client, 17, to_client)),
+    ]
+    return pcap_file(frames, base_ts=NTP_BASE_TS)
+
+
 # Destination ports and source hosts build_bulk_tcp cycles through, in order.
 # Ten hosts and four ports, so a host selects a tenth of the capture, a port a
 # quarter, and a (host, port) conjunction a twentieth — known fractions the
@@ -366,6 +439,7 @@ def main() -> None:
         ("tcp_mixed.pcap", build_tcp_mixed),
         ("dns_multi.pcap", build_dns_multi),
         ("ctrl_comments.pcapng", build_ctrl_comments),
+        ("ntp_times.pcap", build_ntp_times),
     ]:
         path = FIXTURES_DIR / name
         data = build()

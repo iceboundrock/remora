@@ -282,6 +282,72 @@ is installed, asserting the three row sets (pushdown, fields residual, ek
 residual) equal on >= 4.4 and pinning the documented divergence below it, over
 `tests/fixtures/ctrl_comments.pcapng`.
 
+## Reader representation: absolute times
+
+The second place the two readers see one value in different representations is
+`FT_ABSOLUTE_TIME`. tshark renders an absolute time according to the reader
+mode, the field's display base and its own version, and before issue #117
+Remora read only epoch seconds — which `-T ek` never produces, so no absolute
+time was readable through an ek packet, and `frame.time` failed per packet in a
+projection. The renderings below were measured on 4.2.2 and 4.4.19 (the Ubuntu
+24.04 and Debian trixie packages) and 4.6.9 (Homebrew), over
+`tests/data/sample.pcap` and `tests/fixtures/ntp_times.pcap`. The example is one
+instant, 2023-11-05 00:00:05.5 UTC, as each case prints it.
+
+<!-- abs-time-forms:start -->
+
+| reader | display base | tshark | prints | reads as |
+| --- | --- | --- | --- | --- |
+| `-T ek` | any, `frame.time_epoch` included | all | `2023-11-05T00:00:05.500000000Z` | the instant |
+| `-T fields` | Unix (`frame.time_epoch`) | all | `1699142405.500000000` | the instant |
+| `-T fields` | UTC (`frame.time_utc`, `ntp.xmt`) | 4.6 | `2023-11-05T00:00:05.500000000Z` | the instant |
+| `-T fields` | UTC | 4.2, 4.4 | `Nov  5, 2023 00:00:05.500000000 UTC` | the instant |
+| `-T fields` | local (`frame.time`), `TZ` pinned to UTC | 4.6 | `2023-11-05T00:00:05.500000000+0000` | the instant |
+| `-T fields` | local, `TZ` pinned to UTC | 4.2, 4.4 | `Nov  5, 2023 00:00:05.500000000 UTC` | the instant |
+| `-T fields` | local, `TZ=America/Los_Angeles` | 4.6 | `2023-11-04T17:00:05.500000000-0700` | the instant |
+| `-T fields` | local, `TZ=America/Denver` | 4.2, 4.4 | `Nov  4, 2023 18:00:05.500000000 MDT` | `ValueError` |
+| `-T fields` | NTP, zero time | all | `NULL` | the epoch |
+| `-T ek` | NTP, zero time | all | `1970-01-01T00:00:00.000000000Z` | the epoch |
+
+<!-- abs-time-forms:end -->
+
+`values._parse_absolute_time` in `src/remora/values.py` accepts each of those
+forms, because each names its instant unambiguously: epoch seconds, ISO 8601
+with an explicit offset (`Z`, `±HHMM` or `±HH:MM`), the pre-4.6 text when its
+zone is `UTC`, and `NULL`. The result is always an aware UTC `datetime`,
+truncated to microseconds. A timestamp with no offset, and the pre-4.6 text with
+any other zone abbreviation, still raise: `IST` alone names three offsets, so
+reading it would be a guess.
+
+That leaves the local-time display before 4.6, whose zone is wherever tshark
+runs. `src/remora/reader/process.py` closes it by pinning `TZ=UTC0` in the
+environment of every tshark Remora spawns, `Capture` and the workspace alike,
+so the abbreviation is always `UTC`. The pin changes renderings and nothing
+else: Remora never sends tshark an absolute-time literal (see the time-literal
+entry below), so no filter depends on the zone.
+
+On 4.6 the pin is not redundant either, even though the ISO form carries its
+offset, because that offset is only as right as the platform's. On a macOS host
+in `America/Vancouver`, whose rules changed in a recent tzdata release, 4.6.9
+printed frame 1 of `tests/data/sample.pcap` as `2023-11-14T14:13:20-0700`: the
+wall clock is the PST one in force that day, but the offset is the zone's
+current one, so the text names an instant an hour early. `date(1)` on the same
+host prints the same, so the fault is the C library's `%z` rather than tshark's.
+Nothing in the text can detect it, since it is a valid ISO timestamp. Under UTC
+there is no offset to get wrong.
+
+`NULL` is what the NTP display base prints for the zero time in `-T fields`,
+and `-T ek` prints the same value as the epoch, so reading `NULL` as the epoch
+is what keeps the two readers equal. It is only ever the zero time: an NTP
+timestamp that is not zero renders like any UTC field.
+
+`tests/test_values.py` pins each form, `tests/test_semantics_docs.py` parses
+the table above and checks every row against the parser, and
+`tests/integration/test_absolute_time.py` reads `frame.time`, `frame.time_utc`,
+`frame.time_epoch` and the NTP times through a live tshark in both modes,
+asserting the ek and `-T fields` values equal each other and the instants the
+fixtures were built with, including when the caller's own zone is not UTC.
+
 ## What is still divergent
 
 - **`matches` on non-string fields** is a `TypeError` on all three backends —
@@ -345,6 +411,13 @@ residual) equal on >= 4.4 and pinning the documented divergence below it, over
   the join alone and the boundaries are unrecoverable for *any* choice of
   aggregator byte; only `-T ek` sees the truth. Pinned as a known trade-off by
   `tests/test_fields_reader.py`, not papered over.
+- **An absolute time in a rendering Remora does not read** raises `ValueError`
+  naming the text, at conversion time, so per packet rather than at plan time.
+  Planning cannot do better: `tshark -G fields` does not report a field's
+  display base, so nothing can tell in advance which form a projected field
+  will print in. Every form measured above reads, so in practice this is a
+  tshark run whose zone is not UTC on a build before 4.6 — one Remora did not
+  spawn — or a display base none of the three builds was observed using.
 - **Field text tshark could not decode as UTF-8** reaches the predicate backend
   as U+FFFD replacement characters, which cannot round-trip to the original
   bytes. Irreducible; noted in `predicate.py`.

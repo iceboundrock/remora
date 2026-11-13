@@ -23,7 +23,13 @@ FT_INT8..FT_INT64,
 FT_FRAMENUM, FT_CHAR
 FT_BOOLEAN                bool                        ``{"1", "True", "true"}`` -> ``True``;
                                                       ``{"0", "False", "false"}`` -> ``False``
-FT_ABSOLUTE_TIME          datetime (aware, UTC)       epoch seconds, e.g. ``"1625097600.123456789"``
+FT_ABSOLUTE_TIME          datetime (aware, UTC)       epoch seconds (``"1625097600.123456789"``);
+                                                      ISO 8601 with an explicit offset
+                                                      (``"2021-07-01T00:00:00.123456789Z"``,
+                                                      ``"...-0700"``, ``"...+05:30"``);
+                                                      tshark's pre-4.6 rendering in UTC
+                                                      (``"Jul  1, 2021 00:00:00.123456789 UTC"``);
+                                                      ``"NULL"`` (the zero time) -> the epoch
 FT_RELATIVE_TIME          timedelta                   seconds, e.g. ``"0.000123"``
 FT_DOUBLE, FT_FLOAT       float                       anything :func:`float` accepts
 FT_STRING, FT_STRINGZ,    str                         identity (returned unchanged)
@@ -40,6 +46,29 @@ them.
 Unknown ftypes fall back to ``str`` (identity), so new or exotic dissector
 types degrade gracefully instead of failing.
 
+Absolute times: why four forms
+-------------------------------
+tshark renders one ``FT_ABSOLUTE_TIME`` value differently depending on the
+reader mode, the field's display base and the tshark version (measured on
+4.2.2, 4.4.19 and 4.6.9; ``docs/semantics.md`` has the table):
+
+- ``-T ek`` renders every absolute time as ISO 8601 UTC (``...Z``), on every
+  version, ``frame.time_epoch`` included.
+- ``-T fields`` renders a field whose display is Unix time as epoch seconds,
+  and every other display as text: ISO 8601 with an offset on 4.6, and
+  ``"Nov 14, 2023 22:13:20.000000000 UTC"`` before it. A local-time display
+  carries the *local* zone, so before 4.6 it is a zone abbreviation
+  (``MST``, ``IST``) that names no offset unambiguously, and from 4.6 an
+  offset only as reliable as the platform's ``%z``; Remora pins the ``TZ`` of
+  the tshark it spawns to UTC (:mod:`remora.reader.process`) so the zone is
+  always ``UTC``.
+- The NTP display renders the zero time as ``"NULL"`` in ``-T fields``, where
+  ``-T ek`` renders the same value as the epoch.
+
+Each accepted form names its instant unambiguously, so accepting all of them
+loses nothing: a timestamp with no offset, or with a zone abbreviation other
+than ``UTC``, still raises.
+
 Precision note: epoch timestamps may carry nanosecond precision; Python's
 :class:`datetime.datetime` and :class:`datetime.timedelta` resolve to
 microseconds, so sub-microsecond digits are **truncated** (not rounded).
@@ -47,6 +76,7 @@ microseconds, so sub-microsecond digits are **truncated** (not rounded).
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -135,9 +165,109 @@ def _parse_epoch_parts(raw: str) -> tuple[int, int, int]:
     return sign, seconds, micros
 
 
+#: ISO 8601 as tshark writes it: ``-T ek`` on every version (``Z``), and from
+#: 4.6 ``-T fields`` for any non-Unix display (``Z`` or ``±HHMM``). The offset
+#: is mandatory: a timestamp without one is local time, which names no instant.
+_ISO_TIME = re.compile(
+    r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?"
+    r"(?:(Z)|([+-])(\d{2}):?(\d{2}))",
+    re.ASCII,
+)
+
+#: tshark's ``-T fields`` rendering before 4.6: ``"Nov  5, 2023 00:00:05.1 UTC"``.
+#: The day is space-padded, and the zone is an abbreviation. Only ``UTC`` is
+#: accepted: abbreviations are not unique (``IST`` and ``CST`` each name
+#: several offsets), so a table of the rest would be a table of guesses.
+_LEGACY_TIME = re.compile(
+    r"([A-Z][a-z]{2}) +(\d{1,2}), (\d{4}) (\d{2}):(\d{2}):(\d{2})(?:\.(\d+))? (\S+)",
+    re.ASCII,
+)
+
+_MONTHS = {
+    name: number
+    for number, name in enumerate(
+        ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"),
+        start=1,
+    )
+}
+
+#: What the NTP display base renders for the zero time in ``-T fields``; ek
+#: renders the same value as the epoch.
+_NULL_TIME = "NULL"
+
+
+def _micros(frac: str | None) -> int:
+    """Fraction digits -> microseconds, sub-microsecond digits truncated."""
+    return int(frac[:6].ljust(6, "0")) if frac else 0
+
+
 def _parse_absolute_time(raw: str) -> datetime:
-    """Parse epoch seconds into an aware UTC datetime (microsecond precision)."""
-    sign, seconds, micros = _parse_epoch_parts(raw)
+    """Parse any tshark rendering of an absolute time into an aware UTC datetime.
+
+    Accepted: epoch seconds, ISO 8601 with an explicit offset, tshark's pre-4.6
+    ``"Mon D, YYYY HH:MM:SS.f UTC"`` text, and ``"NULL"``. See the module
+    docstring for which reader and version produce which. Microsecond precision.
+    """
+    text = raw.strip()
+    try:
+        return _absolute_time_of(text)
+    except (ValueError, OverflowError) as exc:
+        # OverflowError is a date outside datetime's years 1..9999: malformed
+        # input all the same, and this module's contract is ValueError.
+        raise ValueError(f"invalid absolute time {raw!r}: {exc}") from None
+
+
+def _absolute_time_of(text: str) -> datetime:
+    """:func:`_parse_absolute_time` on stripped text; raises without naming it."""
+    if text == _NULL_TIME:
+        return _EPOCH
+    iso = _ISO_TIME.fullmatch(text)
+    if iso is not None:
+        year, month, day, hour, minute, second, frac, zulu, sign, off_h, off_m = iso.groups()
+        offset = timedelta(0)
+        if not zulu:
+            offset = timedelta(hours=int(off_h), minutes=int(off_m))
+            if sign == "-":
+                offset = -offset
+        local = datetime(
+            int(year),
+            int(month),
+            int(day),
+            int(hour),
+            int(minute),
+            int(second),
+            _micros(frac),
+            tzinfo=timezone(offset),
+        )
+        return local.astimezone(timezone.utc)
+    legacy = _LEGACY_TIME.fullmatch(text)
+    if legacy is not None:
+        month_name, day, year, hour, minute, second, frac, zone = legacy.groups()
+        if zone != "UTC":
+            raise ValueError(
+                f"local time with zone abbreviation {zone!r}; abbreviations are not "
+                "unique UTC offsets, so only UTC is read (tshark renders a local-time "
+                "field this way before 4.6 unless its TZ is UTC, which Remora pins "
+                "for the tshark it spawns)"
+            )
+        if month_name not in _MONTHS:
+            raise ValueError(f"unknown month {month_name!r}")
+        return datetime(
+            int(year),
+            _MONTHS[month_name],
+            int(day),
+            int(hour),
+            int(minute),
+            int(second),
+            _micros(frac),
+            tzinfo=timezone.utc,
+        )
+    try:
+        sign, seconds, micros = _parse_epoch_parts(text)
+    except ValueError:
+        raise ValueError(
+            'expected epoch seconds, ISO 8601 with an offset, "Mon D, YYYY HH:MM:SS UTC" or "NULL"'
+        ) from None
     return _EPOCH + timedelta(seconds=sign * seconds, microseconds=sign * micros)
 
 

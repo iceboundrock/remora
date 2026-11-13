@@ -16,17 +16,44 @@ Two failure modes are engineered away at this layer:
    bounded in time and leaves no zombies. It is invoked by ``__exit__``, by
    the iterator's ``finally`` clause (early break, iterator close, consumer
    exception, or GC of the generator), and as a last resort by ``__del__``.
+
+One property of the child's *environment* is fixed here too, because every
+tshark Remora spawns (``Capture`` and the workspace alike) comes through this
+class: ``TZ`` is pinned to :data:`TSHARK_TZ`, UTC. tshark renders a field with
+a local-time display base in the local zone, and before 4.6 ``-T fields``
+names that zone by abbreviation only (``"Nov 14, 2023 15:13:20.0 MST"``),
+which no parser can turn back into an instant (``IST`` alone is three
+offsets). From 4.6 the rendering carries a numeric offset instead, but that is
+only as right as the C library's ``%z``: on macOS in ``America/Vancouver``,
+whose rules recently changed, it prints the zone's *current* offset for a 2023
+instant, which names a time an hour off and is undetectable in the text. Under
+UTC the zone is ``UTC`` / ``+0000`` on every build and platform, so the value
+reads back exactly (issue #117). The pin changes renderings and nothing else:
+Remora never sends tshark an absolute-time literal (``dfilter.py`` refuses
+them), so no filter semantics depend on the zone.
 """
 
 from __future__ import annotations
 
 import contextlib
+import os
 import subprocess
 import threading
 from collections import deque
 from collections.abc import Iterator, Sequence
 
-__all__ = ["TsharkError", "TsharkNotFoundError", "TsharkProcess", "probe_tshark_version"]
+__all__ = [
+    "TSHARK_TZ",
+    "TsharkError",
+    "TsharkNotFoundError",
+    "TsharkProcess",
+    "probe_tshark_version",
+]
+
+#: The ``TZ`` every spawned tshark runs under (see the module docstring). A
+#: POSIX zone string rather than a zone name, so it needs no tzdata: a minimal
+#: container without ``/usr/share/zoneinfo`` still resolves it to UTC.
+TSHARK_TZ = "UTC0"
 
 #: Number of trailing stderr lines retained for diagnostics.
 _STDERR_TAIL_LINES = 256
@@ -109,6 +136,7 @@ class TsharkProcess:
     """Context manager owning one tshark subprocess.
 
     - stdout: line iterator (text, utf-8, ``errors='replace'``, line separators stripped)
+    - environment: the caller's, with ``TZ`` pinned to :data:`TSHARK_TZ`
     - stderr: drained on a background thread into a bounded buffer (tail only)
     - ``close()``/``__exit__``: terminate -> wait(timeout) -> kill -> reap; bounded
       in time; no zombies
@@ -130,6 +158,7 @@ class TsharkProcess:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                env={**os.environ, "TZ": TSHARK_TZ},
             )
         except FileNotFoundError as exc:
             raise TsharkNotFoundError(

@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 from collections.abc import Generator
 
 import pytest
 
-from remora.reader.process import TsharkError, TsharkNotFoundError, TsharkProcess
+from remora.reader.process import TSHARK_TZ, TsharkError, TsharkNotFoundError, TsharkProcess
 
 
 def _fake_child(code: str) -> list[str]:
@@ -111,3 +112,21 @@ def test_double_close_and_close_after_exhaustion_are_noops() -> None:
     proc.close()
     proc.close()
     assert proc.returncode == 0
+
+
+def test_child_runs_with_tz_pinned_to_utc(monkeypatch: pytest.MonkeyPatch) -> None:
+    """tshark renders a local-time field in its own zone; Remora pins it (#117).
+
+    Before 4.6 that zone is printed as an abbreviation no parser can resolve,
+    so every spawned tshark runs under UTC whatever the caller's zone, and
+    keeps the rest of the caller's environment.
+    """
+    monkeypatch.setenv("TZ", "America/Denver")
+    monkeypatch.setenv("REMORA_TEST_PASSTHROUGH", "kept")
+    code = (
+        "import os\nprint(os.environ.get('TZ'))\nprint(os.environ.get('REMORA_TEST_PASSTHROUGH'))\n"
+    )
+    with TsharkProcess(_fake_child(code)) as proc:
+        assert list(proc) == [TSHARK_TZ, "kept"]
+    # The caller's own environment is left alone.
+    assert os.environ["TZ"] == "America/Denver"
