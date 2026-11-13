@@ -79,13 +79,13 @@ changes shape. Version 3 is #117's: it changed no DDL, but it changed how
 :func:`remora.values.convert` reads tshark's epoch-seconds rendering of a time
 before 1970, and every workspace stores ``frame.time_epoch`` in ``frame_time``.
 tshark prints such an instant with the sign on the whole seconds and a positive
-fraction added (``-1.500000000`` is -1 s + 0.5 s); the earlier reading applied
-the sign to both and stored an instant one second minus twice the fraction
-early. A version 2 file holding such a row is indistinguishable from one that
-does not without trusting the rows themselves, and its cache key still matches
-a fresh request, so it would be reused as a hit or extended by a backfill
-beside the wrong times. Refusing every version 2 file at open, attach included,
-is the cost of making that impossible.
+fraction added (``-1.500000000`` is -1 s + 0.5 s, i.e. -0.5 s); the earlier
+reading applied the sign to both (-1.5 s) and so stored an instant twice the
+fraction early — one second, for that example. A version 2 file holding such a
+row is indistinguishable from one that does not without trusting the rows
+themselves, and its cache key still matches a fresh request, so it would be
+reused as a hit or extended by a backfill beside the wrong times. Refusing every
+version 2 file at open, attach included, is the cost of making that impossible.
 
 Connections are supplied by the caller — this module never opens one, because
 connection and lock ownership belongs to ``Workspace`` (#28). It therefore
