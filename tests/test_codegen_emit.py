@@ -421,8 +421,8 @@ def emit_seed(cls: type[ProtocolBase]) -> EmittedModule:
 def load_emitted(emitted: EmittedModule, directory: Path) -> ModuleType:
     """Write the emitted pair into ``directory`` and import the ``.py``."""
     py_path = directory / f"{emitted.module_name}.py"
-    py_path.write_text(emitted.py_source)
-    (directory / f"{emitted.module_name}.pyi").write_text(emitted.pyi_source)
+    py_path.write_text(emitted.py_source, encoding="utf-8")
+    (directory / f"{emitted.module_name}.pyi").write_text(emitted.pyi_source, encoding="utf-8")
     spec = importlib.util.spec_from_file_location(emitted.module_name, py_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -509,8 +509,8 @@ def test_emitted_seed_modules_pass_ruff_lint(tmp_path: Path) -> None:
         emitted = emit_seed(seed_cls)
         py_path = tmp_path / f"{emitted.module_name}.py"
         pyi_path = tmp_path / f"{emitted.module_name}.pyi"
-        py_path.write_text(emitted.py_source)
-        pyi_path.write_text(emitted.pyi_source)
+        py_path.write_text(emitted.py_source, encoding="utf-8")
+        pyi_path.write_text(emitted.pyi_source, encoding="utf-8")
         paths += [str(py_path), str(pyi_path)]
     config = str(REPO_ROOT / "pyproject.toml")
     lint = subprocess.run(
@@ -545,11 +545,11 @@ def test_emitted_dns_stub_passes_mypy_strict(tmp_path: Path) -> None:
     assert MYPY is not None
     dns_cls = next(cls for _module, cls in SEEDS if cls._proto_ == "dns")
     emitted = emit_seed(dns_cls)
-    (tmp_path / "dns.py").write_text(emitted.py_source)
+    (tmp_path / "dns.py").write_text(emitted.py_source, encoding="utf-8")
     stub_path = tmp_path / "dns.pyi"
-    stub_path.write_text(emitted.pyi_source)
+    stub_path.write_text(emitted.pyi_source, encoding="utf-8")
     config_path = tmp_path / "mypy.ini"
-    config_path.write_text("[mypy]\n")
+    config_path.write_text("[mypy]\n", encoding="utf-8")
     env = dict(os.environ, MYPYPATH=str(REPO_ROOT / "src"))
     result = subprocess.run(
         [

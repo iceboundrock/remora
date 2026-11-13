@@ -38,6 +38,11 @@ if sys.version_info >= (3, 11):
 else:
     import tomli as tomllib
 
+# A stand-in for $TSHARK in tests that monkeypatch every tshark call: find_tshark
+# only checks that the path is an existing file, and nothing ever runs it. The
+# interpreter is such a file on every platform, unlike /usr/bin/true (#129).
+FAKE_TSHARK = sys.executable
+
 SAMPLE_DUMP = (
     "P\tUser Datagram Protocol\tudp\n"
     "F\tSource Port\tudp.srcport\tFT_UINT16\tudp\tBASE_PT_UDP\t0x0\t\n"
@@ -624,7 +629,7 @@ class TestMain:
             "_tshark_dumps",
             lambda tshark: (dump, ""),
         )
-        monkeypatch.setenv("TSHARK", "/usr/bin/true")
+        monkeypatch.setenv("TSHARK", FAKE_TSHARK)
         return config_file, proto_dir
 
     def _argv(self, command: str, config_file: Path, proto_dir: Path) -> list[str]:
@@ -715,7 +720,8 @@ class TestMain:
         captured = capsys.readouterr()
         assert "error:" in captured.err
         assert "tshark not found" in captured.err
-        assert missing in captured.err
+        # repr, as the message prints it: a Windows path's backslashes come out doubled.
+        assert repr(missing) in captured.err
 
     def test_failing_tshark_exits_2(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
@@ -756,7 +762,7 @@ class TestMain:
         assert main(self._argv("check", config_file, missing)) == 2
         captured = capsys.readouterr()
         assert "error:" in captured.err
-        assert str(missing) in captured.err
+        assert repr(str(missing)) in captured.err
 
     def test_warnings_printed_to_stderr_without_failing(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
@@ -816,7 +822,7 @@ class TestSeamCanonicalizesTheFieldsDump:
             return ""
 
         monkeypatch.setattr(fingerprint_module, "_run_tshark", fake_run)
-        monkeypatch.setenv("TSHARK", "/usr/bin/true")
+        monkeypatch.setenv("TSHARK", FAKE_TSHARK)
 
     def _prepare(self, tmp_path: Path) -> tuple[Path, Path]:
         config_file = tmp_path / "codegen.toml"
@@ -937,7 +943,7 @@ class TestMainMultiDest:
             "_tshark_dumps",
             lambda tshark: (canonicalize_dump(dump), ""),
         )
-        monkeypatch.setenv("TSHARK", "/usr/bin/true")
+        monkeypatch.setenv("TSHARK", FAKE_TSHARK)
 
     def _write_repo_config(self, root: Path) -> Path:
         config = root / "codegen.toml"
