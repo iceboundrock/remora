@@ -10,11 +10,11 @@ from remora.proto._meta import ProtocolBase
 class VLAN(ProtocolBase):
     cfi: Field[bool]
     dei: Field[bool]
+    etype: Field[int]
     id: Field[int]
+    id_name: Field[str]
     len: Field[int]
     len_past_end: Field[str]
-    id_name: Field[str]
     priority: Field[int]
     too_many_tags: Field[str]
     trailer: Field[bytes]
-    etype: Field[int]

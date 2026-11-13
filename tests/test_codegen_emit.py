@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import itertools
 import os
 import shutil
 import subprocess
@@ -213,6 +214,54 @@ class TestEmitEdgeCases:
         assert len(emitted.warnings) == 1
         assert emitted.warnings[0].abbrev == "bgp.prefix.length"
         assert "already taken by 'bgp.prefix_length'" in emitted.warnings[0].message
+
+    def test_three_way_collision_warnings_name_the_final_binding(self) -> None:
+        """Marker m1, marker m2, data d: m2 is skipped while m1 holds the attr,
+        then d displaces m1. Both warnings must name d, the field the attr is
+        finally bound to, never the displaced m1 (#70).
+        """
+        proto = Protocol(name="Dynamic Host Configuration Protocol", abbrev="dhcp")
+        fields = [
+            make_field("dhcp.option.classless.static_route", "FT_NONE", "dhcp"),
+            make_field("dhcp.option.classless_static.route", "FT_NONE", "dhcp"),
+            make_field("dhcp.option.classless_static_route", "FT_BYTES", "dhcp"),
+        ]
+        emitted = emit_protocol(proto, fields)
+        assert (
+            '"option_classless_static_route": ("dhcp.option.classless_static_route", '
+            '"FT_BYTES", 0),' in emitted.py_source
+        )
+        assert [(w.abbrev, w.message) for w in emitted.warnings] == [
+            (
+                "dhcp.option.classless_static.route",
+                "attribute name 'option_classless_static_route' already taken by "
+                "'dhcp.option.classless_static_route'; field skipped",
+            ),
+            (
+                "dhcp.option.classless.static_route",
+                "attribute name 'option_classless_static_route' reassigned to data field "
+                "'dhcp.option.classless_static_route'; FT_NONE marker field skipped",
+            ),
+        ]
+
+    @pytest.mark.parametrize("order", list(itertools.permutations(range(3))))
+    def test_three_way_collision_resolution_is_order_independent(
+        self, order: tuple[int, ...]
+    ) -> None:
+        proto = Protocol(name="Dynamic Host Configuration Protocol", abbrev="dhcp")
+        candidates = [
+            make_field("dhcp.option.classless.static_route", "FT_NONE", "dhcp"),
+            make_field("dhcp.option.classless_static.route", "FT_NONE", "dhcp"),
+            make_field("dhcp.option.classless_static_route", "FT_BYTES", "dhcp"),
+        ]
+        emitted = emit_protocol(proto, [candidates[i] for i in order])
+        assert "    option_classless_static_route: Field[bytes]" in emitted.pyi_source
+        assert sorted(w.abbrev for w in emitted.warnings) == [
+            "dhcp.option.classless.static_route",
+            "dhcp.option.classless_static.route",
+        ]
+        for warning in emitted.warnings:
+            assert "'dhcp.option.classless_static_route'" in warning.message
 
     def test_displacing_data_field_keeps_the_attrs_original_position(self) -> None:
         proto = Protocol(name="Dynamic Host Configuration Protocol", abbrev="dhcp")
