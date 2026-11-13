@@ -96,7 +96,7 @@ class DNS(ProtocolBase):
     dsync_target_port: Field[int]
     dsync_type: Field[int]
     eui48: Field[bytes]
-    eui64: Field[str]
+    eui64: Field[bytes]
     extraneous: Field[str]
     extraneous_data: Field[bytes]
     extraneous_length: Field[int]

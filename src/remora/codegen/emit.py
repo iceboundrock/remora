@@ -243,6 +243,7 @@ def _emit_py(
 _STDLIB_STUB_IMPORTS = (
     ("datetime", ("datetime", "timedelta")),
     ("ipaddress", ("IPv4Address", "IPv6Address")),
+    ("uuid", ("UUID",)),
 )
 
 

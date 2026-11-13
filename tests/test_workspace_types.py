@@ -6,6 +6,7 @@ from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
 from ipaddress import IPv4Address, IPv6Address
 from typing import TYPE_CHECKING, Any
+from uuid import UUID
 
 import pytest
 
@@ -39,6 +40,8 @@ SAMPLES: dict[str, Any] = {
     "FT_DOUBLE": 1.5,
     "FT_FLOAT": 1.5,
     "FT_STRING": "hello",
+    "FT_EUI64": bytes.fromhex("0211223344556677"),
+    "FT_GUID": UUID("33221100-5544-7766-8899-aabbccddeeff"),
 }
 INT_SAMPLE = 7
 STR_SAMPLE = "text"
@@ -88,6 +91,8 @@ class TestTypeTable:
             ("FT_IPv6", "UHUGEINT"),
             ("FT_ETHER", "BLOB"),
             ("FT_BYTES", "BLOB"),
+            ("FT_EUI64", "BLOB"),
+            ("FT_GUID", "UUID"),
             ("FT_BOOLEAN", "BOOLEAN"),
             ("FT_ABSOLUTE_TIME", "TIMESTAMP"),
             ("FT_RELATIVE_TIME", "INTERVAL"),
@@ -108,6 +113,10 @@ class TestTypeTable:
             ("FT_INT64", "BIGINT"),
             ("FT_STRING", "VARCHAR"),
             ("FT_NONE", "VARCHAR"),
+            ("FT_OID", "VARCHAR"),
+            ("FT_UINT_STRING", "VARCHAR"),
+            ("FT_STRINGZPAD", "VARCHAR"),
+            ("FT_AX25", "VARCHAR"),
         ],
     )
     def test_frozen_sql_types(self, ftype: str, expected: str) -> None:
@@ -176,6 +185,51 @@ class TestThroughStorage:
         row = con.execute("SELECT v FROM t").fetchone()
         assert row is not None
         assert entry.decode(row[0]) == address
+
+    #: GUIDs either side of each sign boundary DuckDB's 128-bit storage could
+    #: trip on, plus one whose first group reads differently little-endian.
+    GUID_EDGES = (
+        "00000000-0000-0000-0000-000000000000",
+        "00000034-0000-0000-0000-000000000000",
+        "33221100-5544-7766-8899-aabbccddeeff",
+        "7fffffff-ffff-ffff-ffff-ffffffffffff",
+        "80000000-0000-0000-0000-000000000000",
+        "ffffffff-ffff-ffff-7fff-ffffffffffff",
+        "ffffffff-ffff-ffff-8000-000000000000",
+        "ffffffff-ffff-ffff-ffff-ffffffffffff",
+    )
+
+    def test_guid_edges_survive_storage_and_sort_as_uuid_does(
+        self, con: DuckDBPyConnection
+    ) -> None:
+        # The SQL backend pushes <, >, BETWEEN on a UUID column down to DuckDB,
+        # so its order has to be uuid.UUID's: by the 128-bit value of the text.
+        entry = get_column_type("FT_GUID")
+        guids = [UUID(text) for text in self.GUID_EDGES]
+        scratch_column(con, entry.sql_type)
+        con.executemany("INSERT INTO t VALUES (?)", [[entry.encode(g)] for g in reversed(guids)])
+        rows = con.execute("SELECT v FROM t ORDER BY v").fetchall()
+        assert [entry.decode(row[0]) for row in rows] == sorted(guids) == guids
+        for pivot in guids:
+            found = con.execute("SELECT count(*) FROM t WHERE v > ?", [entry.encode(pivot)])
+            assert found.fetchone() == (sum(g > pivot for g in guids),)
+
+    def test_eui64_sorts_as_bytes_do(self, con: DuckDBPyConnection) -> None:
+        entry = get_column_type("FT_EUI64")
+        euis = [bytes.fromhex(h) for h in ("0000000000000001", "0100000000000000", "ff" * 8)]
+        scratch_column(con, entry.sql_type)
+        con.executemany("INSERT INTO t VALUES (?)", [[entry.encode(e)] for e in reversed(euis)])
+        rows = con.execute("SELECT v FROM t ORDER BY v").fetchall()
+        assert [entry.decode(row[0]) for row in rows] == euis
+
+    def test_multi_guid_column_round_trips(self, con: DuckDBPyConnection) -> None:
+        spec = column_spec("sip.Session-ID.local_uuid", "FT_GUID", multi=True)
+        scratch_column(con, spec.sql_type)
+        raw = ("ab30317f-1a78-4dc4-8ff8-24d0d3715d86", "47755a9d-e779-4ba3-8765-3f2099600ef2")
+        con.execute("INSERT INTO t VALUES (?)", [spec.encode_raw(raw)])
+        row = con.execute("SELECT v FROM t").fetchone()
+        assert row is not None
+        assert spec.decode(row[0]) == tuple(UUID(text) for text in raw)
 
     @pytest.mark.parametrize(
         "delta",

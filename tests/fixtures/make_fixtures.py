@@ -61,6 +61,24 @@ space-padded day (``"Nov  5, 2023 ..."``):
 2. NTP server reply    10.0.3.123:123 -> 10.0.3.1:123  all four set, with
    fractional seconds
 
+guid_eui64.pcap (5 packets) — FT_GUID and FT_EUI64 values (issue #69):
+
+1. DHCP DISCOVER  option 97 client UUID, wire bytes 00 11 22 .. ff, which the
+   dissector reads little-endian: ``dhcp.client_id.uuid`` prints
+   ``33221100-5544-7766-8899-aabbccddeeff``
+2. SIP OPTIONS    ``Session-ID: AB30317F1a78...;remote=47755a9d...``:
+   ``sip.Session-ID.local_uuid`` / ``.remote_uuid`` (the mixed case on the wire
+   prints lower-case)
+3. DNS response   one EUI64 record: ``dns.eui64`` = ``02:11:22:33:44:55:66:77``
+4. ICMPv6 NS      a 16-byte Source Link-layer Address option holding an EUI-64
+   (``icmpv6.opt.src_linkaddr_eui64`` = ``fe:00:00:00:00:00:a1:b2``) and an
+   Address Registration Option (``icmpv6.opt.aro.eui64`` =
+   ``02:11:22:33:44:55:66:77``)
+5. DHCP DISCOVER  client UUID printing ``00000034-0000-0000-0000-000000000000``:
+   below frame 1's by text order, above it by tshark 4.2.2's host-endian
+   struct order, so an ordered GUID filter that tshark evaluated would split
+   the two builds
+
 Regenerate with::
 
     uv run python tests/fixtures/make_fixtures.py
@@ -396,6 +414,108 @@ def build_ntp_times() -> bytes:
     return pcap_file(frames, base_ts=NTP_BASE_TS)
 
 
+#: Option 97 (client machine identifier) bodies of guid_eui64.pcap's two DHCP
+#: frames: type 0, then 16 bytes the dissector reads as a little-endian GUID.
+DHCP_UUID_WIRE: tuple[bytes, bytes] = (
+    bytes.fromhex("00112233445566778899aabbccddeeff"),
+    bytes.fromhex("34000000000000000000000000000000"),
+)
+#: The two EUI-64s guid_eui64.pcap carries, in wire (= printed) order.
+EUI64_A = bytes.fromhex("0211223344556677")
+EUI64_B = bytes.fromhex("fe0000000000a1b2")
+
+
+def dhcp_discover(xid: int, client_mac: bytes, client_uuid: bytes) -> bytes:
+    """A BOOTP request with options 53 (DISCOVER) and 97 (client UUID)."""
+    bootp = struct.pack(
+        "!BBBBIHH4s4s4s4s16s64s128s",
+        1,  # op: BOOTREQUEST
+        1,  # htype: Ethernet
+        6,  # hlen
+        0,  # hops
+        xid,
+        0,  # secs
+        0x8000,  # flags: broadcast
+        b"\x00" * 4,
+        b"\x00" * 4,
+        b"\x00" * 4,
+        b"\x00" * 4,
+        client_mac + b"\x00" * 10,
+        b"\x00" * 64,
+        b"\x00" * 128,
+    )
+    options = bytes([99, 130, 83, 99])  # magic cookie
+    options += bytes([53, 1, 1])  # DHCP message type: DISCOVER
+    options += bytes([97, 17, 0]) + client_uuid  # client machine identifier, UUID
+    return bootp + options + bytes([255])
+
+
+SIP_OPTIONS: bytes = (
+    b"OPTIONS sip:bob@example.com SIP/2.0\r\n"
+    b"Via: SIP/2.0/UDP 10.0.4.1:5060;branch=z9hG4bK1\r\n"
+    b"From: <sip:alice@example.com>;tag=1\r\n"
+    b"To: <sip:bob@example.com>\r\n"
+    b"Call-ID: 1@example\r\n"
+    b"CSeq: 1 OPTIONS\r\n"
+    b"Session-ID: AB30317F1a784dc48ff824d0d3715d86;remote=47755a9de7794ba387653f2099600ef2\r\n"
+    b"Content-Length: 0\r\n\r\n"
+)
+
+
+def dns_eui64_response(txid: int, name: str, eui64: bytes) -> bytes:
+    """A DNS response answering *name* with one EUI64 (type 109) record."""
+    header = struct.pack("!HHHHHH", txid, 0x8180, 1, 1, 0, 0)
+    question = dns_qname(name) + struct.pack("!HH", 109, 1)
+    answer = struct.pack("!HHHIH", 0xC00C, 109, 1, 300, 8) + eui64  # name: pointer to qname
+    return header + question + answer
+
+
+def ipv6(src: bytes, dst: bytes, next_header: int, payload: bytes) -> bytes:
+    return struct.pack("!IHBB", 6 << 28, len(payload), next_header, 255) + src + dst + payload
+
+
+def icmpv6_ns_eui64(src: bytes, dst: bytes, target: bytes) -> bytes:
+    """A Neighbor Solicitation whose SLLA and ARO options each carry an EUI-64."""
+    body = struct.pack("!BBHI", 135, 0, 0, 0) + target
+    # Source Link-layer Address, 2 units (16 bytes): an EUI-64 and 6 bytes of padding.
+    body += bytes([1, 2]) + EUI64_B + b"\x00" * 6
+    # Address Registration Option (RFC 6775): status, 3 reserved, lifetime, EUI-64.
+    body += bytes([33, 2, 0, 0, 0, 0]) + struct.pack("!H", 60) + EUI64_A
+    pseudo = src + dst + struct.pack("!I", len(body)) + b"\x00" * 3 + bytes([58])
+    return body[:2] + struct.pack("!H", checksum(pseudo + body)) + body[4:]
+
+
+def build_guid_eui64() -> bytes:
+    """Every FT_GUID and FT_EUI64 rendering the #69 integration suite reads."""
+    unspecified = bytes(4)
+    limited = b"\xff" * 4
+    client = bytes([10, 0, 4, 1])
+    server = bytes([10, 0, 4, 2])
+    v6_src = bytes.fromhex("fe80000000000000fc000000000000a1")
+    v6_dst = bytes.fromhex("ff0200000000000000000001ff0000a2")
+    v6_target = bytes.fromhex("20010db80000000000000000000000a2")
+
+    def discover(xid: int, client_uuid: bytes) -> bytes:
+        datagram = udp(unspecified, limited, 68, 67, dhcp_discover(xid, MAC_A, client_uuid))
+        return ether(BROADCAST, MAC_A, 0x0800, ipv4(unspecified, limited, 17, datagram))
+
+    sip = udp(client, server, 5060, 5060, SIP_OPTIONS)
+    dns = udp(server, client, 53, 53000, dns_eui64_response(0x3001, "eui.example", EUI64_A))
+    frames = [
+        discover(0x3903F326, DHCP_UUID_WIRE[0]),
+        ether(MAC_B, MAC_A, 0x0800, ipv4(client, server, 17, sip)),
+        ether(MAC_A, MAC_B, 0x0800, ipv4(server, client, 17, dns)),
+        ether(
+            bytes.fromhex("3333ff0000a2"),
+            MAC_A,
+            0x86DD,
+            ipv6(v6_src, v6_dst, 58, icmpv6_ns_eui64(v6_src, v6_dst, v6_target)),
+        ),
+        discover(0x3903F327, DHCP_UUID_WIRE[1]),
+    ]
+    return pcap_file(frames, base_ts=1700000400)
+
+
 # Destination ports and source hosts build_bulk_tcp cycles through, in order.
 # Ten hosts and four ports, so a host selects a tenth of the capture, a port a
 # quarter, and a (host, port) conjunction a twentieth — known fractions the
@@ -440,6 +560,7 @@ def main() -> None:
         ("dns_multi.pcap", build_dns_multi),
         ("ctrl_comments.pcapng", build_ctrl_comments),
         ("ntp_times.pcap", build_ntp_times),
+        ("guid_eui64.pcap", build_guid_eui64),
     ]:
         path = FIXTURES_DIR / name
         data = build()

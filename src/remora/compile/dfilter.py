@@ -34,7 +34,30 @@ Literals are first normalized with :func:`remora.values.coerce_literal` (so
 garbage like ``"not-an-ip"`` is rejected), then rendered by the resulting
 Python type: bools as ``1``/``0``, ints as decimal, floats via ``repr`` —
 except NaN, which is refused (see below) — strings double-quoted with
-backslash escapes, IP addresses bare, bytes as colon-hex (``aa:bb:cc``).
+backslash escapes, IP addresses and UUIDs bare (a quoted GUID is a dfilter
+error: ``Globally Unique Identifier cannot be converted from a string``),
+bytes as colon-hex (``aa:bb:cc``), which is also the only EUI-64 spelling
+Wireshark reads as one: on 4.6.9, ``dns.eui64 == 0211223344556677`` is accepted
+and matches nothing.
+
+GUIDs and EUI-64s (issue #69)
+-----------------------------
+Two shapes on these ftypes are refused with :class:`UnsupportedExprError`, so
+the planner evaluates them in Python. Each is a case where tshark's answer
+depends on its version, measured on 4.2.2 (Ubuntu 24.04, CI's ``checks`` leg)
+and 4.6.9:
+
+- **Ordered comparisons and ranges on ``FT_GUID``.** 4.6.9 orders GUIDs by
+  their printed text, as :class:`uuid.UUID` and DuckDB's ``UUID`` do. 4.2.2
+  orders them by the in-memory struct, whose first three groups are
+  host-endian, so ``dhcp.client_id.uuid > 00000034-0000-0000-0000-000000000000``
+  is true for ``33221100-...`` on 4.6.9 and false on 4.2.2. ``==`` and
+  ``in {a, b}`` agree on both and are pushed down.
+- **``contains`` on ``FT_EUI64``.** 4.6.9 runs it as a byte subsequence, as the
+  predicate backend does; 4.2.2 rejects the filter outright (``cannot
+  participate in contains comparison``), which would fail the whole query.
+  Ordered comparisons and ranges on ``FT_EUI64`` agree on both versions with
+  ``bytes`` order and are pushed down.
 
 Time literals (M1 design decision)
 ----------------------------------
@@ -82,7 +105,8 @@ Error policy
 ------------
 :class:`UnsupportedExprError` means "this backend legitimately cannot render
 the expression; the planner should fall back to the Python predicate backend"
-(time literals, float NaN literals, empty bytes, unknown future Expr nodes).
+(time literals, float NaN literals, empty bytes, ordered GUID comparisons,
+``contains`` on an EUI-64, unknown future Expr nodes).
 User errors — malformed literals such as ``IP.src == "not-an-ip"`` — surface as
 the ``ValueError``/``TypeError`` that :func:`remora.values.coerce_literal`
 raises and are deliberately *not* converted into :class:`UnsupportedExprError`.
@@ -94,10 +118,12 @@ import math
 from datetime import datetime, timedelta
 from ipaddress import IPv4Address, IPv6Address
 from typing import Any
+from uuid import UUID
 
 from remora import values
 from remora.expr import (
     And,
+    CompareOp,
     Comparison,
     Contains,
     Expr,
@@ -128,8 +154,10 @@ def compile_dfilter(expr: Expr) -> str:
     expressed as a display filter (see module docstring for the error policy).
     """
     if isinstance(expr, Comparison):
-        literal = _render_literal(values.coerce_literal(expr.field.ftype, expr.value))
-        return f"{expr.field.name} {expr.op.value} {literal}"
+        coerced = values.coerce_literal(expr.field.ftype, expr.value)
+        if expr.op is not CompareOp.EQ:
+            _refuse_unstable_order(expr.field.ftype)
+        return f"{expr.field.name} {expr.op.value} {_render_literal(coerced)}"
     if isinstance(expr, Presence):
         return expr.field.name
     if isinstance(expr, Membership):
@@ -161,6 +189,24 @@ _NAN_REFUSAL = (
 )
 
 
+#: FTypes whose *order* tshark gives differently across versions, so ``<``,
+#: ``<=``, ``>``, ``>=`` and membership ranges are refused (module docstring).
+_UNSTABLE_ORDER_FTYPES = frozenset({"FT_GUID"})
+
+#: FTypes on which some supported tshark rejects ``contains`` outright.
+_NO_CONTAINS_FTYPES = frozenset({"FT_EUI64"})
+
+
+def _refuse_unstable_order(ftype: str) -> None:
+    """Refuse an ordered comparison on an ftype tshark orders version-dependently."""
+    if ftype in _UNSTABLE_ORDER_FTYPES:
+        raise UnsupportedExprError(
+            f"ordered comparisons on {ftype} are not pushed down to display filters: "
+            "tshark 4.2 orders GUIDs by their host-endian struct where 4.6 orders "
+            "their text, so the planner evaluates them as Python predicates"
+        )
+
+
 def _render_literal(value: object) -> str:
     """Render a *normalized* literal (output of ``coerce_literal``) as dfilter text."""
     # bool before int: bool subclasses int.
@@ -176,7 +222,7 @@ def _render_literal(value: object) -> str:
         return repr(value)
     if isinstance(value, str):
         return _render_str(value)
-    if isinstance(value, IPv4Address | IPv6Address):
+    if isinstance(value, IPv4Address | IPv6Address | UUID):
         return str(value)
     if isinstance(value, bytes):
         if not value:
@@ -221,6 +267,7 @@ def _render_set_item(ftype: str, item: MembershipItem) -> str:
             raise UnsupportedExprError(_NAN_REFUSAL)
         if hi < lo:
             raise ValueError(f"inverted membership range: {item.lo!r}..{item.hi!r}")
+        _refuse_unstable_order(ftype)
         return f"{_render_literal(lo)} .. {_render_literal(hi)}"
     return _render_literal(values.coerce_literal(ftype, item))
 
@@ -246,6 +293,11 @@ def _render_needle(ftype: str, needle: str | bytes) -> str:
     if py_type is str and isinstance(needle, str):
         return _render_str(needle)
     if py_type is bytes and isinstance(needle, bytes):
+        if ftype in _NO_CONTAINS_FTYPES:
+            raise UnsupportedExprError(
+                f"contains on {ftype} is not pushed down to display filters: tshark "
+                "4.2 rejects it, so the planner evaluates it as a Python predicate"
+            )
         return ":".join(f"{byte:02x}" for byte in needle)
     raise TypeError(
         "contains needs a str needle on string fields and a bytes needle on "

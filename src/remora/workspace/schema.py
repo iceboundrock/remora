@@ -133,7 +133,7 @@ __all__ = [
     "register_fields",
 ]
 
-SCHEMA_VERSION: Final[int] = 3
+SCHEMA_VERSION: Final[int] = 4
 """Storage layout version written into ``meta.info`` at creation.
 
 Version 2 is #33's: ``main.streams``' four endpoint columns and its
@@ -144,8 +144,16 @@ stream itself is keyed by.
 Version 3 is #117's and changes no DDL: it changes the instant stored for a
 pre-1970 fractional ``frame.time_epoch`` (and any other ``FT_ABSOLUTE_TIME``
 column tshark renders as epoch seconds), so a version 2 file may hold times
-that a fresh materialization would not. An older file is refused at open by
-:func:`check_compatible` rather than migrated — see the module docstring.
+that a fresh materialization would not.
+
+Version 4 is #69's: an ``FT_GUID`` column is ``UUID`` and an ``FT_EUI64``
+column ``BLOB``, where version 3 stored both as ``VARCHAR`` text. Nothing in a
+version 3 file would catch that: ``meta.fields`` registers those columns as
+``VARCHAR`` and the live columns agree, so the integrity check passes, a repeat
+request is a hit, and every read hands back the text through the identity codec
+where the protocol stubs now promise a :class:`uuid.UUID` or 8 ``bytes``. An
+older file is refused at open by :func:`check_compatible` rather than migrated
+— see the module docstring.
 """
 
 _SCHEMA_VERSION_KEY: Final[str] = "schema_version"

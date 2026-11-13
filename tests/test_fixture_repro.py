@@ -40,6 +40,11 @@ def test_ctrl_comments_is_reproducible() -> None:
     assert generator.build_ctrl_comments() == (FIXTURES_DIR / "ctrl_comments.pcapng").read_bytes()
 
 
+def test_guid_eui64_is_reproducible() -> None:
+    generator = _load_generator()
+    assert generator.build_guid_eui64() == (FIXTURES_DIR / "guid_eui64.pcap").read_bytes()
+
+
 def test_ctrl_comments_really_carries_raw_control_bytes() -> None:
     """The whole point of the fixture (#74), checked without spawning tshark.
 

@@ -14,6 +14,7 @@ duckdb = pytest.importorskip("duckdb")
 
 from datetime import datetime, timezone  # noqa: E402
 from ipaddress import IPv4Address, IPv6Address  # noqa: E402
+from uuid import UUID  # noqa: E402
 
 from remora.compile.dfilter import UnsupportedExprError, compile_dfilter  # noqa: E402
 from remora.fields import FieldRef  # noqa: E402
@@ -526,7 +527,8 @@ class TestPre117Workspace:
         with reading(ws_path) as con:
             stored = con.execute("SELECT frame_time FROM main.pkts").fetchall()
         assert stored == [(PRE_EPOCH_TIME,)]
-        assert SCHEMA_VERSION == 3
+        # The bump #117 made is still in force (#69 made the next one).
+        assert SCHEMA_VERSION >= 3
 
     def test_rw_open_refuses_before_any_reuse(self, tmp_path: Path) -> None:
         ws_path, pcap = self._pre_117_workspace(tmp_path)
@@ -579,3 +581,92 @@ class TestPre117Workspace:
             with pytest.raises(SchemaVersionError, match="older remora"):
                 ws.attach(peer, "peer")
             assert dict(ws.attachments) == {}
+
+
+DHCP_UUID: FieldRef[UUID] = FieldRef("dhcp.client_id.uuid", "FT_GUID", False)
+DNS_EUI64: FieldRef[bytes] = FieldRef("dns.eui64", "FT_EUI64", False)
+GUID_TEXT = "33221100-5544-7766-8899-aabbccddeeff"
+EUI64_TEXT = "02:11:22:33:44:55:66:77"
+#: One frame carrying both, projected abbrev-sorted after the two row-key fields.
+GUID_EUI64_ROWS = [line("1", "1614597071.5", GUID_TEXT, EUI64_TEXT)]
+
+
+class TestPre69Workspace:
+    """A workspace written before #69 is refused, not reused (schema version 4).
+
+    Version 3 stored ``FT_GUID`` and ``FT_EUI64`` columns as ``VARCHAR`` text.
+    Its registry and its live columns agree with each other, so nothing but the
+    version row tells it from a current file.
+    """
+
+    @staticmethod
+    def _pre_69_workspace(tmp_path: Path, version: int) -> tuple[Path, Path]:
+        """Materialize a GUID and an EUI-64, then retype them as version 3 had them."""
+        pcap = make_pcap(tmp_path)
+        ws_path = tmp_path / "pre69.duckdb"
+        with Workspace(ws_path, mode="rw") as ws:
+            ws.materialize(
+                pcap,
+                [DHCP_UUID, DNS_EUI64],
+                tshark_version="4.6.9",
+                runner=FakeRunner(GUID_EUI64_ROWS),
+            )
+        con = duckdb.connect(str(ws_path))
+        try:
+            for column, text in (("dhcp_client_id_uuid", GUID_TEXT), ("dns_eui64", EUI64_TEXT)):
+                con.execute(f"ALTER TABLE main.pkts DROP COLUMN {column}")
+                con.execute(f"ALTER TABLE main.pkts ADD COLUMN {column} VARCHAR")
+                con.execute(f"UPDATE main.pkts SET {column} = ?", [text])
+                con.execute(
+                    "UPDATE meta.fields SET column_type = 'VARCHAR' WHERE column_name = ?",
+                    [column],
+                )
+            con.execute(
+                "UPDATE meta.info SET value = ? WHERE key = 'schema_version'", [str(version)]
+            )
+        finally:
+            con.close()
+        return ws_path, pcap
+
+    def test_fresh_workspace_stores_native_types(self, tmp_path: Path) -> None:
+        ws_path, _runner, _result = materialized(
+            tmp_path, lines=GUID_EUI64_ROWS, fields=[DHCP_UUID, DNS_EUI64]
+        )
+        with reading(ws_path) as con:
+            assert pkts_column_type(con, "dhcp_client_id_uuid") == "UUID"
+            assert pkts_column_type(con, "dns_eui64") == "BLOB"
+            stored = con.execute("SELECT dhcp_client_id_uuid, dns_eui64 FROM main.pkts").fetchall()
+        assert stored == [(UUID(GUID_TEXT), bytes.fromhex("0211223344556677"))]
+        assert SCHEMA_VERSION == 4
+
+    def test_rw_open_refuses_before_any_reuse(self, tmp_path: Path) -> None:
+        ws_path, pcap = self._pre_69_workspace(tmp_path, version=3)
+        runner = FakeRunner(GUID_EUI64_ROWS)
+        with (
+            pytest.raises(SchemaVersionError) as excinfo,
+            Workspace(ws_path, mode="rw") as ws,
+        ):
+            ws.materialize(pcap, [DHCP_UUID, DNS_EUI64], tshark_version="4.6.9", runner=runner)
+        assert "version 3" in str(excinfo.value)
+        assert runner.argv is None
+
+    def test_the_version_row_is_the_only_thing_that_tells(self, tmp_path: Path) -> None:
+        # The control: carrying the current version, the same file is a hit and
+        # reads back text where the stubs promise a UUID and 8 bytes.
+        ws_path, pcap = self._pre_69_workspace(tmp_path, version=SCHEMA_VERSION)
+        runner = FakeRunner(GUID_EUI64_ROWS)
+        with Workspace(ws_path, mode="rw") as ws:
+            result = ws.materialize(
+                pcap, [DHCP_UUID, DNS_EUI64], tshark_version="4.6.9", runner=runner
+            )
+            with ws.read() as reader:
+                stored = reader.execute(
+                    "SELECT dhcp_client_id_uuid, dns_eui64 FROM main.pkts"
+                ).fetchall()
+        assert result.outcome == "hit"
+        assert stored == [(GUID_TEXT, EUI64_TEXT)]
+
+    def test_ro_open_refuses(self, tmp_path: Path) -> None:
+        ws_path, _pcap = self._pre_69_workspace(tmp_path, version=3)
+        with pytest.raises(SchemaVersionError, match="older remora"):
+            Workspace(ws_path).open()

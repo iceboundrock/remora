@@ -122,6 +122,22 @@ class TestEmitHappyPath:
         assert "    src: Field[IPv4Address]\n" in pyi
         assert "    host: Field[IPv6Address]\n" in pyi
 
+    def test_guid_imports_uuid_and_eui64_is_bytes(self) -> None:
+        # #69: the stub annotation is the type values.py parses into, and the
+        # stdlib imports keep their canonical order (uuid after ipaddress).
+        proto = Protocol(name="Dynamic Host Configuration Protocol", abbrev="dhcp")
+        fields = [
+            make_field("dhcp.client_id.uuid", "FT_GUID", "dhcp"),
+            make_field("dhcp.ip.client", "FT_IPv4", "dhcp"),
+            make_field("dhcp.eui64", "FT_EUI64", "dhcp"),
+            make_field("dhcp.oid", "FT_OID", "dhcp"),
+        ]
+        pyi = emit_protocol(proto, fields).pyi_source
+        assert pyi.startswith("from ipaddress import IPv4Address\nfrom uuid import UUID\n\n")
+        assert "    client_id_uuid: Field[UUID]\n" in pyi
+        assert "    eui64: Field[bytes]\n" in pyi
+        assert "    oid: Field[str]\n" in pyi
+
     def test_scalar_only_protocol_imports_only_field(self) -> None:
         proto = Protocol(name="Ethernet", abbrev="eth")
         pyi = emit_protocol(proto, [make_field("eth.type", "FT_UINT16", "eth")]).pyi_source
@@ -129,6 +145,7 @@ class TestEmitHappyPath:
         assert "from remora.fields import Field\n" in pyi
         assert "from datetime import" not in pyi
         assert "from ipaddress import" not in pyi
+        assert "from uuid import" not in pyi
 
     def test_multi_only_protocol_imports_only_multifield(self) -> None:
         proto = Protocol(name="Domain Name System", abbrev="dns")

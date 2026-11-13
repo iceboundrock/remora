@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from datetime import datetime, timedelta, timezone
 from ipaddress import IPv4Address, IPv6Address
+from uuid import UUID
 
 import pytest
 
@@ -45,12 +46,12 @@ _ALL_FTYPES = [
     "FT_STRING",
     "FT_STRINGZ",
     "FT_NONE",
-    # Explicit str mappings for the ftypes the issue #19 core set surfaced
-    # (previously reached str via the unknown-ftype fallback); see issue #69.
+    # Surfaced by the issue #19 core set; typed by the issue #69 decision.
     "FT_EUI64",
+    "FT_GUID",
+    # Kept as str by the same decision (OID's richer form is #149's question).
     "FT_OID",
     "FT_UINT_STRING",
-    "FT_GUID",
     "FT_STRINGZPAD",
     "FT_AX25",
 ]
@@ -69,10 +70,10 @@ _EXPECTED_PY_TYPES: dict[str, type] = {
     "FT_STRING": str,
     "FT_STRINGZ": str,
     "FT_NONE": str,
-    "FT_EUI64": str,
+    "FT_EUI64": bytes,
     "FT_OID": str,
     "FT_UINT_STRING": str,
-    "FT_GUID": str,
+    "FT_GUID": UUID,
     "FT_STRINGZPAD": str,
     "FT_AX25": str,
 }
@@ -211,6 +212,128 @@ class TestBytes:
         payload = b"\xde\xad\xbe\xef"
         assert convert("FT_BYTES", payload.hex()) == payload
         assert convert("FT_BYTES", payload.hex(":")) == payload
+
+
+class TestEUI64:
+    """FT_EUI64 -> exactly 8 bytes, in printed order (#69)."""
+
+    def test_tshark_rendering(self) -> None:
+        # What both readers print on 4.2.2 and 4.6.9 (dns.eui64, icmpv6.opt.*).
+        assert convert("FT_EUI64", "02:11:22:33:44:55:66:77") == bytes.fromhex("0211223344556677")
+
+    def test_contiguous_hex_and_either_case(self) -> None:
+        assert convert("FT_EUI64", "0211223344556677") == bytes.fromhex("0211223344556677")
+        assert convert("FT_EUI64", "FE:00:00:00:00:00:A1:B2") == bytes.fromhex("fe0000000000a1b2")
+
+    def test_byte_order_is_printed_order(self) -> None:
+        low = convert("FT_EUI64", "00:00:00:00:00:00:00:01")
+        high = convert("FT_EUI64", "01:00:00:00:00:00:00:00")
+        assert isinstance(low, bytes)
+        assert isinstance(high, bytes)
+        assert low == b"\x00" * 7 + b"\x01"
+        assert low < high
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "",
+            "02:11:22:33:44:55:66",  # 7 bytes
+            "02:11:22:33:44:55:66:77:88",  # 9 bytes
+            "02:11:22:33:44:55",  # an EUI-48
+            "021122334455667",  # odd digit count
+            "02 11 22 33 44 55 66 77",  # bytes.fromhex would take it; tshark never prints it
+            "02-11-22-33-44-55-66-77",
+            "0211:2233:4455:6677",
+            "2:11:22:33:44:55:66:77",
+            "zz:11:22:33:44:55:66:77",
+            "02:11:22:33:44:55:66:7\u0661",  # a non-ASCII digit
+        ],
+    )
+    def test_malformed_raises_value_error(self, raw: str) -> None:
+        with pytest.raises(ValueError, match="EUI-64"):
+            convert("FT_EUI64", raw)
+
+    def test_bytes_literal_must_be_eight_bytes(self) -> None:
+        eui = bytes.fromhex("0211223344556677")
+        assert coerce_literal("FT_EUI64", eui) is eui
+        for wrong in (b"", bytes(6), bytes(9)):
+            with pytest.raises(ValueError, match="need 8 bytes"):
+                coerce_literal("FT_EUI64", wrong)
+
+    def test_str_literal_is_parsed(self) -> None:
+        assert coerce_literal("FT_EUI64", "02:11:22:33:44:55:66:77") == bytes.fromhex(
+            "0211223344556677"
+        )
+        with pytest.raises(ValueError):
+            coerce_literal("FT_EUI64", "02:11")
+
+    def test_ether_keeps_its_own_length(self) -> None:
+        # The 8-byte check is EUI-64's alone: FT_ETHER and FT_BYTES are untouched.
+        assert coerce_literal("FT_BYTES", b"\x01") == b"\x01"
+        with pytest.raises(ValueError):
+            convert("FT_ETHER", "02:11:22:33:44:55:66:77")
+
+
+class TestGUID:
+    """FT_GUID -> uuid.UUID, read from the printed 8-4-4-4-12 text (#69)."""
+
+    def test_tshark_rendering(self) -> None:
+        # dhcp.client_id.uuid, measured in both readers on 4.2.2 and 4.6.9. The
+        # dissector reads it little-endian off the wire; the text is what counts.
+        value = convert("FT_GUID", "33221100-5544-7766-8899-aabbccddeeff")
+        assert value == UUID("33221100-5544-7766-8899-aabbccddeeff")
+        assert isinstance(value, UUID)
+
+    def test_upper_case_is_the_same_value(self) -> None:
+        assert convert("FT_GUID", "AB30317F-1A78-4DC4-8FF8-24D0D3715D86") == UUID(
+            "ab30317f-1a78-4dc4-8ff8-24d0d3715d86"
+        )
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "",
+            "not-a-guid",
+            "ab30317f1a784dc48ff824d0d3715d86",  # uuid.UUID accepts it; tshark never prints it
+            "{ab30317f-1a78-4dc4-8ff8-24d0d3715d86}",
+            "urn:uuid:ab30317f-1a78-4dc4-8ff8-24d0d3715d86",
+            "ab30-317f-1a78-4dc4-8ff8-24d0d3715d86",
+            "ab30317f-1a78-4dc4-8ff8-24d0d3715d8",
+            "ab30317f-1a78-4dc4-8ff8-24d0d3715d86a",
+            "gb30317f-1a78-4dc4-8ff8-24d0d3715d86",
+        ],
+    )
+    def test_malformed_raises_value_error(self, raw: str) -> None:
+        with pytest.raises(ValueError, match="GUID"):
+            convert("FT_GUID", raw)
+
+    def test_literals(self) -> None:
+        guid = UUID("ab30317f-1a78-4dc4-8ff8-24d0d3715d86")
+        assert coerce_literal("FT_GUID", guid) is guid
+        assert coerce_literal("FT_GUID", str(guid).upper()) == guid
+        with pytest.raises(ValueError):
+            coerce_literal("FT_GUID", guid.hex)
+        with pytest.raises(TypeError):
+            coerce_literal("FT_GUID", guid.bytes)
+        with pytest.raises(TypeError):
+            coerce_literal("FT_STRING", guid)
+
+
+class TestKeptAsStr:
+    """The four #19 ftypes the #69 decision keeps as str stay identity parses."""
+
+    @pytest.mark.parametrize(
+        ("ftype", "raw"),
+        [
+            ("FT_OID", "1.3.6.1.2.1.1.1.0"),
+            ("FT_UINT_STRING", "xterm-256color"),
+            ("FT_STRINGZPAD", "PXEClient"),
+            ("FT_AX25", "N0CALL-7"),
+        ],
+    )
+    def test_identity(self, ftype: str, raw: str) -> None:
+        assert convert(ftype, raw) == raw
+        assert coerce_literal(ftype, raw) == raw
 
 
 class TestAbsoluteTime:
