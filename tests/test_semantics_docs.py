@@ -9,7 +9,10 @@ the quickstart.
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 from pathlib import Path
+
+import pytest
 
 from remora.compile.re2 import LOOKAROUND_PREFIXES, MAX_REPEAT
 
@@ -18,6 +21,8 @@ from remora.compile.re2 import LOOKAROUND_PREFIXES, MAX_REPEAT
 # real builder rather than copied out of it.
 from remora.compile.sql import _guarded_match
 from remora.reader.fields_reader import ESCAPED_CHARS, OCC_SEP, UNIT_SEP
+from remora.reader.process import TSHARK_TZ
+from remora.values import convert
 from test_semantics_table import TRUTH_OPERATORS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -28,6 +33,9 @@ TRUTH_END = "<!-- truth-table:end -->"
 
 ESCAPES_START = "<!-- fields-escapes:start -->"
 ESCAPES_END = "<!-- fields-escapes:end -->"
+
+ABS_TIME_START = "<!-- abs-time-forms:start -->"
+ABS_TIME_END = "<!-- abs-time-forms:end -->"
 
 
 def read_doc() -> str:
@@ -118,6 +126,54 @@ def test_the_doc_states_which_side_of_the_escaper_each_separator_is_on() -> None
     assert f"(`0x{ord(OCC_SEP):02x}`)" in text
     assert UNIT_SEP in ESCAPED_CHARS
     assert OCC_SEP not in ESCAPED_CHARS
+
+
+def abs_time_rows() -> list[tuple[str, str]]:
+    """Parse the marked absolute-time table into ``(prints, reads as)`` pairs.
+
+    The ``prints`` cell is taken verbatim between its backticks, because the
+    pre-4.6 rendering's space-padded day (``"Nov  5"``) is part of the form.
+    """
+    body = read_doc().split(ABS_TIME_START, 1)[1].split(ABS_TIME_END, 1)[0]
+    rows: list[tuple[str, str]] = []
+    for raw in body.splitlines():
+        line = raw.strip()
+        if not line.startswith("|") or set(line) <= set("|-: "):
+            continue
+        cells = [cell.strip() for cell in line.strip("|").split("|")]
+        if len(cells) != 5 or cells[0] == "reader":
+            continue
+        rows.append((cells[3].removeprefix("`").removesuffix("`"), cells[4]))
+    return rows
+
+
+#: What each "reads as" cell of the absolute-time table means.
+_ABS_TIME_READINGS = {
+    "the instant": datetime(2023, 11, 5, 0, 0, 5, 500000, tzinfo=timezone.utc),
+    "the epoch": datetime(1970, 1, 1, tzinfo=timezone.utc),
+}
+
+
+def test_the_absolute_time_table_covers_every_measured_form() -> None:
+    # Ten rows: one per (reader, display base, zone, version) case measured
+    # for #117. A row lost to a formatting slip would drop out of the check
+    # below without failing it, so the count is pinned.
+    assert len(abs_time_rows()) == 10
+
+
+@pytest.mark.parametrize(("printed", "reading"), abs_time_rows())
+def test_each_absolute_time_form_reads_as_the_doc_says(printed: str, reading: str) -> None:
+    # The table is the claim that values.py reads what tshark prints, so every
+    # row is run through the parser rather than trusted.
+    if reading == "`ValueError`":
+        with pytest.raises(ValueError, match="zone abbreviation"):
+            convert("FT_ABSOLUTE_TIME", printed)
+        return
+    assert convert("FT_ABSOLUTE_TIME", printed) == _ABS_TIME_READINGS[reading]
+
+
+def test_the_doc_names_the_zone_tshark_is_pinned_to() -> None:
+    assert f"`TZ={TSHARK_TZ}`" in read_doc()
 
 
 #: Suffixes that make a backticked token a repository path rather than prose.

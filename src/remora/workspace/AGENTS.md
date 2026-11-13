@@ -11,7 +11,7 @@ The first three sections bind every module here. The rest are per module.
 ## Layout (`schema.py`)
 
 - `iter_ddl()` is the single source of the layout, and `create_schema()` executes exactly those statements, idempotently. `iter_scratch_ddl()` holds session-scoped `TEMP` DDL. Tests freeze this: only `schema.py` (plus the visible `DDL_SCRATCH_FILES` exemption set) may contain a `CREATE` head, and the heads inside `schema.py` must equal `iter_ddl()`.
-- `SCHEMA_VERSION` is 2, `check_compatible` accepts only the exact version, and there is no migration. Any column added to an existing table is a bump, because `create_schema` is `IF NOT EXISTS`-only. The opener calls both `create_schema` and `check_compatible`.
+- `SCHEMA_VERSION` is 3, `check_compatible` accepts only the exact version, and there is no migration. Any column added to an existing table is a bump, because `create_schema` is `IF NOT EXISTS`-only. So is a change to what a stored value means with no DDL change at all: version 3 (#117) changed the instant a pre-1970 fractional `frame.time_epoch` reads as, and a version 2 file would otherwise be reused as a cache hit holding the old instants. The opener calls both `create_schema` and `check_compatible`, and every attach runs `check_compatible` against the alias.
 - Packet data lives in `main` (`pkts`, `streams`, `annotations`) and the catalog in `meta`. `pkts` has no `PRIMARY KEY`, because an ART index taxes bulk append; `frame_number` is the row key by convention. Every catalog probe is pinned to `current_database()` so an attached database cannot vouch for or collide with the current one.
 
 ## Naming and types (`naming.py`, `types.py`)

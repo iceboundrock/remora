@@ -74,6 +74,19 @@ refusal at open. That is what version 2 is: #33 added ``main.streams``'
 endpoint columns and its ``UNIQUE`` key, so a version 1 workspace is now
 refused by name of both versions and has to be recreated.
 
+A change to what a stored value *means* is a bump too, even when no table
+changes shape. Version 3 is #117's: it changed no DDL, but it changed how
+:func:`remora.values.convert` reads tshark's epoch-seconds rendering of a time
+before 1970, and every workspace stores ``frame.time_epoch`` in ``frame_time``.
+tshark prints such an instant with the sign on the whole seconds and a positive
+fraction added (``-1.500000000`` is -1 s + 0.5 s, i.e. -0.5 s); the earlier
+reading applied the sign to both (-1.5 s) and so stored an instant twice the
+fraction early — one second, for that example. A version 2 file holding such a
+row is indistinguishable from one that does not without trusting the rows
+themselves, and its cache key still matches a fresh request, so it would be
+reused as a hit or extended by a backfill beside the wrong times. Refusing every
+version 2 file at open, attach included, is the cost of making that impossible.
+
 Connections are supplied by the caller — this module never opens one, because
 connection and lock ownership belongs to ``Workspace`` (#28). It therefore
 imports duckdb only for typing and stays importable without it.
@@ -120,13 +133,18 @@ __all__ = [
     "register_fields",
 ]
 
-SCHEMA_VERSION: Final[int] = 2
+SCHEMA_VERSION: Final[int] = 3
 """Storage layout version written into ``meta.info`` at creation.
 
 Version 2 is #33's: ``main.streams``' four endpoint columns and its
 ``UNIQUE (protocol, stream_id)`` key, plus the ``main.annotations.protocol``
 column that key forced — a stream annotation has to name the same pair the
-stream itself is keyed by. A version 1 file is refused at open by
+stream itself is keyed by.
+
+Version 3 is #117's and changes no DDL: it changes the instant stored for a
+pre-1970 fractional ``frame.time_epoch`` (and any other ``FT_ABSOLUTE_TIME``
+column tshark renders as epoch seconds), so a version 2 file may hold times
+that a fresh materialization would not. An older file is refused at open by
 :func:`check_compatible` rather than migrated — see the module docstring.
 """
 

@@ -22,6 +22,12 @@ Each packet produces two lines: an index/action metadata line such as
   (``"ip_ip_ttl": "64"``). JSON numbers are still normalized defensively for
   other versions/configurations.
 - **FT_BOOLEAN** fields are JSON ``true``/``false``.
+- **FT_ABSOLUTE_TIME** fields are ISO 8601 UTC strings
+  (``"2023-11-14T22:13:20.000000000Z"``) whatever their display base, so even
+  ``frame.time_epoch`` arrives as ISO text rather than epoch seconds (measured
+  on 4.2.2, 4.4.19 and 4.6.9). They pass through unchanged like every other
+  string: :func:`remora.values.convert` reads that form, and the per-ftype
+  concern stays there rather than here (#117).
 - **Multi-occurrence** fields are JSON arrays in wire order
   (``"tcp_tcp_port": ["51234", "443"]``). Nested arrays were never observed;
   if one appears it is flattened recursively (defensive policy).

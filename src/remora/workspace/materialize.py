@@ -31,12 +31,16 @@ different residual would silently reuse the wrong rows.
 Why ``frame.time_epoch`` feeds ``frame_time``
 ---------------------------------------------
 The ``pkts`` skeleton's row key is ``frame_number`` / ``frame_time``. tshark's
-``frame.time`` renders a human-readable, locale- and timezone-shaped string;
-``frame.time_epoch`` is the epoch-seconds form
-:func:`remora.values.convert` parses for ``FT_ABSOLUTE_TIME``. So the
-projection always asks for ``frame.time_epoch`` and stores it in ``frame_time``,
-and a caller *requesting* ``frame.time`` or ``frame.number`` gets no extra
-column — the row key already holds that data.
+``frame.time`` renders human-readable text whose shape depends on the tshark
+version and, before 4.6, on the zone the binary runs in; ``frame.time_epoch``
+renders epoch seconds on every version, whatever the zone. Both read back to
+the same instant since #117 (:func:`remora.values.convert` accepts every
+rendering, and :mod:`remora.reader.process` pins tshark's zone to UTC), but
+only the epoch form owes nothing to that pin, and switching would change the
+argv every stored cache key was computed over. So the projection always asks
+for ``frame.time_epoch`` and stores it in ``frame_time``, and a caller
+*requesting* ``frame.time`` or ``frame.number`` gets no extra column — the row
+key already holds that data.
 
 Why batches bind plain values, never Arrow
 ------------------------------------------
@@ -274,9 +278,8 @@ _FRAME_NUMBER_SPEC: Final[ColumnSpec] = ColumnSpec(
     # from that layout rather than restated, so the two cannot drift.
     sql_type=SKELETON_COLUMN_TYPES["frame_number"],
 )
-# frame.time renders human-readable; frame.time_epoch is the epoch-seconds
-# form remora.values.convert parses for FT_ABSOLUTE_TIME, landing in the
-# frame_time column.
+# frame.time_epoch renders epoch seconds on every tshark version and in every
+# zone, landing in the frame_time column (see the module docstring).
 _FRAME_TIME_SPEC: Final[ColumnSpec] = ColumnSpec(
     abbrev="frame.time_epoch",
     column_name="frame_time",

@@ -156,6 +156,23 @@ store the same thing — exempting them would be the same class of mistake as
 ignoring `-d`. A loud refusal costs one rematerialization; a silent hit would
 cost trust in the cache.
 
+### A parser change can change what a stored value means
+
+The cache key describes what tshark printed, not what remora made of it. Issue
+#117 changed how a pre-1970 time with a fraction is read from tshark's
+epoch-seconds text: tshark prints the instant half a second before the epoch as
+`-1.500000000`, meaning -1 s plus 0.5 s, and earlier remoras read it as
+-1.5 s, one second early. Every workspace stores `frame.time_epoch` as
+`frame_time`, and the argv and tshark version are unchanged, so a workspace
+written before the fix would still match a fresh request as a hit, or be
+extended by a backfill, while holding the early times.
+
+So the fix raised the workspace schema version from 2 to 3, and a version 2
+file is refused with `SchemaVersionError` whether it is opened `rw` or `ro` or
+attached. That refuses every version 2 file, including those whose captures
+have no pre-1970 frames, because the stored rows cannot vouch for themselves:
+re-materialize the capture into a fresh workspace file.
+
 ### The fingerprint's blind spot
 
 Fingerprinting is `size + mtime_ns + 64 KiB from each end` because materializing

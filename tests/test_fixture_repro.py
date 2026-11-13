@@ -57,3 +57,8 @@ def test_ctrl_comments_really_carries_raw_control_bytes() -> None:
         b"rs\x1ehere",
     ):
         assert expected in raw
+
+
+def test_ntp_times_is_reproducible() -> None:
+    generator = _load_generator()
+    assert generator.build_ntp_times() == (FIXTURES_DIR / "ntp_times.pcap").read_bytes()

@@ -49,10 +49,11 @@ FIELDS_VERSION = "4.4.5"
 #: Frame-level fields have no generated protocol class, so this is a hand-built
 #: ref — and it is exactly what the residual cases want: dfilter.py refuses to
 #: push a time literal, so a term built from it is a guaranteed residual Expr.
-#: ``frame.time_epoch`` rather than ``frame.time``, matching what a live run
-#: would ask for: the planner projects the abbrev verbatim and ``-e frame.time``
-#: renders a locale-shaped string where ``FT_ABSOLUTE_TIME`` parses epoch
-#: seconds, so the canned columns below would be unreachable output.
+#: ``frame.time_epoch`` rather than ``frame.time`` because the canned columns
+#: below are epoch seconds, which is what ``-e frame.time_epoch`` prints; the
+#: planner projects the abbrev verbatim, and ``-e frame.time`` prints text
+#: instead. Both read back since #117 (``values._parse_absolute_time``), and
+#: ``tests/integration/test_absolute_time.py`` covers every live rendering.
 FRAME_TIME = FieldRef[datetime]("frame.time_epoch", "FT_ABSOLUTE_TIME", False)
 
 #: The instant the fields-mode fixture rows straddle, to the nanosecond.

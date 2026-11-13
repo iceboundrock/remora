@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import pytest
 
@@ -22,13 +22,14 @@ from remora.reader.process import TsharkError, TsharkNotFoundError  # noqa: E402
 from remora.workspace import (  # noqa: E402
     ColumnNameCollisionError,
     MaterializeResult,
+    SchemaVersionError,
     Workspace,
     WorkspaceError,
     WorkspaceModeError,
     detect_tshark_version,
     materialize_into,
 )
-from remora.workspace.schema import read_cache_key, read_fields  # noqa: E402
+from remora.workspace.schema import SCHEMA_VERSION, read_cache_key, read_fields  # noqa: E402
 from workspace_doubles import (  # noqa: E402
     FRAME_NUMBER,
     FRAME_TIME_T,
@@ -479,3 +480,102 @@ class TestWorkspaceMethod:
             assert stored is not None
             assert stored.tshark_version == "9.9.9"
             assert stored.argv[0] == missing
+
+
+#: One frame half a second before the epoch, as ``tshark -T fields`` prints its
+#: ``frame.time_epoch``: the whole seconds carry the sign and the fraction is
+#: added (#117).
+PRE_EPOCH_ROWS = [line("1", "-1.500000000", "10.0.0.1")]
+#: What a fresh materialization stores for it.
+PRE_EPOCH_TIME = datetime(1969, 12, 31, 23, 59, 59, 500000)
+#: What remora stored for it before #117, which read the text as -1.5 s.
+PRE_117_TIME = datetime(1969, 12, 31, 23, 59, 58, 500000)
+
+
+class TestPre117Workspace:
+    """A workspace written before #117 is refused, not reused (schema version 3).
+
+    #117 changed the instant a pre-epoch fractional ``frame.time_epoch`` reads
+    as, without changing the argv or the layout, so an older file's cache key
+    still matches a fresh request. Only the schema version can tell it apart.
+    """
+
+    @staticmethod
+    def _pre_117_workspace(tmp_path: Path) -> tuple[Path, Path]:
+        """Materialize ``PRE_EPOCH_ROWS``, then leave the file as remora 2 left it.
+
+        A version 2 remora wrote the same layout and the same cache key over the
+        same argv; what differed was the stored instant and the version row.
+        """
+        pcap = make_pcap(tmp_path)
+        ws_path = tmp_path / "pre117.duckdb"
+        with Workspace(ws_path, mode="rw") as ws:
+            ws.materialize(
+                pcap, [IP_SRC], tshark_version="4.6.9", runner=FakeRunner(PRE_EPOCH_ROWS)
+            )
+        con = duckdb.connect(str(ws_path))
+        try:
+            con.execute("UPDATE main.pkts SET frame_time = ?", [PRE_117_TIME])
+            con.execute("UPDATE meta.info SET value = '2' WHERE key = 'schema_version'")
+        finally:
+            con.close()
+        return ws_path, pcap
+
+    def test_fresh_workspace_stores_the_tshark_instant(self, tmp_path: Path) -> None:
+        ws_path, _runner, _result = materialized(tmp_path, lines=PRE_EPOCH_ROWS, fields=[IP_SRC])
+        with reading(ws_path) as con:
+            stored = con.execute("SELECT frame_time FROM main.pkts").fetchall()
+        assert stored == [(PRE_EPOCH_TIME,)]
+        assert SCHEMA_VERSION == 3
+
+    def test_rw_open_refuses_before_any_reuse(self, tmp_path: Path) -> None:
+        ws_path, pcap = self._pre_117_workspace(tmp_path)
+        runner = FakeRunner(PRE_EPOCH_ROWS)
+        # Without the bump this repeat request was a cache hit: same pcap, same
+        # field set, same tshark version and argv, so the early time stayed.
+        with (
+            pytest.raises(SchemaVersionError) as excinfo,
+            Workspace(ws_path, mode="rw") as ws,
+        ):
+            ws.materialize(pcap, [IP_SRC], tshark_version="4.6.9", runner=runner)
+        message = str(excinfo.value)
+        assert "version 2" in message
+        assert str(SCHEMA_VERSION) in message
+        assert "recreate the workspace" in message
+        assert runner.argv is None
+
+    def test_the_version_row_is_the_only_thing_that_tells(self, tmp_path: Path) -> None:
+        # The control: the same file carrying the current version is accepted
+        # as a hit and keeps the early time. Only the version row refuses it.
+        ws_path, pcap = self._pre_117_workspace(tmp_path)
+        con = duckdb.connect(str(ws_path))
+        try:
+            con.execute(
+                "UPDATE meta.info SET value = ? WHERE key = 'schema_version'",
+                [str(SCHEMA_VERSION)],
+            )
+        finally:
+            con.close()
+        runner = FakeRunner(PRE_EPOCH_ROWS)
+        with Workspace(ws_path, mode="rw") as ws:
+            result = ws.materialize(pcap, [IP_SRC], tshark_version="4.6.9", runner=runner)
+            with ws.read() as reader:
+                stored = reader.execute("SELECT frame_time FROM main.pkts").fetchall()
+        assert result.outcome == "hit"
+        assert stored == [(PRE_117_TIME,)]
+
+    def test_ro_open_refuses(self, tmp_path: Path) -> None:
+        ws_path, _pcap = self._pre_117_workspace(tmp_path)
+        with pytest.raises(SchemaVersionError, match="older remora"):
+            Workspace(ws_path).open()
+
+    @pytest.mark.parametrize("mode", ["ro", "rw"])
+    def test_attach_refuses(self, tmp_path: Path, mode: Literal["ro", "rw"]) -> None:
+        peer, _pcap = self._pre_117_workspace(tmp_path)
+        primary = tmp_path / "ws.duckdb"
+        with Workspace(primary, mode="rw"):
+            pass
+        with Workspace(primary, mode=mode) as ws:
+            with pytest.raises(SchemaVersionError, match="older remora"):
+                ws.attach(peer, "peer")
+            assert dict(ws.attachments) == {}

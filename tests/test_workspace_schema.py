@@ -177,9 +177,9 @@ class TestCreateSchema:
 
     def test_streams_rollup_columns(self, con: DuckDBPyConnection) -> None:
         # The columns remora.workspace.streams (#33) populates. Adding the
-        # endpoints changed a v1 layout, which is why SCHEMA_VERSION is 2: an
-        # IF NOT EXISTS create cannot add a column to an existing file, so a v1
-        # workspace has to be refused at open rather than half-upgraded.
+        # endpoints changed a v1 layout, which is why SCHEMA_VERSION went to 2:
+        # an IF NOT EXISTS create cannot add a column to an existing file, so a
+        # v1 workspace has to be refused at open rather than half-upgraded.
         assert column_names(con, "main", "streams") == [
             "stream_id",
             "protocol",
