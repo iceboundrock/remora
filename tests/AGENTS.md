@@ -13,7 +13,7 @@ The root `AGENTS.md` has the commands and the five-part CI gate. Tests that free
 ## CI legs
 
 - CI's `checks` job installs Ubuntu 24.04's stock tshark (4.2.2), not the codegen pin. Behavior asserted against a live binary must hold on both, so measure on 4.2.2 first.
-- The `windows` CI job runs `mypy --strict src tests` and `pytest -m "not integration"` on `windows-latest`, minus the three codegen suites that fail there for test-only reasons (#129). The tshark integration suite stays Linux-only.
+- The `windows` CI job runs `mypy --strict src tests` and `pytest -m "not integration"` on `windows-latest`. The tshark integration suite stays Linux-only. Tests that write a file another step reads back pass `encoding="utf-8"`, since Windows defaults to the locale codec, and a fake tshark must be a path that exists on every OS (`sys.executable`), not `/usr/bin/true` (#129).
 
 ## Workspace integration suites (`integration/workspace/`)
 

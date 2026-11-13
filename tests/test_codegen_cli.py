@@ -17,6 +17,11 @@ if sys.version_info >= (3, 11):
 else:
     import tomli as tomllib
 
+# A stand-in for $TSHARK in tests that monkeypatch every tshark call: find_tshark
+# only checks that the path is an existing file, and nothing ever runs it. The
+# interpreter is such a file on every platform, unlike /usr/bin/true (#129).
+FAKE_TSHARK = sys.executable
+
 SAMPLE_DUMP = (
     "P\tUser Datagram Protocol\tudp\n"
     "F\tSource Port\tudp.srcport\tFT_UINT16\tudp\tBASE_PT_UDP\t0x0\t\n"
@@ -32,7 +37,7 @@ def fake_tshark(monkeypatch: pytest.MonkeyPatch) -> None:
         lambda tshark: "TShark (Wireshark) 4.6.7 (Git).",
     )
     monkeypatch.setattr(fingerprint_module, "_tshark_dumps", lambda tshark: (SAMPLE_DUMP, ""))
-    monkeypatch.setenv("TSHARK", "/usr/bin/true")
+    monkeypatch.setenv("TSHARK", FAKE_TSHARK)
 
 
 class TestGen:
@@ -91,7 +96,7 @@ class TestGen:
             lambda tshark: "TShark (Wireshark) 4.6.7 (Git).",
         )
         monkeypatch.setattr(fingerprint_module, "_tshark_dumps", lambda tshark: (dump, ""))
-        monkeypatch.setenv("TSHARK", "/usr/bin/true")
+        monkeypatch.setenv("TSHARK", FAKE_TSHARK)
         assert main(["gen", "--protocols", "udp", "--out", str(tmp_path / "gen")]) == 0
         assert "warning:" in capsys.readouterr().err
 
