@@ -349,6 +349,15 @@ parser for `FT_ABSOLUTE_TIME`. A `-` before a zero whole part (`-0.5`) can only
 be the fraction's own sign, and both read it as negative. An ISO offset whose
 minutes exceed 59 (`+0060`) raises rather than carrying into the hour.
 
+On Windows, tshark cannot render a pre-epoch time in the local display base.
+The MSVC C runtime's `localtime()` rejects a negative `time_t`, so 4.6.9 on
+`windows-latest` prints `frame.time` for those frames as `Not representable`
+in `-T fields`, and Remora raises `ValueError` naming that text. The UTC and
+Unix bases (`frame.time_utc`, `frame.time_epoch`) and every `-T ek` rendering
+read correctly there, so project one of those, or leave the capture in ek mode,
+when pre-epoch timestamps are possible. Reading the text as absence would make
+a residual predicate silently drop those packets.
+
 Earlier remoras read `-1.500000000` as -1.5 s, and a workspace stores
 `frame.time_epoch` read this way, so the fix raised the workspace schema
 version to 3 and a workspace written before it is refused at open and at attach
@@ -366,7 +375,9 @@ the table above and checks every row against the parser, and
 `frame.time_epoch` and the NTP times through a live tshark in both modes,
 asserting the ek and `-T fields` values equal each other and the instants the
 fixtures were built with, including when the caller's own zone is not UTC and
-for pre-epoch frames, whose residual predicates it also runs in both modes.
+for pre-epoch frames, whose residual predicates it also runs in both modes. On
+Windows it asserts the `Not representable` refusal for local pre-epoch times
+instead.
 
 ## Reader representation: GUIDs and EUI-64s
 
@@ -508,7 +519,9 @@ means").
   display base, so nothing can tell in advance which form a projected field
   will print in. Every form measured above reads, so in practice this is a
   tshark run whose zone is not UTC on a build before 4.6 — one Remora did not
-  spawn — or a display base none of the three builds was observed using.
+  spawn — a pre-epoch time in the local display base on Windows, which prints
+  `Not representable`, or a display base none of the three builds was observed
+  using.
 - **Field text tshark could not decode as UTF-8** reaches the predicate backend
   as U+FFFD replacement characters, which cannot round-trip to the original
   bytes. Irreducible; noted in `predicate.py`.

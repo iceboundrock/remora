@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import shutil
 import struct
+import sys
 from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -83,6 +84,13 @@ PRE_EPOCH_TIMES = [
     EPOCH - timedelta(microseconds=1),
     EPOCH + timedelta(microseconds=250000),
 ]
+
+#: The MSVC C runtime's localtime() rejects a negative time_t, so Windows
+#: tshark (4.6.9 on windows-latest, #130) prints the local display base of a
+#: pre-epoch time as this text. The UTC and Unix bases and every -T ek
+#: rendering are unaffected. docs/semantics.md records the limit.
+NOT_REPRESENTABLE = "Not representable"
+LOCAL_PRE_EPOCH_IS_UNREADABLE = sys.platform == "win32"
 
 
 def _pcapng_block(block_type: int, body: bytes) -> bytes:
@@ -219,7 +227,22 @@ class TestPreEpoch:
     @pytest.mark.parametrize("ref", FRAME_TIMES, ids=lambda ref: ref.name)
     def test_ek_and_fields_agree(self, ref: FieldRef[datetime], pre_epoch: Path) -> None:
         assert _times(_ek(pre_epoch), ref) == PRE_EPOCH_TIMES
+        if LOCAL_PRE_EPOCH_IS_UNREADABLE and ref is FRAME_TIME:
+            self._assert_local_pre_epoch_is_refused(pre_epoch)
+            return
         assert _times(_fields(pre_epoch, ref), ref) == PRE_EPOCH_TIMES
+
+    @staticmethod
+    def _assert_local_pre_epoch_is_refused(pre_epoch: Path) -> None:
+        # Frames 1-3 have a negative whole second, which localtime() rejects;
+        # frame 4's is 0, which it accepts. The refusal must be loud: the
+        # text raises, naming itself, rather than reading as absence.
+        raws = [pkt.get_raw(FRAME_TIME.name) for pkt in _fields(pre_epoch, FRAME_TIME)]
+        assert raws[:3] == [(NOT_REPRESENTABLE,)] * 3, raws
+        (last,) = raws[3]
+        assert convert(FRAME_TIME.ftype, last) == PRE_EPOCH_TIMES[3]
+        with pytest.raises(ValueError, match=NOT_REPRESENTABLE):
+            convert(FRAME_TIME.ftype, NOT_REPRESENTABLE)
 
     def test_fields_prints_the_signed_whole_seconds_form(self, pre_epoch: Path) -> None:
         # The precondition, pinned so the parity above cannot pass by tshark
@@ -255,6 +278,11 @@ class TestPreEpoch:
         assert fields.plan().mode == "fields"
         assert fields.plan().residual is not None
         assert [pkt.get_raw("frame.number") for pkt in ek] == frames
+        if LOCAL_PRE_EPOCH_IS_UNREADABLE and ref is FRAME_TIME:
+            # The residual reads frame 1 first, which prints NOT_REPRESENTABLE.
+            with pytest.raises(ValueError, match=NOT_REPRESENTABLE):
+                list(fields)
+            return
         assert [pkt.get_raw("frame.number") for pkt in fields] == frames
 
 
