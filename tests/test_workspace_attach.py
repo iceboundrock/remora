@@ -384,7 +384,6 @@ class TestWorkspaceAttachRefusals:
         with Workspace(primary) as ws, pytest.raises(WorkspaceError, match="own file"):
             ws.attach(alias_path, "self")
 
-    @pytest.mark.skipif(os.name != "posix", reason="hard links need privileges on Windows")
     @pytest.mark.parametrize("mode", ["ro", "rw"])
     def test_attaching_the_workspaces_own_file_through_a_hard_link(
         self, tmp_path: Path, mode: Mode
