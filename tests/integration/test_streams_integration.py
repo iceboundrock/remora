@@ -100,6 +100,7 @@ def tshark_conversations(pcap: Path, protocol: str) -> dict[tuple[str, int], Con
         check=True,
         capture_output=True,
         text=True,
+        encoding="utf-8",
         timeout=60,
     ).stdout
     conversations: dict[tuple[str, int], Conversation] = {}

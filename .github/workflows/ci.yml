@@ -98,7 +98,7 @@ jobs:
   # does not need tshark (the runner has none) on windows-latest. It is also
   # the only leg on which mypy sees the `sys.platform == "win32"` branches and
   # pytest runs the Windows-only tests, so Windows code is covered here or not
-  # at all. The tshark integration suite stays Linux-only for now.
+  # at all. The tshark integration suite runs in `windows-tshark` below.
   windows:
     name: workspace and unit suites on Windows (#85)
     runs-on: windows-latest
@@ -115,6 +115,50 @@ jobs:
       - name: Test
         run: uv run pytest -rs -m "not integration"
         env:
+          REMORA_REQUIRE_DUCKDB: "1"
+
+  # Issue #130: the other half of the suite on Windows, against a live
+  # tshark.exe — the reader's argv and pipes, the `-T fields` framing bytes, the
+  # absolute-time renderings under TZ pinning, and the workspace parity matrix.
+  # A sibling job rather than more steps in `windows`, so a broken Wireshark
+  # install cannot hide the unit suite's result and the two run in parallel.
+  #
+  # Chocolatey's `wireshark` package is the current stable release, unpinned:
+  # it is a >= 4.4 build, so this leg takes the unescape path, and what it adds
+  # over `tshark-ppa` is the platform, not a tshark version. The version line
+  # below records which build a run met. Reading capture files needs no Npcap
+  # (that is for live capture). The install directory goes on PATH explicitly
+  # rather than relying on the installer or a chocolatey shim to put it there.
+  windows-tshark:
+    name: tshark integration suite on Windows (#130)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: uv sync
+      - name: Install Wireshark (chocolatey)
+        shell: pwsh
+        run: |
+          choco install wireshark --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $dir = Join-Path $env:ProgramFiles "Wireshark"
+          if (-not (Test-Path (Join-Path $dir "tshark.exe"))) {
+            throw "tshark.exe not found under $dir"
+          }
+          Add-Content -Path $env:GITHUB_PATH -Value $dir
+      - name: tshark version
+        shell: pwsh
+        run: (Get-Command tshark).Source; tshark --version | Select-Object -First 1
+      # `-m integration`, the complement of the `windows` job's selection, so
+      # the two jobs together run the whole suite once.
+      - name: Test
+        run: uv run pytest -rs -m integration
+        env:
+          REMORA_REQUIRE_TSHARK: "1"
           REMORA_REQUIRE_DUCKDB: "1"
 
   codegen-drift:

@@ -335,6 +335,9 @@ def detect_tshark_version(tshark: str) -> str:
             check=True,
             capture_output=True,
             text=True,
+            # tshark writes UTF-8 on every platform; the locale codec is a
+            # code page on Windows.
+            encoding="utf-8",
             timeout=_VERSION_PROBE_TIMEOUT,
         ).stdout
     except OSError as exc:

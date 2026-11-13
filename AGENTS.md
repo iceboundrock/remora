@@ -36,7 +36,7 @@ uv run mypy --strict --python-version 3.12 .github/scripts/check_stub_resolution
 The CI gate is all five: `ruff check`, `ruff format --check`, `mypy --strict src tests`, the stub check, and `pytest`. Run it before committing.
 
 - The stub check keeps `from remora.proto.wlan import WLAN` typed in an editable or multi-root layout (#77). Its `--python-version 3.12` only selects typeshed semantics, so the one step runs unchanged on every interpreter.
-- The `windows` CI job is the only leg that type-checks `sys.platform == "win32"` branches and runs the Windows-only tests, so Windows code is covered there or nowhere. `tests/AGENTS.md` has what it runs and what it skips.
+- The `windows` CI job is the only leg that type-checks `sys.platform == "win32"` branches and runs the Windows-only tests, so Windows code is covered there or nowhere. Its sibling `windows-tshark` runs the tshark integration suite there. `tests/AGENTS.md` has what each runs.
 
 ## Workflow
 

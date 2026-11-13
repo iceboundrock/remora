@@ -457,8 +457,17 @@ def find_tshark(explicit: str | None = None) -> str:
 
 
 def _run_tshark(tshark: str, *args: str) -> str:
-    """Run one tshark subcommand and return its stdout; CalledProcessError on failure."""
-    return subprocess.run([tshark, *args], check=True, capture_output=True, text=True).stdout
+    """Run one tshark subcommand and return its stdout; CalledProcessError on failure.
+
+    Decoded as UTF-8, not the locale codec: tshark writes UTF-8 on every
+    platform, and on Windows the locale codec is an ANSI code page such as cp1252, which
+    would turn a non-ASCII field description into mojibake, and so a
+    different ``dump-sha256``, or fail outright on a byte it leaves undefined.
+    Strict, so a dump that is not UTF-8 is refused rather than hashed.
+    """
+    return subprocess.run(
+        [tshark, *args], check=True, capture_output=True, text=True, encoding="utf-8"
+    ).stdout
 
 
 def _tshark_version_output(tshark: str) -> str:

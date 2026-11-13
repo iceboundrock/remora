@@ -114,6 +114,11 @@ def probe_tshark_version(tshark: str) -> str | None:
             check=True,
             capture_output=True,
             text=True,
+            # UTF-8 as TsharkProcess decodes, not the locale codec (a code
+            # page on Windows); ``replace`` because a UnicodeDecodeError is
+            # neither exception below, and this probe must never raise.
+            encoding="utf-8",
+            errors="replace",
             timeout=_VERSION_PROBE_TIMEOUT,
         ).stdout
     except (OSError, subprocess.SubprocessError):
