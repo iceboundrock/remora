@@ -59,6 +59,32 @@ and 4.6.9:
   Ordered comparisons and ranges on ``FT_EUI64`` agree on both versions with
   ``bytes`` order and are pushed down.
 
+Object identifiers (issue #149)
+-------------------------------
+Every value test on ``FT_OID`` (``==``, ``!=``, ordered comparisons,
+membership, ``contains``, ``matches``) is refused with
+:class:`UnsupportedExprError`; only presence is pushed down. ``FT_OID`` is
+``str`` (:mod:`remora.values`), so the generic string rendering would quote
+the literal, and tshark rejects a quoted OID: ``ASN.1 object identifier cannot
+be converted from a string`` on 4.2.2, 4.4.19 and 4.6.9 alike. Before this
+refusal, any value filter on an OID field failed the whole capture. ``matches``
+is rejected on every build, and ``contains`` accepts neither a string nor a
+byte needle. The bare dotted form (``snmp.name == 1.3.6.1.2.1.1.2.0``) is
+accepted, but not pushed either, for three reasons:
+
+- tshark compares the BER-encoded bytes, while the Python and SQL backends
+  compare the text tshark prints. The two agree only for well-formed
+  encodings. A truncated arc (``2b 06 81``) prints ``1.3.6`` but is not
+  ``== 1.3.6`` on ``-Y``, and it sorts above ``1.3.6.1.2.1.1.9`` there.
+- The orders differ even for well-formed values: tshark's is arc by arc
+  (``1.3.6.1.2.1.1.9 < 1.3.6.1.2.1.1.10``) and a string's is not.
+- Two-arc literals lex differently by version: ``snmp.name == 1.3`` is an OID
+  on 4.2.2 and a rejected ``Double`` on 4.4.19 and 4.6.9.
+
+So these filters run as Python predicates over the printed text, which is the
+same text the workspace stores and SQL compares. The measurements are in
+``docs/semantics.md``.
+
 Time literals (M1 design decision)
 ----------------------------------
 ``datetime``/``timedelta`` comparisons raise :class:`UnsupportedExprError`:
@@ -106,7 +132,7 @@ Error policy
 :class:`UnsupportedExprError` means "this backend legitimately cannot render
 the expression; the planner should fall back to the Python predicate backend"
 (time literals, float NaN literals, empty bytes, ordered GUID comparisons,
-``contains`` on an EUI-64, unknown future Expr nodes).
+``contains`` on an EUI-64, value tests on an OID, unknown future Expr nodes).
 User errors — malformed literals such as ``IP.src == "not-an-ip"`` — surface as
 the ``ValueError``/``TypeError`` that :func:`remora.values.coerce_literal`
 raises and are deliberately *not* converted into :class:`UnsupportedExprError`.
@@ -157,17 +183,23 @@ def compile_dfilter(expr: Expr) -> str:
         coerced = values.coerce_literal(expr.field.ftype, expr.value)
         if expr.op is not CompareOp.EQ:
             _refuse_unstable_order(expr.field.ftype)
-        return f"{expr.field.name} {expr.op.value} {_render_literal(coerced)}"
+        rendered = _render_literal(coerced)
+        _refuse_value_test(expr.field.ftype)
+        return f"{expr.field.name} {expr.op.value} {rendered}"
     if isinstance(expr, Presence):
         return expr.field.name
     if isinstance(expr, Membership):
         rendered = ", ".join(_render_set_item(expr.field.ftype, item) for item in expr.values)
+        _refuse_value_test(expr.field.ftype)
         return f"{expr.field.name} in {{{rendered}}}"
     if isinstance(expr, Contains):
-        return f"{expr.field.name} contains {_render_needle(expr.field.ftype, expr.needle)}"
+        needle = _render_needle(expr.field.ftype, expr.needle)
+        _refuse_value_test(expr.field.ftype)
+        return f"{expr.field.name} contains {needle}"
     if isinstance(expr, Matches):
         if values.get_info(expr.field.ftype).py_type is not str:
             raise TypeError(f"matches is only supported on string fields, not {expr.field.ftype}")
+        _refuse_value_test(expr.field.ftype)
         return f"{expr.field.name} matches {_render_str(expr.pattern)}"
     if isinstance(expr, Not):
         return f"!({compile_dfilter(expr.operand)})"
@@ -195,6 +227,25 @@ _UNSTABLE_ORDER_FTYPES = frozenset({"FT_GUID"})
 
 #: FTypes on which some supported tshark rejects ``contains`` outright.
 _NO_CONTAINS_FTYPES = frozenset({"FT_EUI64"})
+
+#: FTypes whose ``py_type`` is not what tshark compares, so no value test is
+#: pushed down, only presence (module docstring, "Object identifiers").
+_NO_VALUE_TEST_FTYPES = frozenset({"FT_OID"})
+
+
+def _refuse_value_test(ftype: str) -> None:
+    """Refuse a value test on an ftype whose dfilter semantics Remora does not share.
+
+    Called after the literal has been coerced and rendered, so a malformed
+    literal or an inverted range is still the user error it is on every
+    backend.
+    """
+    if ftype in _NO_VALUE_TEST_FTYPES:
+        raise UnsupportedExprError(
+            f"value tests on {ftype} are not pushed down to display filters: tshark "
+            "rejects a quoted OID and compares the encoded bytes rather than the "
+            "printed text, so the planner evaluates them as Python predicates"
+        )
 
 
 def _refuse_unstable_order(ftype: str) -> None:
