@@ -16,7 +16,7 @@ import pytest
 
 import remora.workspace.workspace as workspace_module
 from remora.workspace.errors import SchemaVersionError, WorkspaceError, WorkspaceModeError
-from remora.workspace.permissions import copy_permissions
+from remora.workspace.permissions import copy_permissions, copy_permissions_to_descriptor
 from remora.workspace.schema import SCHEMA_VERSION
 from remora.workspace.swap import remove_file, replace_file
 from remora.workspace.workspace import Workspace
@@ -432,7 +432,9 @@ ws.compact()
 
 # Compacts in a child process whose permission carry-over fails, so the
 # compact fails with its temp created, and parks at the first removal of its
-# cleanup, so the parent can probe the lock at that moment.
+# cleanup, so the parent can probe the lock at that moment. Both carry-overs
+# fail: by name onto the POSIX temp after ATTACH, and through the creating
+# descriptor onto the Windows temp before it (R9-F1).
 _FAIL_AND_BLOCK_IN_CLEANUP = """
 import sys
 
@@ -441,7 +443,7 @@ import remora.workspace.workspace as workspace_module
 real_remove = workspace_module._remove_temp
 state = {"failed": False, "parked": False}
 
-def fail(src, dst):
+def fail(src, dst, **kwargs):
     state["failed"] = True
     raise OSError("simulated failure to carry permissions")
 
@@ -453,6 +455,7 @@ def remove(staging, claim):
     real_remove(staging, claim)
 
 workspace_module.copy_permissions = fail
+workspace_module.copy_permissions_to_descriptor = fail
 workspace_module._remove_temp = remove
 
 from remora.workspace import Workspace
@@ -493,8 +496,11 @@ print("DONE", flush=True)
 
 
 # Holds the workspace argv[1] open read-write and parks the compact of the
-# workspace argv[2] just before its first row is copied, so the parent can
-# compact a workspace whose name both of theirs extend.
+# workspace argv[2] once its temp exists and has the workspace's
+# restrictions, before any row is copied, so the parent can compact a
+# workspace whose name both of theirs extend. It parks in whichever
+# carry-over the layout runs: by name onto the POSIX temp after ATTACH, or
+# through the descriptor creating the Windows temp before it (R9-F1).
 _HOLD_AND_PARK_COMPACT = """
 import sys
 
@@ -502,14 +508,17 @@ import duckdb
 
 import remora.workspace.workspace as workspace_module
 
-real_copy = workspace_module.copy_permissions
+def parking(real):
+    def park(*args, **kwargs):
+        real(*args, **kwargs)
+        print("PARKED", flush=True)
+        sys.stdin.readline()
+    return park
 
-def park(src, dst):
-    real_copy(src, dst)
-    print("PARKED", flush=True)
-    sys.stdin.readline()
-
-workspace_module.copy_permissions = park
+workspace_module.copy_permissions = parking(workspace_module.copy_permissions)
+workspace_module.copy_permissions_to_descriptor = parking(
+    workspace_module.copy_permissions_to_descriptor
+)
 
 from remora.workspace import Workspace
 
@@ -710,11 +719,14 @@ class TestCompact:
         assert _snapshot(tmp_path, but=path.name) == before
 
     def test_staging_name_taken_by_anything_is_skipped_not_reused(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, layout: bool
     ) -> None:
         # The staging name is fresh: when the drawn name is taken, here by
         # someone else's directory, another is drawn and the entry is left
-        # alone.
+        # alone. The temp that gets the workspace's restrictions is the one
+        # of the second name, by name inside the POSIX staging directory and
+        # through its creating descriptor beside it in the Windows layout
+        # (R9-F1).
         path = tmp_path / "ws.duckdb"
         with Workspace(path, mode="rw") as ws:
             pass
@@ -724,20 +736,27 @@ class TestCompact:
         tokens = iter(["5" * 16, "6" * 16])
         monkeypatch.setattr("secrets.token_hex", lambda n: next(tokens))
         before = _snapshot(tmp_path, but=path.name)
-        used: list[Path] = []
+        used: list[tuple[str, Path]] = []
         real_copy = copy_permissions
+        real_copy_to_descriptor = copy_permissions_to_descriptor
 
         def note(src: Path, dst: Path) -> None:
-            used.append(dst)
+            used.append(("name", dst))
             real_copy(src, dst)
 
+        def note_descriptor(src: Path, fd: int, *, name: Path | None = None) -> None:
+            assert name is not None
+            used.append(("descriptor", name))
+            real_copy_to_descriptor(src, fd, name=name)
+
         monkeypatch.setattr(workspace_module, "copy_permissions", note)
+        monkeypatch.setattr(workspace_module, "copy_permissions_to_descriptor", note_descriptor)
         with Workspace(path, mode="rw") as ws:
             ws.compact()
-        assert [p.name for p in used] == [
-            "remora-compact-" + "6" * 16 + ".tmp"
-            if workspace_module._TEMP_BESIDE_STAGING
-            else "compact.duckdb"
+        assert [(how, p.parent, p.name) for how, p in used] == [
+            ("descriptor", tmp_path, "remora-compact-" + "6" * 16 + ".tmp")
+            if layout
+            else ("name", tmp_path / ("remora-compact-" + "6" * 16), "compact.duckdb")
         ]
         assert _snapshot(tmp_path, but=path.name) == before
 
@@ -1308,7 +1327,9 @@ class TestCompact:
         assert len(seen) == 1
         assert sorted(p.name for p in tmp_path.iterdir()) == [path.name]
 
-    def test_compact_leaves_other_workspaces_at_colliding_names_alone(self, tmp_path: Path) -> None:
+    def test_compact_leaves_other_workspaces_at_colliding_names_alone(
+        self, tmp_path: Path, layout: bool
+    ) -> None:
         # Workspaces named like an older remora's temp, like the marker, and
         # like a staging directory, one of them open and one mid-compact in
         # another process, are neither removed nor disturbed.
@@ -1324,8 +1345,9 @@ class TestCompact:
                     "INSERT INTO pkts (frame_number, frame_time) "
                     f"VALUES ({i}, TIMESTAMP '2024-01-01 00:00:00')"
                 )
+        script = _beside(_HOLD_AND_PARK_COMPACT) if layout else _HOLD_AND_PARK_COMPACT
         proc = subprocess.Popen(
-            [sys.executable, "-c", _HOLD_AND_PARK_COMPACT, str(others[0]), str(others[2])],
+            [sys.executable, "-c", script, str(others[0]), str(others[2])],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             text=True,
@@ -1335,7 +1357,8 @@ class TestCompact:
             assert proc.stdout is not None
             assert proc.stdin is not None
             # others[0] is open read-write in the child, and others[2]'s
-            # compact is parked with its temp in its own staging directory.
+            # compact is parked with its temp in its own staging directory,
+            # or beside it in the Windows layout.
             assert proc.stdout.readline().strip() == "PARKED"
             (their_staging,) = _stagings(others[2])
             assert _compact_temp(others[2]).exists()
@@ -1989,7 +2012,9 @@ class TestCompact:
         finally:
             rw.close()
 
-    def test_failed_compact_cleans_up_before_releasing_the_lock(self, tmp_path: Path) -> None:
+    def test_failed_compact_cleans_up_before_releasing_the_lock(
+        self, tmp_path: Path, layout: bool
+    ) -> None:
         # A failed compact removes its own temp and staging directory while
         # it still holds the source's exclusive lock (R1-F1), and another
         # process's compact, locked out meanwhile, touches none of it.
@@ -2000,8 +2025,9 @@ class TestCompact:
                     "INSERT INTO pkts (frame_number, frame_time) "
                     "VALUES (7, TIMESTAMP '2024-01-01 00:00:00')"
                 )
+            script = _beside(_FAIL_AND_BLOCK_IN_CLEANUP) if layout else _FAIL_AND_BLOCK_IN_CLEANUP
             proc = subprocess.Popen(
-                [sys.executable, "-c", _FAIL_AND_BLOCK_IN_CLEANUP, str(path)],
+                [sys.executable, "-c", script, str(path)],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 text=True,
