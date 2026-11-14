@@ -100,14 +100,25 @@ Mode = Literal["ro", "rw"]
 
 _MODES: tuple[Mode, ...] = ("ro", "rw")
 
-# compact()'s staging: one directory per compact, created beside the
-# workspace file as ``<name>.compacting-<16 hex digits>`` and marked as that
-# workspace's by a marker file inside (see _make_staging). On POSIX it holds
-# the temp database and its .wal; on Windows the temp is the sibling file
-# ``<staging name>.tmp`` (see _staging_temp).
-_STAGING_INFIX: Final = ".compacting-"
+# compact()'s staging: one directory per compact, created beside the workspace
+# file as ``remora-compact-<16 hex digits>`` and marked as that workspace's by
+# a marker file inside (see _make_staging). The name does not embed the
+# workspace's, so its length is fixed whatever the workspace is called; the
+# marker alone says whose it is. On POSIX it holds the temp database and its
+# .wal; on Windows the temp is the sibling file ``<staging name>.tmp`` (see
+# _staging_temp), whose identity a claim file inside records.
+_STAGING_PREFIX: Final = "remora-compact-"
 _STAGING_TOKEN: Final = re.compile(r"[0-9a-f]{16}")
 _STAGING_MARKER: Final = "remora-compact"
+# The temp inside a POSIX staging directory. A fixed name, never the
+# workspace's, so no workspace name can collide with the marker.
+_STAGING_DB: Final = "compact.duckdb"
+_STAGING_CLAIM: Final = "temp-claim"
+
+# Whether the temp is the staging directory's sibling rather than inside it,
+# as on Windows (see _staging_temp). Read at call time, so a test can run the
+# Windows layout on any platform.
+_TEMP_BESIDE_STAGING: bool = sys.platform == "win32"
 
 # ``(st_dev, st_ino)`` normally; the resolved pathname only as a fallback for
 # a file that cannot be stat'ed (see :func:`_file_key`).
@@ -233,17 +244,49 @@ def _staging_marker(name: str) -> bytes:
     return b"remora compact staging v1\n" + os.fsencode(name) + b"\n"
 
 
-def _staging_temp(staging: Path, name: str) -> Path:
-    """The temp database of the compact that owns ``staging``, for workspace ``name``.
+def _wal(path: Path) -> Path:
+    """DuckDB's write-ahead log for the database at ``path``."""
+    return path.with_name(path.name + ".wal")
+
+
+def _staging_temp(staging: Path) -> Path:
+    """The temp database of the compact that owns ``staging``.
 
     On POSIX the temp is inside the private staging directory. On Windows it
     is beside the workspace, where DuckDB's share mode protects it and it
     inherits the workspace directory's ACL rather than the staging
     directory's (#147); the staging directory only reserves its name.
     """
-    if sys.platform == "win32":
+    if _TEMP_BESIDE_STAGING:
         return staging.with_name(staging.name + ".tmp")
-    return staging / name
+    return staging / _STAGING_DB
+
+
+def _temp_claim(st: os.stat_result) -> bytes:
+    """What the claim file holds for a sibling temp whose ``lstat`` is ``st``."""
+    return b"remora compact temp v1\n%d %d\n" % (st.st_dev, st.st_ino)
+
+
+def _write_exclusive(path: Path, data: bytes) -> None:
+    """Create ``path``, which must not exist, owner-only, holding ``data``."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+
+
+def _claim_temp(staging: Path) -> None:
+    """Record in ``staging`` the identity of the sibling temp this compact created.
+
+    Called only once DuckDB has created the temp at a name found free, so the
+    file the claim names is provably this compact's. A sibling is outside the
+    staging directory, so its name alone proves nothing: a compact killed
+    before this point leaves no claim, and after the swap whatever appears at
+    the name is another file. :func:`_stale_temp_files` removes the sibling
+    only while it is still the very file claimed here. On NTFS a file ID
+    carries a sequence number, so a file created after the temp is gone does
+    not take over its identity.
+    """
+    _write_exclusive(staging / _STAGING_CLAIM, _temp_claim(os.lstat(_staging_temp(staging))))
 
 
 def _make_staging(target: Path) -> Path:
@@ -258,23 +301,17 @@ def _make_staging(target: Path) -> Path:
     :func:`_own_stale_stagings`).
     """
     while True:
-        staging = target.with_name(target.name + _STAGING_INFIX + secrets.token_hex(8))
+        staging = target.with_name(_STAGING_PREFIX + secrets.token_hex(8))
         try:
             os.mkdir(staging, 0o700)
         except FileExistsError:
             continue
         break
     try:
-        fd = os.open(
-            staging / _STAGING_MARKER,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
-            0o600,
-        )
-        with os.fdopen(fd, "wb") as marker:
-            marker.write(_staging_marker(target.name))
+        _write_exclusive(staging / _STAGING_MARKER, _staging_marker(target.name))
     except BaseException:
         with suppress(OSError):
-            _remove_staging(staging, target.name, temp=False)
+            _remove_staging(staging, ())
         raise
     return staging
 
@@ -284,9 +321,9 @@ def _is_own_stale_staging(staging: Path, name: str) -> bool:
 
     Every condition must hold: a real directory (not a symlink or junction),
     owned by this user on POSIX, holding the marker naming ``name`` and
-    nothing but the regular files a compact of ``name`` creates there; on
-    Windows the sibling temp and its ``.wal``, if present, are regular files
-    too. Anything else may belong to someone else and is left alone.
+    nothing but the regular files a compact creates there. Anything else may
+    belong to someone else and is left alone. On Windows this says nothing
+    about the sibling temp, which :func:`_stale_temp_files` judges.
     """
     try:
         st = os.lstat(staging)
@@ -297,18 +334,15 @@ def _is_own_stale_staging(staging: Path, name: str) -> bool:
         if hasattr(os, "geteuid") and st.st_uid != os.geteuid():
             return False
         allowed = {_STAGING_MARKER}
-        if sys.platform != "win32":
-            allowed |= {name, name + ".wal"}
+        if _TEMP_BESIDE_STAGING:
+            allowed.add(_STAGING_CLAIM)
+        else:
+            allowed |= {_STAGING_DB, _STAGING_DB + ".wal"}
         entries = os.listdir(staging)
         if _STAGING_MARKER not in entries or not set(entries) <= allowed:
             return False
         if not all(stat.S_ISREG(os.lstat(staging / entry).st_mode) for entry in entries):
             return False
-        if sys.platform == "win32":
-            tmp = _staging_temp(staging, name)
-            for sibling in (tmp, tmp.with_name(tmp.name + ".wal")):
-                if os.path.lexists(sibling) and not stat.S_ISREG(os.lstat(sibling).st_mode):
-                    return False
         expected = _staging_marker(name)
         with open(staging / _STAGING_MARKER, "rb") as marker:
             return marker.read(len(expected) + 1) == expected
@@ -322,11 +356,11 @@ def _own_stale_stagings(target: Path) -> list[Path]:
     Only called with ``target``'s exclusive lock held, so no compact of it is
     in flight: a staging directory of ``target`` is either debris or that of a
     compact that has already swapped and is about to remove it. Candidates
-    are the exact ``<name>.compacting-<16 hex digits>`` names, and each must
-    pass :func:`_is_own_stale_staging`. A directory that cannot be listed
-    yields none.
+    are the exact ``remora-compact-<16 hex digits>`` names, and each must
+    pass :func:`_is_own_stale_staging` for ``target``'s name, so the staging
+    of another workspace in the same directory is never a candidate. A
+    directory that cannot be listed yields none.
     """
-    prefix = target.name + _STAGING_INFIX
     try:
         names = os.listdir(target.parent)
     except OSError:
@@ -334,24 +368,58 @@ def _own_stale_stagings(target: Path) -> list[Path]:
     return [
         target.with_name(entry)
         for entry in sorted(names)
-        if entry.startswith(prefix)
-        and _STAGING_TOKEN.fullmatch(entry[len(prefix) :])
+        if entry.startswith(_STAGING_PREFIX)
+        and _STAGING_TOKEN.fullmatch(entry[len(_STAGING_PREFIX) :])
         and _is_own_stale_staging(target.with_name(entry), target.name)
     ]
 
 
-def _remove_staging(staging: Path, name: str, *, temp: bool) -> None:
-    """Remove a staging directory this compact owns, and with ``temp`` its temp.
+def _stale_temp_files(staging: Path) -> tuple[Path, ...]:
+    """The temp files of the stale ``staging`` that provably are its compact's.
 
-    The marker goes last before the directory, so a removal that fails part
-    way leaves debris a later compact still recognizes. Only the entries a
-    compact creates are removed, never a tree, so whatever else has appeared
-    in the directory makes the final ``rmdir`` fail rather than be deleted.
+    Inside a POSIX staging directory that :func:`_is_own_stale_staging`
+    accepted, they are whatever of the temp and its ``.wal`` is there: only
+    the owner can put anything in it. The Windows sibling temp is outside,
+    so it counts only while it is a regular file whose identity is the one
+    :func:`_claim_temp` recorded, and its ``.wal`` only beside that file,
+    whose ``.wal`` DuckDB would open as its own. Without the claim (a compact
+    killed before it was written), or once the claimed file is gone (renamed
+    over the workspace by the swap), whatever is at those names is left
+    alone. The ``.wal`` comes first, so a removal that stops part way leaves
+    the claimed temp, and with it the ``.wal``'s ownership, in place.
     """
-    if temp:
-        tmp = _staging_temp(staging, name)
-        tmp.unlink(missing_ok=True)
-        tmp.with_name(tmp.name + ".wal").unlink(missing_ok=True)
+    tmp = _staging_temp(staging)
+    if not _TEMP_BESIDE_STAGING:
+        return (_wal(tmp), tmp)
+    try:
+        with open(staging / _STAGING_CLAIM, "rb") as claim_file:
+            claim = claim_file.read(4096)
+        st = os.lstat(tmp)
+    except OSError:
+        return ()
+    if not stat.S_ISREG(st.st_mode) or claim != _temp_claim(st):
+        return ()
+    try:
+        wal_st = os.lstat(_wal(tmp))
+    except OSError:
+        return (tmp,)
+    return (_wal(tmp), tmp) if stat.S_ISREG(wal_st.st_mode) else (tmp,)
+
+
+def _remove_staging(staging: Path, temp: Sequence[Path]) -> None:
+    """Remove a staging directory this compact owns, and the ``temp`` files it owns.
+
+    ``temp`` is what the caller knows to be the compact's: the temp and its
+    ``.wal`` that this compact created, or :func:`_stale_temp_files` for
+    debris. They go first, in order, then the claim, and the marker last
+    before the directory, so a removal that fails part way leaves debris a
+    later compact still recognizes. Only the entries a compact creates are
+    removed, never a tree, so whatever else has appeared in the directory
+    makes the final ``rmdir`` fail rather than be deleted.
+    """
+    for path in temp:
+        path.unlink(missing_ok=True)
+    (staging / _STAGING_CLAIM).unlink(missing_ok=True)
     (staging / _STAGING_MARKER).unlink(missing_ok=True)
     staging.rmdir()
 
@@ -1281,15 +1349,18 @@ class Workspace:
         large after scattered deletes; this copies every schema, table and
         row into a temp database and atomically swaps it in by renaming the
         temp over the open original. Each compact creates its own staging
-        directory beside the original, ``<name>.compacting-<16 hex digits>``,
+        directory beside the original, ``remora-compact-<16 hex digits>``,
         under a name nothing else holds, with a marker file naming the
-        workspace. On POSIX the temp is written inside it as ``<name>``, and
-        only the owner can enter it; on Windows the directory only reserves
-        the name, and the temp is the sibling file
-        ``<name>.compacting-<16 hex digits>.tmp``. Either way the temp is
-        renamed over the original from the same directory or one inside it,
-        so the final rename never crosses a filesystem, and the staging
-        directory is removed after the swap.
+        workspace. The name is the same length whatever the workspace is
+        called, so a workspace whose name is near the filesystem's limit
+        compacts too. On POSIX the temp is written inside it as
+        ``compact.duckdb``, and only the owner can enter it; on Windows the
+        directory only reserves the name, and the temp is the sibling file
+        ``remora-compact-<16 hex digits>.tmp``, whose identity a claim file
+        in the directory records once DuckDB has created it. Either way the
+        temp is renamed over the original from the same directory or one
+        inside it, so the final rename never crosses a filesystem, and the
+        staging directory is removed after the swap.
         The original is only ever replaced whole: an interruption at any
         point leaves it intact, and at worst a stale staging directory (with
         the temp and the ``.wal`` sidecar a hard kill mid-copy can leave)
@@ -1297,9 +1368,13 @@ class Workspace:
         staging directory only when it can prove the directory is this
         workspace's: a real directory owned by this user on POSIX, holding
         the marker naming this workspace and only the files a compact puts
-        there. Anything else beside the workspace is never removed, whatever
-        its name, including the ``<name>.compacting`` file a remora from
-        before #147 used as its temp: delete such debris by hand.
+        there. On Windows it removes the sibling temp only while that is
+        still the file the claim names, and the temp's ``.wal`` only beside
+        it; a compact killed before writing the claim leaves its temp for
+        removal by hand, and whatever appears at the name after the swap is
+        left alone. Anything else beside the workspace is never removed,
+        whatever its name, including the ``<name>.compacting`` file a remora
+        from before #147 used as its temp: delete such debris by hand.
 
         A workspace addressed through a symlink is compacted at its
         *resolved* target: the temp lives beside the real file and the swap
@@ -1430,10 +1505,10 @@ class Workspace:
                 workspace is unchanged in each case.
             OSError: An unclassified failure from the swap, unchanged. This
                 includes :class:`PermissionError` for Windows access denied
-                (error 5), which may mean missing delete permission. On
-                POSIX, also a failure to create the staging directory, such
-                as a workspace directory this process cannot write; the
-                workspace is unchanged.
+                (error 5), which may mean missing delete permission. Also a
+                failure to create the staging directory or one of the files
+                compact keeps in it, such as a workspace directory this
+                process cannot write; the workspace is unchanged.
         """
         self._require_open()
         if self._mode == "ro":
@@ -1491,7 +1566,6 @@ class Workspace:
         # identity the live file is about to have (see below).
         claimed_new_key: _FileKey | None = None
         try:
-            name = target.name
             # This compact's own staging directory, with a fresh name and a
             # marker naming the workspace, so nothing it removes can belong
             # to anyone else; see _make_staging.
@@ -1508,7 +1582,7 @@ class Workspace:
                     # is left alone.
                     for stale in _own_stale_stagings(target):
                         try:
-                            _remove_staging(stale, name, temp=True)
+                            _remove_staging(stale, _stale_temp_files(stale))
                         except OSError as exc:
                             raise WorkspaceError(
                                 f"compact() could not remove {stale}, left by an earlier "
@@ -1523,8 +1597,8 @@ class Workspace:
                     # inherits the directory's ACL rather than a staging
                     # directory's.
                     staging = _make_staging(target)
-                    tmp = _staging_temp(staging, name)
-                    tmp_wal = tmp.with_name(tmp.name + ".wal")
+                    tmp = _staging_temp(staging)
+                    tmp_wal = _wal(tmp)
                     if os.path.lexists(tmp) or os.path.lexists(tmp_wal):
                         # Only possible on Windows, where the temp is outside
                         # the fresh directory. ATTACH would open what is there.
@@ -1538,6 +1612,12 @@ class Workspace:
                     assert row is not None
                     con.execute(f"ATTACH '{_quote_path(str(tmp))}' AS compact_dst")
                     attached = True
+                    if _TEMP_BESIDE_STAGING:
+                        # Only now, with the temp created at a name found
+                        # free, is the sibling provably this compact's: a
+                        # later compact removes it only while it is still
+                        # this very file (see _stale_temp_files).
+                        _claim_temp(staging)
                     # DuckDB has just created the temp with this process's
                     # defaults (the umask; on Windows the directory's
                     # inherited ACL), which may be wider than the workspace
@@ -1595,7 +1675,9 @@ class Workspace:
                             con.execute("DETACH compact_dst")
                     if staging is not None:
                         with suppress(OSError):
-                            _remove_staging(staging, name, temp=tmp_ours and not swapped)
+                            _remove_staging(
+                                staging, (tmp_wal, tmp) if tmp_ours and not swapped else ()
+                            )
                     raise
                 # The temp is the workspace now. What is left is the staging
                 # directory this compact created, holding only its marker; its
@@ -1604,7 +1686,7 @@ class Workspace:
                 # process may already have started on the new file. That one
                 # may also find and remove it first, hence best effort.
                 with suppress(OSError):
-                    _remove_staging(staging, name, temp=False)
+                    _remove_staging(staging, ())
             finally:
                 con.close()
         finally:

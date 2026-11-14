@@ -15,6 +15,7 @@ private inside a folder every user may read.
 
 from __future__ import annotations
 
+import contextlib
 import csv
 import os
 import re
@@ -251,32 +252,42 @@ def _probe_compact(
 
 
 def _stagings(path: Path) -> list[Path]:
-    """compact()'s staging directories beside the workspace at ``path`` (#147)."""
-    prefix = path.name + ".compacting-"
-    return sorted(
-        p
-        for p in path.parent.iterdir()
-        if p.name.startswith(prefix) and p.is_dir() and not p.is_symlink()
-    )
+    """compact()'s staging directories beside the workspace at ``path`` (#147).
+
+    Their names do not embed the workspace's, so the marker inside says whose
+    they are.
+    """
+    expected = workspace_module._staging_marker(path.name)
+    found = []
+    for p in path.parent.iterdir():
+        if not p.name.startswith("remora-compact-") or p.is_symlink() or not p.is_dir():
+            continue
+        with contextlib.suppress(OSError):
+            if (p / "remora-compact").read_bytes() == expected:
+                found.append(p)
+    return sorted(found)
 
 
 def _compact_temp(path: Path) -> Path:
     """The temp database of the one compact in flight on the workspace at ``path``.
 
-    On POSIX ``<name>`` inside its private staging directory, on Windows the
-    staging directory's sibling ``<staging name>.tmp``.
+    On POSIX ``compact.duckdb`` inside its private staging directory, on
+    Windows the staging directory's sibling ``<staging name>.tmp``.
     """
     (staging,) = _stagings(path)
-    return workspace_module._staging_temp(staging, path.name)
+    return workspace_module._staging_temp(staging)
 
 
 def _stale_staging(path: Path) -> Path:
     """Leave what a compact of ``path`` killed mid-copy leaves: its marked
-    staging directory, the temp and the temp's ``.wal``."""
+    staging directory, the temp and the temp's ``.wal``, and on Windows the
+    claim recording the temp."""
     staging = workspace_module._make_staging(path)
-    tmp = workspace_module._staging_temp(staging, path.name)
+    tmp = workspace_module._staging_temp(staging)
     tmp.write_bytes(b"garbage from an interrupted compact")
     tmp.with_name(tmp.name + ".wal").write_bytes(b"garbage wal")
+    if workspace_module._TEMP_BESIDE_STAGING:
+        workspace_module._claim_temp(staging)
     return staging
 
 
@@ -465,7 +476,7 @@ class TestCompactStaging:
             # COPY wrote rows into the temp's .wal, created with the umask's
             # 0o644; only the directory keeps other users from it.
             seen["detach"] = staged()
-            tmp_wal = _compact_temp(path).with_name("ws.duckdb.wal")
+            tmp_wal = _compact_temp(path).with_name("compact.duckdb.wal")
             seen["wal_mode"] = _mode(tmp_wal)
             seen["wal_size"] = tmp_wal.stat().st_size
 
@@ -491,23 +502,23 @@ class TestCompactStaging:
         # One staging directory, this compact's, throughout.
         assert len(set(scratch)) == 1
         name = scratch[0].name
-        assert re.fullmatch(r"ws\.duckdb\.compacting-[0-9a-f]{16}", name)
+        assert re.fullmatch(r"remora-compact-[0-9a-f]{16}", name)
         private = {
             "beside": sorted(["ws.duckdb", name]),
             "scratch_mode": 0o700,
             "scratch_owner": os.stat(path).st_uid,  # this process's user
         }
-        assert seen["copy"] == {**private, "inside": ["remora-compact", "ws.duckdb"]}
+        assert seen["copy"] == {**private, "inside": ["compact.duckdb", "remora-compact"]}
         assert seen["detach"] == {
             **private,
-            "inside": ["remora-compact", "ws.duckdb", "ws.duckdb.wal"],
+            "inside": ["compact.duckdb", "compact.duckdb.wal", "remora-compact"],
         }
         assert seen["tmp_mode"] == 0o600
         assert seen["wal_mode"] == 0o644
         assert isinstance(seen["wal_size"], int)
         assert seen["wal_size"] > 0
-        assert seen["swap"] == {**private, "inside": ["remora-compact", "ws.duckdb"]}
-        assert seen["swap_src"] == (name, "ws.duckdb")
+        assert seen["swap"] == {**private, "inside": ["compact.duckdb", "remora-compact"]}
+        assert seen["swap_src"] == (name, "compact.duckdb")
         assert seen["swap_mode"] == 0o600
         # The compacted file keeps the workspace's mode, and nothing of the
         # compact is left beside it.
@@ -553,7 +564,7 @@ class TestCompactStaging:
                     if not removable:
                         with pytest.raises(WorkspaceError, match="remove it and retry"):
                             ws.compact()
-                        assert (scratch / "ws.duckdb").exists()
+                        assert (scratch / "compact.duckdb").exists()
                         os.chmod(scratch, 0o700)
                 ws.compact()
                 with ws.read() as con:
@@ -574,9 +585,7 @@ class TestCompactStaging:
         elsewhere = tmp_path / "elsewhere"
         elsewhere.mkdir()
         lookalike = _stale_staging(elsewhere / "ws.duckdb")
-        (tmp_path / ("ws.duckdb.compacting-" + "0" * 16)).symlink_to(
-            lookalike, target_is_directory=True
-        )
+        (tmp_path / ("remora-compact-" + "0" * 16)).symlink_to(lookalike, target_is_directory=True)
         (tmp_path / "ws.duckdb.compacting").symlink_to(elsewhere, target_is_directory=True)
         before = _snapshot(tmp_path)
         with Workspace(path, mode="rw") as ws:
@@ -584,7 +593,7 @@ class TestCompactStaging:
         assert _snapshot(tmp_path, but="ws.duckdb") == {
             k: v for k, v in before.items() if k != "ws.duckdb"
         }
-        assert before["ws.duckdb.compacting-" + "0" * 16][0] == "link"
+        assert before["remora-compact-" + "0" * 16][0] == "link"
 
     def test_refuses_to_swap_when_the_temp_wal_outlives_detach(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
