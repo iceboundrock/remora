@@ -201,7 +201,8 @@ def shared_dir(tmp_path: Path) -> Iterator[Path]:
 
     On Windows every user may read what is created in it. On POSIX the umask
     is pinned to ``022`` for the test, so a new file is ``0o644`` whatever the
-    developer's own umask is.
+    developer's own umask is, and the directory itself is set to ``0o755``,
+    since ``mkdir`` ran under that umask too.
     """
     shared = tmp_path / "shared"
     shared.mkdir()
@@ -209,6 +210,7 @@ def shared_dir(tmp_path: Path) -> Iterator[Path]:
         _icacls(shared, "/grant", f"*{_EVERYONE}:(OI)(RX)")
         yield shared
         return
+    os.chmod(shared, 0o755)
     previous = os.umask(0o022)
     try:
         yield shared
