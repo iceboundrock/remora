@@ -329,16 +329,19 @@ blocks the file keeps forever. `compact()` is what reclaims those: it rewrites
 every schema, table and row into a temp database beside the workspace and swaps
 it in atomically by renaming over the open original — `os.replace` on POSIX, a
 POSIX-semantics `FileRenameInfoEx` rename on Windows
-(`remora.workspace.swap.replace_file`). On POSIX the temp is
-`<name>.compacting/<name>`, inside a directory only its owner can enter; on
-Windows it is the file `<name>.compacting`.
+(`remora.workspace.swap.replace_file`). On POSIX the temp is written as
+`<name>.compacting/<name>`, inside a directory only its owner can enter; once it
+is final it moves out to `<name>.compacting.new` and the directory is removed,
+both before the swap, so compact removes nothing after the swap, when another
+process's compact may already be using those names. On Windows the temp is the
+file `<name>.compacting`.
 
 | Property | Behaviour |
 | --- | --- |
 | Mode | `rw` only; `WorkspaceModeError` in ro |
 | Concurrency | Needs **sole access**. Any other connection — including a read-only reader in another process, or an ro-mode `Workspace` on the same file in this one — makes it fail fast on the lock with **nothing modified** |
 | In-process | A `write()` or rw-mode `read()` in flight on *any* `Workspace` for this file raises `WorkspaceError`, and for compaction's duration writers and rw-mode readers fail fast the same way |
-| Interruption | The original is replaced whole, so a crash at any point leaves it intact, and at worst a stale `<name>.compacting` (with the temp's `.wal`) that the next compact removes once it holds the lock. One it cannot remove, such as another user's private directory, makes it raise `WorkspaceError` naming the path, with the workspace unchanged |
+| Interruption | The original is replaced whole, so a crash at any point leaves it intact, and at worst a stale `<name>.compacting` or `<name>.compacting.new` (with the temp's `.wal`) that the next compact removes once it holds the lock. A compact that fails removes its own artifacts before it releases the lock. One it cannot remove, such as another user's private directory, makes it raise `WorkspaceError` naming the path, with the workspace unchanged |
 | Symlinks | Compacts the *resolved* target, so a symlink survives as a symlink. A **hard link** cannot survive an atomic swap: the replaced name gets the new inode, the other name keeps the old one, and the two diverge |
 | Permissions | The compacted file keeps the workspace file's restrictions: the mode bits, and on Windows also the DACL and whether it inherits (#132). A `0o640` workspace stays `0o640`, and a Windows file made private inside a shared folder stays private. They are set as soon as DuckDB creates the temp, before any row is copied, and if they cannot be, `compact()` raises `WorkspaceError` and the workspace is unchanged. Ownership follows the fresh file. While the temp and its `.wal` hold rows, other users are kept from them on POSIX by the `0o700` staging directory, since a mode set after creation cannot revoke a descriptor opened before it and the `.wal` never gets the file's mode, and on Windows by DuckDB opening both without read or write sharing (#147). None of this covers the workspace's own `.wal`: see [File permissions](#file-permissions-the-directory-is-the-boundary) |
 | Platform | POSIX, and **Windows with duckdb ≥ 1.5.0** (which opens its database with `FILE_SHARE_DELETE`, so the file can be renamed over while compact's exclusive connection holds it) on Windows 10 1607 / Server 2016 or later, NTFS (ReFS unverified). A sharing violation (Windows error 32, such as an older duckdb or a handle without delete sharing) or a volume without POSIX rename semantics makes `compact()` raise `WorkspaceError` naming the requirement, with the workspace unchanged (#85). Access denied (Windows error 5) propagates as the original `PermissionError`: it may mean missing delete permission on the workspace file and its directory, not a sharing conflict. Paths longer than 260 characters are unverified on Windows |

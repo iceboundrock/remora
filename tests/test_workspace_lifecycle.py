@@ -33,6 +33,17 @@ def _compact_temp(path: Path) -> Path:
     return scratch if sys.platform == "win32" else scratch / path.name
 
 
+def _compact_ready(path: Path) -> Path:
+    """Where compact()'s finished temp waits for the swap.
+
+    On POSIX ``<name>.compacting.new``, moved out of the staging directory
+    and the directory removed while the source lock is held; on Windows the
+    temp itself.
+    """
+    scratch = path.with_name(path.name + ".compacting")
+    return scratch if sys.platform == "win32" else scratch.with_name(scratch.name + ".new")
+
+
 @contextlib.contextmanager
 def _held_without_delete_sharing(path: Path) -> Iterator[None]:
     """Hold ``path`` open on Windows the one way that refuses only a rename over it.
@@ -337,6 +348,68 @@ ws.compact()
 """
 
 
+# Compacts in a child process whose permission carry-over fails, so the
+# compact fails with its temp created, and parks at the first removal of its
+# cleanup, so the parent can probe the lock at that moment.
+_FAIL_AND_BLOCK_IN_CLEANUP = """
+import sys
+
+import remora.workspace.workspace as workspace_module
+
+real_remove = workspace_module._remove_entry
+state = {"failed": False, "parked": False}
+
+def fail(src, dst):
+    state["failed"] = True
+    raise OSError("simulated failure to carry permissions")
+
+def remove(path):
+    if state["failed"] and not state["parked"]:
+        state["parked"] = True
+        print("CLEANUP", flush=True)
+        sys.stdin.readline()
+    real_remove(path)
+
+workspace_module.copy_permissions = fail
+workspace_module._remove_entry = remove
+
+from remora.workspace import Workspace
+
+ws = Workspace(sys.argv[1], mode="rw")
+ws.open()
+try:
+    ws.compact()
+except Exception as exc:
+    print("RAISED", type(exc).__name__, flush=True)
+"""
+
+
+# Compacts in a child process and parks just after the swap has landed, the
+# source connection still open, so the parent can run a compact of its own
+# before this one finishes.
+_BLOCK_AFTER_SWAP = """
+import sys
+
+import remora.workspace.workspace as workspace_module
+
+real_replace = workspace_module.replace_file
+
+def hook(src, dst):
+    real_replace(src, dst)
+    print("SWAPPED", flush=True)
+    sys.stdin.readline()
+
+workspace_module.replace_file = hook
+
+from remora.workspace import Workspace
+
+ws = Workspace(sys.argv[1], mode="rw")
+ws.open()
+ws.compact()
+print("DONE", flush=True)
+"""
+
+
 # Runs one complete compact in a child process — swapping a new inode into
 # the path — and exits. Used to land a foreign swap inside the parent
 # compact's claim-to-connect window.
@@ -461,12 +534,17 @@ class TestCompact:
         path = tmp_path / "ws.duckdb"
         stale = tmp_path / "ws.duckdb.compacting"
         stale_wal = tmp_path / "ws.duckdb.compacting.wal"
+        stale_ready = tmp_path / "ws.duckdb.compacting.new"
         stale.write_bytes(b"garbage from an interrupted compact")
         stale_wal.write_bytes(b"garbage wal from an interrupted compact")
+        if sys.platform != "win32":
+            # A POSIX compact killed between leaving staging and the swap.
+            stale_ready.write_bytes(b"garbage from a compact killed at the swap")
         with Workspace(path, mode="rw") as ws:
             ws.compact()
         assert not stale.exists()
         assert not stale_wal.exists()
+        assert not stale_ready.exists()
         leftovers = [p.name for p in tmp_path.iterdir() if p.name != path.name]
         assert leftovers == []
 
@@ -1088,11 +1166,130 @@ class TestCompact:
         finally:
             rw.close()
 
+    def test_failed_compact_cleans_up_before_releasing_the_lock(self, tmp_path: Path) -> None:
+        # A failed compact removes its scratch while it still holds the
+        # source's exclusive lock. Were the lock released first, another
+        # process's compact could create its own staging at the same fixed
+        # names in between, and the cleanup would delete it (R1-F1).
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw") as ws:
+            with ws.write() as con:
+                con.execute(
+                    "INSERT INTO pkts (frame_number, frame_time) "
+                    "VALUES (7, TIMESTAMP '2024-01-01 00:00:00')"
+                )
+            proc = subprocess.Popen(
+                [sys.executable, "-c", _FAIL_AND_BLOCK_IN_CLEANUP, str(path)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                assert proc.stdout is not None
+                assert proc.stdin is not None
+                # The child's compact has failed after creating its temp and
+                # is about to remove it.
+                assert proc.stdout.readline().strip() == "CLEANUP"
+                assert _compact_temp(path).exists()
+                with pytest.raises(WorkspaceError, match="sole access"):
+                    ws.compact()
+                # Locked out, so this compact touched none of the child's
+                # artifacts either.
+                assert _compact_temp(path).exists()
+                proc.stdin.write("go\n")
+                proc.stdin.close()
+                assert proc.stdout.readline().strip() == "RAISED WorkspaceError"
+                assert proc.wait(timeout=60) == 0
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    with contextlib.suppress(subprocess.TimeoutExpired):
+                        proc.wait(timeout=30)
+            leftovers = [p.name for p in tmp_path.iterdir() if p.name != path.name]
+            assert leftovers == []
+            ws.compact()
+            with ws.read() as con:
+                rows = con.execute("SELECT frame_number FROM pkts").fetchall()
+        assert rows == [(7,)]
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX staging directory (#147)")
+    def test_compact_touches_nothing_after_its_swap(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The swap installs an inode the finishing compact's lock does not
+        # cover, so another process's compact may start at once and create
+        # its staging directory at the same fixed name. The finishing
+        # compact must not remove it: here it resumes exactly between the
+        # successor's mkdir and its ATTACH, and the successor must still
+        # succeed (R1-F1).
+        path = tmp_path / "ws.duckdb"
+        scratch = path.with_name(path.name + ".compacting")
+        with Workspace(path, mode="rw") as ws:  # noqa: SIM117
+            with ws.write() as con:
+                con.execute(
+                    "INSERT INTO pkts (frame_number, frame_time) "
+                    "VALUES (7, TIMESTAMP '2024-01-01 00:00:00')"
+                )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", _BLOCK_AFTER_SWAP, str(path)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert proc.stdout is not None
+            assert proc.stdin is not None
+            assert proc.stdout.readline().strip() == "SWAPPED"
+            stdin, stdout = proc.stdin, proc.stdout
+            finished: list[str] = []
+
+            def finish_first_compact() -> None:
+                # The successor has just created its staging directory.
+                assert scratch.is_dir()
+                stdin.write("go\n")
+                stdin.close()
+                finished.append(stdout.readline().strip())
+                assert proc.wait(timeout=60) == 0
+                assert scratch.is_dir()
+
+            real_connect = workspace_module._connect
+
+            class _Probe:
+                def __init__(self, real: Any) -> None:
+                    self._real = real
+
+                def execute(self, sql: str, *args: object) -> object:
+                    if sql.startswith("SELECT current_database()") and not finished:
+                        finish_first_compact()
+                    return self._real.execute(sql, *args)
+
+                def close(self) -> None:
+                    self._real.close()
+
+            def probed_connect(path_: str, *, read_only: bool) -> Any:
+                return _Probe(real_connect(path_, read_only=read_only))
+
+            monkeypatch.setattr(workspace_module, "_connect", probed_connect)
+            with Workspace(path, mode="rw") as ws:
+                ws.compact()
+                monkeypatch.undo()
+                with ws.read() as con:
+                    rows = con.execute("SELECT frame_number FROM pkts").fetchall()
+            assert finished == ["DONE"]
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=30)
+        assert rows == [(7,)]
+        leftovers = [p.name for p in tmp_path.iterdir() if p.name != path.name]
+        assert leftovers == []
+
     def test_hard_killed_compact_leaves_original_and_next_compact_recovers(
         self, tmp_path: Path
     ) -> None:
         path = tmp_path / "ws.duckdb"
-        tmp = _compact_temp(path)
+        ready = _compact_ready(path)
         with Workspace(path, mode="rw") as ws:  # noqa: SIM117
             with ws.write() as con:
                 con.execute(
@@ -1117,11 +1314,13 @@ class TestCompact:
                 proc.kill()
                 with contextlib.suppress(subprocess.TimeoutExpired):
                     proc.wait(timeout=30)
-        # The original was never replaced, and the kill left the temp behind
-        # (on POSIX inside its private directory, which the kill left too).
-        assert tmp.is_file()
+        # The original was never replaced, and the kill left the finished
+        # temp behind. On POSIX it had already left its staging directory,
+        # which is gone, and has the workspace's own mode.
+        assert ready.is_file()
         if sys.platform != "win32":
-            assert stat.S_IMODE(os.lstat(tmp.parent).st_mode) == 0o700
+            assert not _compact_temp(path).parent.exists()
+            assert stat.S_IMODE(os.lstat(ready).st_mode) == stat.S_IMODE(os.lstat(path).st_mode)
         with Workspace(path) as ws, ws.read() as con:
             rows = con.execute("SELECT frame_number FROM pkts").fetchall()
         assert rows == [(7,)]

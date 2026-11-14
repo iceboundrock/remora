@@ -30,6 +30,7 @@ import pytest
 import remora.workspace.workspace as workspace_module
 from remora.workspace.errors import WorkspaceError
 from remora.workspace.permissions import copy_permissions
+from remora.workspace.swap import replace_file
 from remora.workspace.workspace import Workspace
 
 duckdb = pytest.importorskip("duckdb")
@@ -419,10 +420,21 @@ class TestCompactStaging:
             seen["wal_mode"] = _mode(tmp_wal)
             seen["wal_size"] = tmp_wal.stat().st_size
 
+        real_replace = replace_file
+
+        def at_swap(src: Path, dst: Path) -> None:
+            # Final, closed and without a .wal, the temp has left the
+            # staging directory, which is already gone.
+            seen["swap"] = sorted(p.name for p in shared_dir.iterdir())
+            seen["swap_src"] = src.name
+            seen["swap_mode"] = _mode(src)
+            real_replace(src, dst)
+
         with Workspace(path, mode="rw") as ws:
             _probe_compact(
                 monkeypatch, {"COPY FROM DATABASE": at_copy, "DETACH compact_dst": at_detach}
             )
+            monkeypatch.setattr(workspace_module, "replace_file", at_swap)
             ws.compact()
             monkeypatch.undo()
             with ws.read() as con:
@@ -438,8 +450,11 @@ class TestCompactStaging:
         assert seen["wal_mode"] == 0o644
         assert isinstance(seen["wal_size"], int)
         assert seen["wal_size"] > 0
-        # The compacted file keeps the workspace's mode, and the staging
-        # directory is gone with the rename out of it.
+        assert seen["swap"] == ["ws.duckdb", "ws.duckdb.compacting.new"]
+        assert seen["swap_src"] == "ws.duckdb.compacting.new"
+        assert seen["swap_mode"] == 0o600
+        # The compacted file keeps the workspace's mode, and nothing of the
+        # compact is left beside it.
         assert _mode(path) == 0o600
         assert rows == [(7,)]
         assert sorted(p.name for p in shared_dir.iterdir()) == ["ws.duckdb"]

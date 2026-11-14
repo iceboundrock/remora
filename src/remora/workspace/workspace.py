@@ -1164,13 +1164,15 @@ class Workspace:
         A checkpoint only truncates trailing free blocks, so a file stays
         large after scattered deletes; this copies every schema, table and
         row into a temp database and atomically swaps it in by renaming the
-        temp over the open original. On POSIX the temp is
+        temp over the open original. On POSIX the temp is written as
         ``<name>.compacting/<name>``, inside a directory only the owner can
-        enter; on Windows it is the file ``<name>.compacting``. Either way it
-        is beside the original, so the final rename never crosses a
-        filesystem. The original is only ever replaced whole: an
-        interruption at any point leaves it intact, and at worst a stale
-        ``<name>.compacting`` — plus the ``.wal`` sidecar a hard kill
+        enter, and once it is final it moves out to ``<name>.compacting.new``
+        and the directory is removed, all before the swap; on Windows it is
+        the file ``<name>.compacting``. Either way it is swapped in from
+        beside the original, so the final rename never crosses a filesystem.
+        The original is only ever replaced whole: an interruption at any
+        point leaves it intact, and at worst a stale ``<name>.compacting``
+        or ``<name>.compacting.new`` — plus the ``.wal`` sidecar a hard kill
         mid-copy can leave beside the temp — that the next compact removes.
 
         A workspace addressed through a symlink is compacted at its
@@ -1248,7 +1250,12 @@ class Workspace:
         Cleanup of stale artifacts from an earlier crash happens only
         *after* that exclusive lock is held, so a compact that loses the
         lock modifies nothing at all — including another process's
-        in-flight temp file.
+        in-flight temp file. Every removal compact makes happens under that
+        lock: a failed compact removes its own artifacts before it closes
+        the source connection, and a successful one has removed its staging
+        directory before the swap and touches nothing on disk after it,
+        because from the swap on another process's compact may already own
+        the scratch names.
 
         Within this process the file lock cannot arbitrate, since
         same-process connections share one DuckDB instance; a module-level
@@ -1291,15 +1298,16 @@ class Workspace:
                 Windows swap is refused (a handle without delete sharing —
                 duckdb older than 1.5.0 or a scanner — or a Windows/volume
                 without POSIX rename semantics, #85). Also if a stale
-                ``<name>.compacting`` from an earlier crash cannot be
-                removed, or if the temp's ``.wal`` outlives its detach, so
-                the temp may lack rows; the workspace is unchanged in each
-                case.
+                ``<name>.compacting`` or ``<name>.compacting.new`` from an
+                earlier crash cannot be removed, or if the temp's ``.wal``
+                outlives its detach, so the temp may lack rows; the
+                workspace is unchanged in each case.
             OSError: An unclassified failure from the swap, unchanged. This
                 includes :class:`PermissionError` for Windows access denied
                 (error 5), which may mean missing delete permission. On
                 POSIX, also a failure to create the staging directory, such
-                as a workspace directory this process cannot write.
+                as a workspace directory this process cannot write, or to
+                move the finished temp out of it; the workspace is unchanged.
         """
         self._require_open()
         if self._mode == "ro":
@@ -1366,18 +1374,25 @@ class Workspace:
             scratch = target.with_name(target.name + _COMPACT_SUFFIX)
             tmp = scratch if sys.platform == "win32" else scratch / target.name
             tmp_wal = tmp.with_name(tmp.name + ".wal")
+            # On POSIX the finished temp leaves the staging directory under
+            # this name, so the directory is gone before the swap (below).
+            ready = tmp if sys.platform == "win32" else scratch.with_name(scratch.name + ".new")
             # On POSIX this is only ever a pre-#147 remora's stale .wal.
             scratch_wal = scratch.with_name(scratch.name + ".wal")
+            # On Windows ready is the scratch name itself.
+            leftovers = tuple(dict.fromkeys((scratch, ready, scratch_wal)))
+            attached = False
+            ready_key: _FileKey | None = None
             try:
                 try:
                     # Now that the lock is ours, anything at the scratch names
                     # is debris from an earlier crash, never a live compact.
                     try:
-                        _remove_entry(scratch)
-                        _remove_entry(scratch_wal)
+                        for leftover in leftovers:
+                            _remove_entry(leftover)
                     except OSError as exc:
                         raise WorkspaceError(
-                            f"compact() could not remove {scratch}, left by an earlier "
+                            f"compact() could not remove {leftover}, left by an earlier "
                             f"interrupted compact ({exc}); remove it and retry. The "
                             "workspace is unchanged"
                         ) from exc
@@ -1389,6 +1404,7 @@ class Workspace:
                     row = con.execute("SELECT current_database()").fetchone()
                     assert row is not None
                     con.execute(f"ATTACH '{_quote_path(str(tmp))}' AS compact_dst")
+                    attached = True
                     # DuckDB has just created the temp with this process's
                     # defaults (the umask; on Windows the directory's
                     # inherited ACL), which may be wider than the workspace
@@ -1408,6 +1424,7 @@ class Workspace:
                         ) from exc
                     con.execute(f"COPY FROM DATABASE {_quote_ident(str(row[0]))} TO compact_dst")
                     con.execute("DETACH compact_dst")
+                    attached = False
                     # DETACH checkpoints the temp and deletes its .wal. Only
                     # the database file is swapped in, so rows still in a .wal
                     # would be lost with it: refuse rather than install them.
@@ -1417,7 +1434,19 @@ class Workspace:
                             "rewritten file, so that file may not hold every row; it was "
                             "not swapped in. The workspace is unchanged"
                         )
-                    new_key = _file_key(tmp)
+                    if ready != tmp:
+                        # The temp is now final: closed, holding every row in
+                        # the database file itself, with the workspace's own
+                        # mode, so outside the directory it is no more open
+                        # than the workspace it is about to become. Move it
+                        # out and remove the directory while the lock still
+                        # excludes every other compact: the swap installs a
+                        # new inode that lock does not cover, after which
+                        # another process's compact may own the scratch names,
+                        # so nothing is removed after it.
+                        os.rename(tmp, ready)
+                        scratch.rmdir()
+                    ready_key = new_key = _file_key(ready)
                     if new_key != key:
                         # The temp is private to this compact (fresh file, held
                         # exclusive lock on the source), so claiming its identity
@@ -1426,25 +1455,31 @@ class Workspace:
                         # after the swap but before this compact fully ends.
                         _begin_compact(new_key, target)
                         claimed_new_key = new_key
-                    # The scratch directory is the target's sibling, so the
-                    # rename stays on one filesystem and keeps the inode.
-                    replace_file(tmp, target)
-                finally:
-                    con.close()
-            except BaseException:
-                # Only artifacts this compact created, or debris it was
-                # already allowed to remove: the connect above succeeded, so
-                # nothing here belongs to another process. Best effort, so
-                # the error that brought us here is the one that propagates.
-                for leftover in (scratch, scratch_wal):
-                    with suppress(OSError):
-                        _remove_entry(leftover)
-                raise
-            # After the swap the directory is empty. Failing to remove it
-            # loses nothing, and the next compact clears it under the lock.
-            if scratch != tmp:
-                with suppress(OSError):
-                    scratch.rmdir()
+                    # The temp is the target's sibling, so the rename stays on
+                    # one filesystem and keeps the inode.
+                    replace_file(ready, target)
+                except BaseException:
+                    # Clean up while the source connection, and with it the
+                    # exclusive lock, is still held: until the swap lands no
+                    # other compact can start, so everything at the scratch
+                    # names is this compact's own or debris it was already
+                    # allowed to remove. Once the swap has landed (an
+                    # interrupt just after the rename), another process's
+                    # compact may own those names, so nothing is removed.
+                    # Best effort, so the error that brought us here is the
+                    # one that propagates; whatever is left, the next compact
+                    # removes under the lock.
+                    if ready_key is None or _file_key(target) != ready_key:
+                        if attached:
+                            # Windows cannot remove a file DuckDB holds open.
+                            with suppress(Exception):
+                                con.execute("DETACH compact_dst")
+                        for leftover in leftovers:
+                            with suppress(OSError):
+                                _remove_entry(leftover)
+                    raise
+            finally:
+                con.close()
         finally:
             # Both identities stay flagged until here, which is *after* the
             # inner finally closed the source connection: DuckDB's instance
