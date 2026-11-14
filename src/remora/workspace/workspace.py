@@ -45,9 +45,12 @@ the claim retried against the new file on a mismatch.
 from __future__ import annotations
 
 import os
+import shutil
+import stat
+import sys
 import threading
 from collections.abc import Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import datetime
 from pathlib import Path
 from types import TracebackType
@@ -95,6 +98,10 @@ __all__ = ["Workspace"]
 Mode = Literal["ro", "rw"]
 
 _MODES: tuple[Mode, ...] = ("ro", "rw")
+
+# compact()'s scratch entry beside the workspace file: on POSIX a private
+# directory holding the temp database, on Windows the temp database itself.
+_COMPACT_SUFFIX: Final = ".compacting"
 
 # ``(st_dev, st_ino)`` normally; the resolved pathname only as a fallback for
 # a file that cannot be stat'ed (see :func:`_file_key`).
@@ -213,6 +220,24 @@ def _connect(path: str, *, read_only: bool) -> DuckDBPyConnection:
             "the remora workspace requires duckdb; install it with pip install 'remora[workspace]'"
         ) from exc
     return duckdb.connect(path, read_only=read_only)
+
+
+def _remove_entry(path: Path) -> None:
+    """Remove whatever ``path`` names: a directory tree, or a file or link.
+
+    compact()'s scratch name holds a directory on POSIX and a file on Windows,
+    and a file on POSIX too when an older remora left it there, so a stale
+    entry is removed whatever kind it is. A symlink is removed itself, never
+    followed, and :func:`shutil.rmtree` does not follow links inside the tree.
+    """
+    try:
+        mode = os.lstat(path).st_mode
+    except FileNotFoundError:
+        return
+    if stat.S_ISDIR(mode):
+        shutil.rmtree(path)
+    else:
+        path.unlink(missing_ok=True)
 
 
 def _quote_path(path: str) -> str:
@@ -1138,13 +1163,15 @@ class Workspace:
 
         A checkpoint only truncates trailing free blocks, so a file stays
         large after scattered deletes; this copies every schema, table and
-        row into ``<name>.compacting`` beside the original (same directory,
-        so the final rename never crosses a filesystem) and atomically
-        swaps it in by renaming the temp over the open original. The
-        original is only ever replaced whole: an interruption at any point
-        leaves it intact, and at worst a stale temp file — plus the ``.wal``
-        sidecar a hard kill mid-copy can leave beside it — that the next
-        compact removes.
+        row into a temp database and atomically swaps it in by renaming the
+        temp over the open original. On POSIX the temp is
+        ``<name>.compacting/<name>``, inside a directory only the owner can
+        enter; on Windows it is the file ``<name>.compacting``. Either way it
+        is beside the original, so the final rename never crosses a
+        filesystem. The original is only ever replaced whole: an
+        interruption at any point leaves it intact, and at worst a stale
+        ``<name>.compacting`` — plus the ``.wal`` sidecar a hard kill
+        mid-copy can leave beside the temp — that the next compact removes.
 
         A workspace addressed through a symlink is compacted at its
         *resolved* target: the temp lives beside the real file and the swap
@@ -1158,21 +1185,36 @@ class Workspace:
         whole duration), but a hardlinked alias goes on referring to the
         pre-compact file.
 
-        Access restrictions survive the swap, and the temp has them before
-        it holds any data. DuckDB creates the temp with this process's
-        defaults (the umask on POSIX, the directory's inherited ACL on
-        Windows). As soon as the temp exists, while it is still an empty
-        database, :func:`remora.workspace.permissions.copy_permissions`
-        gives it the source's mode bits and, on Windows, the source's DACL
-        and its inheritance setting. A ``0o640`` workspace stays ``0o640``,
-        and a Windows workspace made private inside a shared directory stays
+        Access restrictions survive the swap. DuckDB creates the temp and
+        its ``.wal`` with this process's defaults (the umask on POSIX, the
+        directory's inherited ACL on Windows), so each platform keeps other
+        users away from them while they hold rows. On POSIX that is the
+        ``0o700`` directory they are created in, which no other user can
+        enter: a descriptor opened on the temp before its mode is set, or on
+        its ``.wal``, which no mode is ever set on, needs a path through that
+        directory (#147). On Windows DuckDB holds both without read or write
+        sharing. Whatever the platform, as soon as the temp exists and while
+        it is still an empty database,
+        :func:`remora.workspace.permissions.copy_permissions` gives it the
+        source's mode bits and, on Windows, the source's DACL and its
+        inheritance setting, so the compacted file is exactly as restricted
+        as the workspace was: a ``0o640`` workspace stays ``0o640``, and a
+        Windows workspace made private inside a shared directory stays
         private (#132). If the restrictions cannot be carried over, compact
         raises :class:`WorkspaceError` before copying any row, and the
         workspace is unchanged. Ownership and other metadata follow the
         fresh file, because changing them would need privileges compact does
-        not assume. DuckDB creates its ``.wal`` sidecars, the temp's
-        included, with the defaults, so the directory's permissions protect
-        a workspace's data and the file's alone do not (#147).
+        not assume.
+
+        None of that reaches the workspace's *own* ``.wal``, which DuckDB
+        creates with the process defaults when a commit first writes to it
+        (a ``0o600`` database gets a ``0o644`` ``.wal`` under umask ``022``)
+        and which holds committed rows until the next checkpoint. remora has
+        no hook between DuckDB creating it and writing to it, so the boundary
+        that keeps other users from a workspace's data is its *directory*:
+        keep a sensitive workspace in a directory only its owner can enter,
+        such as ``0o700``. compact never changes that directory's
+        permissions.
 
         The swap is :func:`remora.workspace.swap.replace_file`: ``os.replace``
         on POSIX, and on Windows a POSIX-semantics rename
@@ -1248,10 +1290,16 @@ class Workspace:
                 the temp (refused before any row is copied), or if the
                 Windows swap is refused (a handle without delete sharing —
                 duckdb older than 1.5.0 or a scanner — or a Windows/volume
-                without POSIX rename semantics, #85).
+                without POSIX rename semantics, #85). Also if a stale
+                ``<name>.compacting`` from an earlier crash cannot be
+                removed, or if the temp's ``.wal`` outlives its detach, so
+                the temp may lack rows; the workspace is unchanged in each
+                case.
             OSError: An unclassified failure from the swap, unchanged. This
                 includes :class:`PermissionError` for Windows access denied
-                (error 5), which may mean missing delete permission.
+                (error 5), which may mean missing delete permission. On
+                POSIX, also a failure to create the staging directory, such
+                as a workspace directory this process cannot write.
         """
         self._require_open()
         if self._mode == "ro":
@@ -1309,14 +1357,35 @@ class Workspace:
         # identity the live file is about to have (see below).
         claimed_new_key: _FileKey | None = None
         try:
-            tmp = target.with_name(target.name + ".compacting")
+            # On POSIX the temp is created inside a private directory, so no
+            # other user can open it or its .wal while rows are written; see
+            # the docstring. Windows keeps the temp beside the workspace,
+            # where DuckDB's share mode already shuts other handles out and
+            # the file inherits the directory's ACL rather than a staging
+            # directory's.
+            scratch = target.with_name(target.name + _COMPACT_SUFFIX)
+            tmp = scratch if sys.platform == "win32" else scratch / target.name
             tmp_wal = tmp.with_name(tmp.name + ".wal")
+            # On POSIX this is only ever a pre-#147 remora's stale .wal.
+            scratch_wal = scratch.with_name(scratch.name + ".wal")
             try:
                 try:
-                    # Now that the lock is ours, any temp beside the source
+                    # Now that the lock is ours, anything at the scratch names
                     # is debris from an earlier crash, never a live compact.
-                    tmp.unlink(missing_ok=True)
-                    tmp_wal.unlink(missing_ok=True)
+                    try:
+                        _remove_entry(scratch)
+                        _remove_entry(scratch_wal)
+                    except OSError as exc:
+                        raise WorkspaceError(
+                            f"compact() could not remove {scratch}, left by an earlier "
+                            f"interrupted compact ({exc}); remove it and retry. The "
+                            "workspace is unchanged"
+                        ) from exc
+                    if sys.platform != "win32":
+                        # mkdir with 0o700 is never wider than owner-only,
+                        # whatever the umask, and fails rather than adopting a
+                        # directory someone else created at this name.
+                        os.mkdir(scratch, 0o700)
                     row = con.execute("SELECT current_database()").fetchone()
                     assert row is not None
                     con.execute(f"ATTACH '{_quote_path(str(tmp))}' AS compact_dst")
@@ -1324,10 +1393,10 @@ class Workspace:
                     # defaults (the umask; on Windows the directory's
                     # inherited ACL), which may be wider than the workspace
                     # file's own restrictions. Carry those over while the
-                    # temp is still an empty database, so no row is ever
-                    # written into it while it is more open than the
-                    # workspace (its .wal sidecar is out of reach, #147). If
-                    # that is impossible, refuse before copying anything.
+                    # temp is still an empty database, so the compacted file
+                    # ends up exactly as restricted as the workspace, and on
+                    # Windows no row is ever written into it while it is more
+                    # open. If that is impossible, refuse before copying.
                     try:
                         copy_permissions(target, tmp)
                     except OSError as exc:
@@ -1339,6 +1408,15 @@ class Workspace:
                         ) from exc
                     con.execute(f"COPY FROM DATABASE {_quote_ident(str(row[0]))} TO compact_dst")
                     con.execute("DETACH compact_dst")
+                    # DETACH checkpoints the temp and deletes its .wal. Only
+                    # the database file is swapped in, so rows still in a .wal
+                    # would be lost with it: refuse rather than install them.
+                    if os.path.lexists(tmp_wal):
+                        raise WorkspaceError(
+                            f"compact() found {tmp_wal} still present after detaching the "
+                            "rewritten file, so that file may not hold every row; it was "
+                            "not swapped in. The workspace is unchanged"
+                        )
                     new_key = _file_key(tmp)
                     if new_key != key:
                         # The temp is private to this compact (fresh file, held
@@ -1348,15 +1426,25 @@ class Workspace:
                         # after the swap but before this compact fully ends.
                         _begin_compact(new_key, target)
                         claimed_new_key = new_key
+                    # The scratch directory is the target's sibling, so the
+                    # rename stays on one filesystem and keeps the inode.
                     replace_file(tmp, target)
                 finally:
                     con.close()
             except BaseException:
-                # Only artifacts this compact created: the connect above
-                # succeeded, so nothing here belongs to another process.
-                tmp.unlink(missing_ok=True)
-                tmp_wal.unlink(missing_ok=True)
+                # Only artifacts this compact created, or debris it was
+                # already allowed to remove: the connect above succeeded, so
+                # nothing here belongs to another process. Best effort, so
+                # the error that brought us here is the one that propagates.
+                for leftover in (scratch, scratch_wal):
+                    with suppress(OSError):
+                        _remove_entry(leftover)
                 raise
+            # After the swap the directory is empty. Failing to remove it
+            # loses nothing, and the next compact clears it under the lock.
+            if scratch != tmp:
+                with suppress(OSError):
+                    scratch.rmdir()
         finally:
             # Both identities stay flagged until here, which is *after* the
             # inner finally closed the source connection: DuckDB's instance

@@ -1,7 +1,7 @@
 """Give compact()'s temp file the workspace file's access restrictions (#85, #132).
 
 :meth:`remora.workspace.workspace.Workspace.compact` copies the workspace into
-a sibling temp file that DuckDB creates, and swaps it in. A file DuckDB creates
+a temp file that DuckDB creates beside it, and swaps it in. A file DuckDB creates
 gets its platform's defaults: the process umask on POSIX, and on Windows the
 access control list the directory hands down to new files. Swapped in as it is,
 the temp would replace a workspace whose own file was restricted (``0o600``,
@@ -16,14 +16,18 @@ database file without sharing read or write access, so from the moment the
 temp exists until the DACL is applied no other handle can open it for data. From
 then on the temp has the workspace's own DACL. POSIX has no share modes, so a
 descriptor that another user opens in the short interval between DuckDB
-creating the temp and this call stays usable afterwards.
+creating the temp and this call would stay usable afterwards. That is why
+compact creates the temp on POSIX inside an owner-only directory, where no
+other user can reach it at all (#147); this module then only decides the
+compacted file's own mode.
 
 DuckDB's ``.wal`` sidecars, the temp's included, are created with the defaults
-on both platforms. On POSIX a ``0o600`` database's ``.wal`` is ``0o644`` and
-holds committed rows until the next checkpoint. On Windows DuckDB holds the
-``.wal`` without read sharing and deletes it on a clean close, so only a crash
-leaves one behind. This module does not reach them, and the directory's
-permissions are what protect a workspace's data (#147).
+on both platforms, and this module does not reach them. The temp's lives in
+compact's private directory on POSIX and is held without read sharing on
+Windows. The workspace's own ``.wal`` is outside anything remora can do: on
+POSIX a ``0o600`` database's ``.wal`` is ``0o644`` and holds committed rows
+until the next checkpoint, so the directory's permissions are what protect a
+workspace's data (#147).
 
 The module is import-pure and never imports duckdb. Its only Windows
 dependencies are ``advapi32`` and ``kernel32`` through :mod:`ctypes`, bound at
@@ -153,7 +157,7 @@ def copy_permissions(src: Path, dst: Path) -> None:
     discretionary ACL, together with whether that ACL inherits from the
     directory. Inherited entries are derived from ``dst``'s own parent, so
     the copy is exact when both files share a directory, as compact's temp
-    and the workspace do. Ownership, the group, and the Windows owner and
+    and the workspace do on Windows. Ownership, the group, and the Windows owner and
     audit entries stay as ``dst`` has them, because changing those needs
     privileges.
 

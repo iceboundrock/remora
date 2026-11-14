@@ -23,6 +23,16 @@ from remora.workspace.workspace import Workspace
 duckdb = pytest.importorskip("duckdb")
 
 
+def _compact_temp(path: Path) -> Path:
+    """Where compact() creates its temp database for the workspace at ``path``.
+
+    On POSIX inside the private ``<name>.compacting`` directory (#147), on
+    Windows the file ``<name>.compacting`` beside the workspace.
+    """
+    scratch = path.with_name(path.name + ".compacting")
+    return scratch if sys.platform == "win32" else scratch / path.name
+
+
 @contextlib.contextmanager
 def _held_without_delete_sharing(path: Path) -> Iterator[None]:
     """Hold ``path`` open on Windows the one way that refuses only a rename over it.
@@ -445,6 +455,9 @@ class TestCompact:
         assert leftovers == []
 
     def test_compact_removes_stale_temp_from_earlier_crash(self, tmp_path: Path) -> None:
+        # The file-shaped temp is what Windows uses, and what a remora from
+        # before #147 left behind on POSIX; the directory-shaped one is
+        # covered in tests/test_workspace_permissions.py.
         path = tmp_path / "ws.duckdb"
         stale = tmp_path / "ws.duckdb.compacting"
         stale_wal = tmp_path / "ws.duckdb.compacting.wal"
@@ -454,6 +467,8 @@ class TestCompact:
             ws.compact()
         assert not stale.exists()
         assert not stale_wal.exists()
+        leftovers = [p.name for p in tmp_path.iterdir() if p.name != path.name]
+        assert leftovers == []
 
     def test_compact_swap_holds_exclusive_lock(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -857,8 +872,8 @@ class TestCompact:
 
     def test_lock_conflicted_compact_modifies_nothing(self, tmp_path: Path) -> None:
         path = tmp_path / "ws.duckdb"
-        decoy = tmp_path / "ws.duckdb.compacting"
-        decoy_wal = tmp_path / "ws.duckdb.compacting.wal"
+        decoy = _compact_temp(path)
+        decoy_wal = decoy.with_name(decoy.name + ".wal")
         sentinel = b"other compaction in flight"
         sentinel_wal = b"other compaction wal in flight"
         with Workspace(path, mode="rw") as ws:
@@ -868,6 +883,7 @@ class TestCompact:
                     "VALUES (7, TIMESTAMP '2024-01-01 00:00:00')"
                 )
             # Stand in for another process's in-flight compaction.
+            decoy.parent.mkdir(mode=0o700, exist_ok=True)
             decoy.write_bytes(sentinel)
             decoy_wal.write_bytes(sentinel_wal)
             holder = subprocess.Popen(
@@ -915,6 +931,8 @@ class TestCompact:
             ws.compact()
         assert not decoy.exists()
         assert not decoy_wal.exists()
+        leftovers = [p.name for p in tmp_path.iterdir() if p.name != path.name]
+        assert leftovers == []
 
     def test_swap_refusal_leaves_original_intact(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1074,7 +1092,7 @@ class TestCompact:
         self, tmp_path: Path
     ) -> None:
         path = tmp_path / "ws.duckdb"
-        tmp = tmp_path / "ws.duckdb.compacting"
+        tmp = _compact_temp(path)
         with Workspace(path, mode="rw") as ws:  # noqa: SIM117
             with ws.write() as con:
                 con.execute(
@@ -1099,8 +1117,11 @@ class TestCompact:
                 proc.kill()
                 with contextlib.suppress(subprocess.TimeoutExpired):
                     proc.wait(timeout=30)
-        # The original was never replaced, and the kill left the temp behind.
-        assert tmp.exists()
+        # The original was never replaced, and the kill left the temp behind
+        # (on POSIX inside its private directory, which the kill left too).
+        assert tmp.is_file()
+        if sys.platform != "win32":
+            assert stat.S_IMODE(os.lstat(tmp.parent).st_mode) == 0o700
         with Workspace(path) as ws, ws.read() as con:
             rows = con.execute("SELECT frame_number FROM pkts").fetchall()
         assert rows == [(7,)]

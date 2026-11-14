@@ -1,11 +1,16 @@
-"""copy_permissions, and compact()'s use of it (issues #85, #132).
+"""copy_permissions, compact()'s use of it, and what the directory protects (#85, #132, #147).
 
 compact() swaps in a temp file that DuckDB created with this process's
-defaults. These tests pin two things. The temp has the workspace file's
+defaults. These tests pin three things. The temp has the workspace file's
 restrictions before any row is copied into it, and the compacted file keeps
-them. A restricted workspace in a directory whose defaults are wider is the
-case that fails without that: ``0o600`` under umask ``022``, or a Windows file
-made private inside a folder every user may read.
+them. On POSIX the temp and its ``.wal`` sit inside an owner-only directory
+for as long as they hold rows, because a mode set after DuckDB creates a file
+cannot revoke a descriptor opened before it, and the ``.wal`` never gets one.
+And the workspace's own ``.wal`` is created with the process defaults, a
+known DuckDB limitation pinned so a fixed DuckDB is noticed. A restricted
+workspace in a directory whose defaults are wider is the case that fails
+without all that: ``0o600`` under umask ``022``, or a Windows file made
+private inside a folder every user may read.
 """
 
 from __future__ import annotations
@@ -242,6 +247,16 @@ def _probe_compact(
     monkeypatch.setattr(workspace_module, "_connect", connect)
 
 
+def _compact_temp(path: Path) -> Path:
+    """Where compact() creates its temp database for the workspace at ``path``.
+
+    On POSIX inside the private ``<name>.compacting`` directory, on Windows
+    the file ``<name>.compacting`` beside the workspace.
+    """
+    scratch = path.with_name(path.name + ".compacting")
+    return scratch if sys.platform == "win32" else scratch / path.name
+
+
 def _insert_row(ws: Workspace) -> None:
     with ws.write() as con:
         con.execute(
@@ -287,7 +302,7 @@ class TestCompactPermissions:
         self, shared_dir: Path, monkeypatch: pytest.MonkeyPatch, restriction: str
     ) -> None:
         path = shared_dir / "ws.duckdb"
-        tmp = path.with_name(path.name + ".compacting")
+        tmp = _compact_temp(path)
         with Workspace(path, mode="rw") as ws:
             _insert_row(ws)
         _restrict(path, restriction)
@@ -327,14 +342,18 @@ class TestCompactPermissions:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         path = tmp_path / "ws.duckdb"
-        tmp = path.with_name(path.name + ".compacting")
+        tmp = _compact_temp(path)
         error = PermissionError(13, "simulated: cannot set permissions", str(tmp))
         copies: list[str] = []
 
         def cannot_copy(src: Path, dst: Path) -> None:
             # Names only: compact works on the realpath, which may respell
             # the directory (macOS /private/var, Windows 8.3 short names).
-            assert (src.name, dst.name) == (path.name, tmp.name)
+            assert (src.name, dst.parent.name, dst.name) == (
+                path.name,
+                tmp.parent.name,
+                tmp.name,
+            )
             raise error
 
         with Workspace(path, mode="rw") as ws:
@@ -355,3 +374,227 @@ class TestCompactPermissions:
             ws.compact()  # the refusal released the lock and both identity flags
         leftovers = [p.name for p in tmp_path.iterdir() if p.name != path.name]
         assert leftovers == []
+
+
+def _mode(path: Path) -> int:
+    return stat.S_IMODE(os.lstat(path).st_mode)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX staging directory (#147)")
+class TestCompactStaging:
+    """On POSIX compact()'s temp and its .wal live in an owner-only directory (#147)."""
+
+    def test_temp_and_wal_hold_rows_only_inside_a_private_directory(
+        self, shared_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = shared_dir / "ws.duckdb"
+        scratch = path.with_name(path.name + ".compacting")
+        tmp = _compact_temp(path)
+        tmp_wal = tmp.with_name(tmp.name + ".wal")
+        with Workspace(path, mode="rw") as ws:
+            _insert_row(ws)
+        os.chmod(path, 0o600)
+        # The directory everyone may enter: what the temp would sit in otherwise.
+        assert _mode(shared_dir) & 0o005 == 0o005
+        seen: dict[str, object] = {}
+
+        def staged() -> dict[str, object]:
+            return {
+                "beside": sorted(p.name for p in shared_dir.iterdir()),
+                "scratch_mode": _mode(scratch),
+                "scratch_owner": os.lstat(scratch).st_uid,
+                "inside": sorted(p.name for p in scratch.iterdir()),
+            }
+
+        def at_copy() -> None:
+            seen["copy"] = staged()
+            seen["tmp_mode"] = _mode(tmp)
+
+        def at_detach() -> None:
+            # COPY wrote rows into the temp's .wal, created with the umask's
+            # 0o644; only the directory keeps other users from it.
+            seen["detach"] = staged()
+            seen["wal_mode"] = _mode(tmp_wal)
+            seen["wal_size"] = tmp_wal.stat().st_size
+
+        with Workspace(path, mode="rw") as ws:
+            _probe_compact(
+                monkeypatch, {"COPY FROM DATABASE": at_copy, "DETACH compact_dst": at_detach}
+            )
+            ws.compact()
+            monkeypatch.undo()
+            with ws.read() as con:
+                rows = con.execute("SELECT frame_number FROM pkts").fetchall()
+        private = {
+            "beside": ["ws.duckdb", "ws.duckdb.compacting"],
+            "scratch_mode": 0o700,
+            "scratch_owner": os.stat(path).st_uid,  # this process's user
+        }
+        assert seen["copy"] == {**private, "inside": ["ws.duckdb"]}
+        assert seen["detach"] == {**private, "inside": ["ws.duckdb", "ws.duckdb.wal"]}
+        assert seen["tmp_mode"] == 0o600
+        assert seen["wal_mode"] == 0o644
+        assert isinstance(seen["wal_size"], int)
+        assert seen["wal_size"] > 0
+        # The compacted file keeps the workspace's mode, and the staging
+        # directory is gone with the rename out of it.
+        assert _mode(path) == 0o600
+        assert rows == [(7,)]
+        assert sorted(p.name for p in shared_dir.iterdir()) == ["ws.duckdb"]
+
+    def test_staging_directory_is_private_under_a_permissive_umask(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "ws.duckdb"
+        scratch = path.with_name(path.name + ".compacting")
+        with Workspace(path, mode="rw") as ws:
+            _insert_row(ws)
+        modes: list[int] = []
+        previous = os.umask(0)
+        try:
+            with Workspace(path, mode="rw") as ws:
+                _probe_compact(
+                    monkeypatch, {"COPY FROM DATABASE": lambda: modes.append(_mode(scratch))}
+                )
+                ws.compact()
+        finally:
+            os.umask(previous)
+        assert modes == [0o700]
+
+    @pytest.mark.parametrize("stale_mode", [0o755, 0o700, 0o500])
+    def test_stale_staging_directory_is_removed_under_the_lock(
+        self, tmp_path: Path, stale_mode: int
+    ) -> None:
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw") as ws:
+            _insert_row(ws)
+        # What a compact killed mid-copy leaves, in whatever mode: the temp,
+        # its .wal, and the pre-#147 name of a stale .wal beside them.
+        scratch = path.with_name(path.name + ".compacting")
+        scratch.mkdir()
+        (scratch / "ws.duckdb").write_bytes(b"garbage from an interrupted compact")
+        (scratch / "ws.duckdb.wal").write_bytes(b"garbage wal")
+        (scratch / "nested").mkdir()
+        (scratch / "nested" / "x").write_bytes(b"x")
+        os.chmod(scratch, stale_mode)
+        legacy_wal = path.with_name(path.name + ".compacting.wal")
+        legacy_wal.write_bytes(b"pre-#147 garbage wal")
+        try:
+            with Workspace(path, mode="rw") as ws:
+                if stale_mode == 0o500:
+                    # Entries of a directory its owner cannot write cannot be
+                    # removed (as root they can, so the test asks the kernel).
+                    removable = os.access(scratch, os.W_OK)
+                    if not removable:
+                        with pytest.raises(WorkspaceError, match="remove it and retry"):
+                            ws.compact()
+                        assert (scratch / "ws.duckdb").exists()
+                        os.chmod(scratch, 0o700)
+                ws.compact()
+                with ws.read() as con:
+                    rows = con.execute("SELECT frame_number FROM pkts").fetchall()
+        finally:
+            if scratch.exists():
+                os.chmod(scratch, 0o700)
+        assert rows == [(7,)]
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["ws.duckdb"]
+
+    def test_stale_symlink_is_removed_not_followed(self, tmp_path: Path) -> None:
+        path = tmp_path / "ws.duckdb"
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "keep").write_bytes(b"not compact's")
+        with Workspace(path, mode="rw") as ws:
+            _insert_row(ws)
+        scratch = path.with_name(path.name + ".compacting")
+        scratch.symlink_to(elsewhere, target_is_directory=True)
+        with Workspace(path, mode="rw") as ws:
+            ws.compact()
+        assert (elsewhere / "keep").read_bytes() == b"not compact's"
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["elsewhere", "ws.duckdb"]
+
+    def test_refuses_to_swap_when_the_temp_wal_outlives_detach(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "ws.duckdb"
+        tmp = _compact_temp(path)
+        with Workspace(path, mode="rw") as ws:
+            _insert_row(ws)
+        real_connect = workspace_module._connect
+
+        class _WalLeftBehind(_ProbingConnection):
+            def execute(self, query: str, *args: Any) -> Any:
+                result = super().execute(query, *args)
+                if query.startswith("DETACH compact_dst"):
+                    # A DuckDB whose detach did not fold the .wal back in.
+                    tmp.with_name(tmp.name + ".wal").write_bytes(b"rows not in the temp")
+                return result
+
+        def connect(path_: str, *, read_only: bool) -> Any:
+            return _WalLeftBehind(real_connect(path_, read_only=read_only), {})
+
+        swaps: list[Path] = []
+        monkeypatch.setattr(workspace_module, "_connect", connect)
+        monkeypatch.setattr(workspace_module, "replace_file", lambda src, dst: swaps.append(src))
+        with Workspace(path, mode="rw") as ws:
+            with pytest.raises(WorkspaceError, match="still present after detaching"):
+                ws.compact()
+            monkeypatch.undo()
+            assert swaps == []
+            with ws.read() as con:
+                rows = con.execute("SELECT frame_number FROM pkts").fetchall()
+            assert rows == [(7,)]
+            ws.compact()
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["ws.duckdb"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+class TestWorkspaceWal:
+    """The workspace's own .wal: a DuckDB limitation, not something remora can fix (#147).
+
+    DuckDB creates a database's ``.wal`` with the process defaults, not with
+    the database file's mode, and a committed row sits in it until the next
+    checkpoint. remora has no hook between DuckDB creating the file and
+    writing to it, and neither a ``chmod`` after the fact (a descriptor opened
+    before it stays usable) nor a process-wide ``umask`` change (not
+    thread-safe) is a fix, so the directory is the documented boundary. The
+    test states the behaviour remora would want and is a strict xfail: the day
+    a DuckDB release creates the ``.wal`` with the database's mode it starts
+    passing, the strict xfail fails the run, and the boundary in
+    docs/workspace.md is due for a second look.
+    """
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="DuckDB creates the .wal with the process defaults, not the database's mode (#147)",
+    )
+    def test_committed_rows_wal_has_the_database_mode(
+        self, shared_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = shared_dir / "ws.duckdb"
+        wal = path.with_name(path.name + ".wal")
+        with Workspace(path, mode="rw"):
+            pass
+        os.chmod(path, 0o600)
+        observed: list[tuple[int, int]] = []
+        real_connect = workspace_module._connect
+
+        class _ProbeAtClose(_ProbingConnection):
+            def close(self) -> None:
+                # After write() committed, before the close checkpoints the
+                # .wal away: the moment the committed row is in it.
+                if wal.exists():
+                    observed.append((_mode(wal), wal.stat().st_size))
+                super().close()
+
+        def connect(path_: str, *, read_only: bool) -> Any:
+            return _ProbeAtClose(real_connect(path_, read_only=read_only), {})
+
+        with Workspace(path, mode="rw") as ws:
+            monkeypatch.setattr(workspace_module, "_connect", connect)
+            _insert_row(ws)
+            monkeypatch.undo()
+        assert len(observed) == 1
+        wal_mode, wal_size = observed[0]
+        assert wal_size > 0  # the committed row is in it
+        assert wal_mode == _mode(path)  # fails today: 0o644 beside 0o600
