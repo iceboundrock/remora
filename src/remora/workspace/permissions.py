@@ -1,22 +1,26 @@
 """Give compact()'s temp file the workspace file's access restrictions (#85, #132).
 
 :meth:`remora.workspace.workspace.Workspace.compact` copies the workspace into
-a temp file that DuckDB creates beside it, and swaps it in. A file DuckDB creates
-gets its platform's defaults: the process umask on POSIX, and on Windows the
-access control list the directory hands down to new files. Swapped in as it is,
-the temp would replace a workspace whose own file was restricted (``0o600``,
-say, or a Windows DACL that leaves out other users of a shared directory) with
-a file those users can open. :func:`copy_permissions` gives the temp the
-source's restrictions. Compact calls it as soon as DuckDB has created the temp,
-while the temp is still an empty database, so no row is ever written into the
-temp while it is more open than the workspace.
+a temp file, and swaps it in. On POSIX DuckDB creates the temp when compact
+attaches it; on Windows compact creates it itself, exclusively, as an empty
+database, before attaching it. Either way it gets its platform's defaults: the
+process umask on POSIX, and on Windows the access control list the directory
+hands down to new files. Swapped in as it is, the temp would replace a
+workspace whose own file was restricted (``0o600``, say, or a Windows DACL that
+leaves out other users of a shared directory) with a file those users can open.
+:func:`copy_permissions` gives the temp the source's restrictions. Compact calls
+it as soon as the temp is attached, while the temp is still an empty database,
+so no row is ever written into the temp while it is more open than the
+workspace.
 
 On Windows that order closes the gap completely. DuckDB opens a read-write
-database file without sharing read or write access, so from the moment the
-temp exists until the DACL is applied no other handle can open it for data. From
-then on the temp has the workspace's own DACL. POSIX has no share modes, so a
-descriptor that another user opens in the short interval between DuckDB
-creating the temp and this call would stay usable afterwards. That is why
+database file without sharing read or write access, so from ``ATTACH`` until
+the DACL is applied no other handle can open it for data, and a handle another
+program opened on it before ``ATTACH``, while it held only an empty database,
+makes the ``ATTACH`` fail with a sharing violation instead of staying open on
+rows. From then on the temp has the workspace's own DACL. POSIX has no share
+modes, so a descriptor that another user opens in the short interval between
+DuckDB creating the temp and this call would stay usable afterwards. That is why
 compact creates the temp on POSIX inside an owner-only directory, where no
 other user can reach it at all (#147); this module then only decides the
 compacted file's own mode.

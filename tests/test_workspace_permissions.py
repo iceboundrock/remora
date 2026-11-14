@@ -1,11 +1,12 @@
 """copy_permissions, compact()'s use of it, and what the directory protects (#85, #132, #147).
 
-compact() swaps in a temp file that DuckDB created with this process's
-defaults. These tests pin three things. The temp has the workspace file's
-restrictions before any row is copied into it, and the compacted file keeps
-them. On POSIX the temp and its ``.wal`` sit inside an owner-only directory
-for as long as they hold rows, because a mode set after DuckDB creates a file
-cannot revoke a descriptor opened before it, and the ``.wal`` never gets one.
+compact() swaps in a temp file created with this process's defaults, by
+DuckDB on POSIX and by compact itself on Windows. These tests pin three
+things. The temp has the workspace file's restrictions before any row is
+copied into it, and the compacted file keeps them. On POSIX the temp and its
+``.wal`` sit inside an owner-only directory for as long as they hold rows,
+because a mode set after DuckDB creates a file cannot revoke a descriptor
+opened before it, and the ``.wal`` never gets one.
 And the workspace's own ``.wal`` is created with the process defaults, a
 known DuckDB limitation pinned so a fixed DuckDB is noticed. A restricted
 workspace in a directory whose defaults are wider is the case that fails

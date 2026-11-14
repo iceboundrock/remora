@@ -804,8 +804,8 @@ class TestCompact:
     @pytest.mark.usefixtures("windows_layout")
     def test_windows_sibling_never_claimed_is_left_alone(self, tmp_path: Path) -> None:
         # R3-F1: a compact killed after writing its marker but before it
-        # checked the temp's name (or before DuckDB created the temp there)
-        # wrote no claim, so whatever is at the sibling names may be anyone's.
+        # checked the temp's name (or between creating the temp there and
+        # claiming it) wrote no claim, so whatever is at the sibling names may be anyone's.
         # The marked directory goes; the siblings stay byte for byte.
         path = tmp_path / "ws.duckdb"
         with Workspace(path, mode="rw") as ws, ws.write() as con:
@@ -1065,10 +1065,13 @@ class TestCompact:
                 if sql.startswith(when) and not replaced:
                     if when == "DETACH":
                         result = self._real.execute(sql, *args)
-                        os.replace(theirs, tmp)
+                        replace_file(theirs, tmp)
                         replaced.append(sql)
                         return result
-                    os.replace(theirs, tmp)
+                    # replace_file, not os.replace: at COPY the temp is
+                    # attached, and on Windows only a POSIX-semantics
+                    # rename can replace a file DuckDB holds open.
+                    replace_file(theirs, tmp)
                     replaced.append(sql)
                     if when != "ATTACH":
                         raise RuntimeError("simulated failure after the replacement")

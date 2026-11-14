@@ -1458,8 +1458,10 @@ class Workspace:
         compacts too. On POSIX the temp is written inside it as
         ``compact.duckdb``, and only the owner can enter it; on Windows the
         directory only reserves the name, and the temp is the sibling file
-        ``remora-compact-<16 hex digits>.tmp``, whose identity a claim file
-        in the directory records once DuckDB has created it. Either way the
+        ``remora-compact-<16 hex digits>.tmp``, which compact creates itself,
+        exclusively, and fills with an empty database before ``ATTACH``; a
+        claim file in the directory records its identity while the creating
+        handle is still open. Either way the
         temp is renamed over the original from the same directory or one
         inside it, so the final rename never crosses a filesystem, and the
         staging directory is removed after the swap.
@@ -1493,16 +1495,19 @@ class Workspace:
         whole duration), but a hardlinked alias goes on referring to the
         pre-compact file.
 
-        Access restrictions survive the swap. DuckDB creates the temp and
-        its ``.wal`` with this process's defaults (the umask on POSIX, the
-        directory's inherited ACL on Windows), so each platform keeps other
-        users away from them while they hold rows. On POSIX that is the
+        Access restrictions survive the swap. The temp and its ``.wal`` are
+        created with this process's defaults (the umask on POSIX, the
+        directory's inherited ACL on Windows): on POSIX DuckDB creates both
+        at ``ATTACH``, and on Windows compact creates the temp itself before
+        ``ATTACH`` and DuckDB creates its ``.wal``. So each platform keeps
+        other users away from them while they hold rows. On POSIX that is the
         ``0o700`` directory they are created in, which no other user can
         enter: a descriptor opened on the temp before its mode is set, or on
         its ``.wal``, which no mode is ever set on, needs a path through that
         directory (#147). On Windows DuckDB holds both without read or write
-        sharing. Whatever the platform, as soon as the temp exists and while
-        it is still an empty database,
+        sharing from ``ATTACH`` on, before any row is written. Whatever the
+        platform, as soon as the temp is attached and while it is still an
+        empty database,
         :func:`remora.workspace.permissions.copy_permissions` gives it the
         source's mode bits and, on Windows, the source's DACL and its
         inheritance setting, so the compacted file is exactly as restricted
