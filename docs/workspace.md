@@ -326,24 +326,101 @@ A DuckDB checkpoint truncates only **trailing** free blocks. Emptying a table
 therefore shrinks the file mostly by itself, while *scattered* deletes — deleting
 annotations, re-running `build_streams()` over and over — leave interior free
 blocks the file keeps forever. `compact()` is what reclaims those: it rewrites
-every schema, table and row into a sibling `<name>.compacting` file and swaps it
-in atomically by renaming over the open original — `os.replace` on POSIX, a
+every schema, table and row into a temp database beside the workspace and swaps
+it in atomically by renaming over the open original — `os.replace` on POSIX, a
 POSIX-semantics `FileRenameInfoEx` rename on Windows
-(`remora.workspace.swap.replace_file`).
+(`remora.workspace.swap.replace_file`). Each compact first creates its own
+staging directory beside the workspace, `remora-compact-<16 hex digits>`, under
+a name nothing else holds, with a `remora-compact` marker file inside that names
+the workspace. The name does not depend on the workspace's, so a workspace whose
+name is close to the filesystem's 255-byte limit compacts too, and the marker,
+not the name, says which workspace a staging directory belongs to. On POSIX the
+temp is written inside it as `compact.duckdb`, and only its owner can enter it.
+On Windows the directory only reserves the name: the temp is the file
+`remora-compact-<16 hex digits>.tmp` beside it, and if anything is already there
+or at its `.wal` name, compact refuses rather than use or remove it. A name found
+free proves nothing, since another program can create a file there a moment
+later, so compact creates the temp itself, exclusively (`O_CREAT | O_EXCL`, which
+fails on an existing entry rather than open it), as an empty DuckDB database,
+and while it still holds the file open a `temp-claim` file in the staging
+directory records the temp's file identity. If the temp is no longer that file
+once attached or before the swap, compact refuses. Nothing holds the temp
+between its detach and the swap, so another program could replace it at its
+name right after any check by name; the swap therefore checks the identity of
+the very file it renames, through the handle it renames with, which shares no
+deletion while it is open, and so does every removal of the temp. The temp is
+swapped in from there, and the staging
+directory is removed after the swap. Its name is that compact's alone, so
+removing it cannot touch the staging of another compact that has already
+started on the new file.
+
+compact removes only what it can prove is its own. Its own temp and staging
+directory, on failure or success. And, once it holds the lock (so no compact of
+this workspace is in flight), a staging directory an earlier compact of the same
+workspace was killed before removing: a real directory at an exact
+`remora-compact-<16 hex digits>` name, owned by this user on POSIX, holding the
+marker naming this workspace and nothing but the files a compact puts there. On
+Windows the temp is outside that directory, so its name proves nothing: compact
+removes it, failing or stale, only as the regular file whose identity the claim
+recorded, checked through the handle that removes it. A compact killed between creating the temp and
+writing the claim leaves its temp for removal by hand, and a file that appears at
+the temp's name, after the swap renamed the temp away or by replacing it while
+the compact runs, is left alone. The Windows temp's `.wal` is a separate file at a
+derived name, which DuckDB creates and deletes itself and no claim covers, so
+compact never removes one: a file at that name may be another program's, created
+after a detach deleted the temp's own. A stale one, which a hard kill mid-copy
+can leave, is for removal by hand too. Anything
+else beside the workspace is left alone, whatever its name: a symlink, another
+program's file or directory, another workspace (even one named like a staging
+directory), or a staging directory with anything extra in it. That includes the
+`<name>.compacting` and `<name>.compacting.wal` an interrupted compact by a
+remora older than #147 left; nothing proves they are compact's, so delete them
+by hand.
 
 | Property | Behaviour |
 | --- | --- |
 | Mode | `rw` only; `WorkspaceModeError` in ro |
 | Concurrency | Needs **sole access**. Any other connection — including a read-only reader in another process, or an ro-mode `Workspace` on the same file in this one — makes it fail fast on the lock with **nothing modified** |
 | In-process | A `write()` or rw-mode `read()` in flight on *any* `Workspace` for this file raises `WorkspaceError`, and for compaction's duration writers and rw-mode readers fail fast the same way |
-| Interruption | The original is replaced whole, so a crash at any point leaves it intact, and at worst a stale temp file the next compact removes |
+| Interruption | The original is replaced whole, so a crash at any point leaves it intact, and at worst a stale marked staging directory (with the temp and its `.wal`, if the crash came before the swap) that the next compact removes once it holds the lock. On Windows a temp the crash left before its claim was written (the instant after its exclusive creation), and the temp's `.wal` whatever the claim, are not provably compact's and stay for removal by hand. A compact that fails removes its own artifacts before it releases the lock. A stale staging directory of this workspace that cannot be removed, such as one whose mode its owner made read-only, makes compact raise `WorkspaceError` naming the path, with the workspace unchanged |
 | Symlinks | Compacts the *resolved* target, so a symlink survives as a symlink. A **hard link** cannot survive an atomic swap: the replaced name gets the new inode, the other name keeps the old one, and the two diverge |
-| Permissions | The temp gets the workspace file's restrictions as soon as DuckDB creates it and before any row is copied into it: the mode bits, and on Windows also the DACL and whether it inherits (#132). A `0o640` workspace stays `0o640`, and a Windows file made private inside a shared folder stays private. If they cannot be carried over, `compact()` raises `WorkspaceError` before copying anything and the workspace is unchanged. Ownership follows the fresh file. DuckDB creates its `.wal` sidecars, the temp's included, with the process defaults (on POSIX a `0o600` database gets a `0o644` `.wal` holding committed rows), so the directory's permissions protect a workspace's data and the file's alone do not (#147) |
+| Permissions | The compacted file keeps the workspace file's restrictions: the mode bits, and on Windows also the DACL and whether it inherits (#132). A `0o640` workspace stays `0o640`, and a Windows file made private inside a shared folder stays private. They are set while the temp is still an empty database, before any row is copied: on POSIX by name right after `ATTACH`, inside the private staging directory, and on Windows before `ATTACH`, through the descriptor that created and claimed the temp, so they reach only that file and never another program's file put at its name in the shared directory. If they cannot be, `compact()` raises `WorkspaceError` and the workspace is unchanged. Ownership follows the fresh file. While the temp and its `.wal` hold rows, other users are kept from them on POSIX by the `0o700` staging directory, since a mode set after creation cannot revoke a descriptor opened before it and the `.wal` never gets the file's mode, and on Windows by DuckDB opening both without read or write sharing (#147). None of this covers the workspace's own `.wal`: see [File permissions](#file-permissions-the-directory-is-the-boundary) |
 | Platform | POSIX, and **Windows with duckdb ≥ 1.5.0** (which opens its database with `FILE_SHARE_DELETE`, so the file can be renamed over while compact's exclusive connection holds it) on Windows 10 1607 / Server 2016 or later, NTFS (ReFS unverified). A sharing violation (Windows error 32, such as an older duckdb or a handle without delete sharing) or a volume without POSIX rename semantics makes `compact()` raise `WorkspaceError` naming the requirement, with the workspace unchanged (#85). Access denied (Windows error 5) propagates as the original `PermissionError`: it may mean missing delete permission on the workspace file and its directory, not a sharing conflict. Paths longer than 260 characters are unverified on Windows |
 
 When to run it: after deleting a lot of annotations, after repeated
 re-materialization cycles, or before archiving a workspace — not routinely, and
 never while anyone else is connected.
+
+### File permissions: the directory is the boundary
+
+What keeps other users from a workspace's data is the permissions of the
+**directory** it lives in, not the mode or ACL of the `.duckdb` file. A
+`chmod 0600 ws.duckdb` alone does not make a workspace private.
+
+DuckDB writes committed rows into a `<name>.wal` sidecar before checkpointing
+them into the database file, and creates that sidecar with the process defaults
+rather than the database file's permissions. Measured with duckdb 1.5.6: with
+`ws.duckdb` at `0o600` in a `0o755` directory under umask `022`, every
+`write()` that commits creates `ws.duckdb.wal` at `0o644`, and the committed
+rows sit in it, readable by any local user, until the next checkpoint (by
+default when the connection closes). A file that a crash leaves behind stays
+that way. On Windows the `.wal` gets the directory's inherited ACL; DuckDB holds
+it without read sharing and deletes it on a clean close, so only one left by a
+crash can be read.
+
+remora cannot fix this from outside DuckDB. Nothing runs between DuckDB creating
+the `.wal` and writing rows into it, a `chmod` afterwards does not revoke a
+descriptor another user opened in between, and changing the process `umask` is
+process-wide and not thread-safe. It is a DuckDB limitation, tracked in #147;
+`tests/test_workspace_permissions.py` pins it with a strict `xfail` that starts
+failing the day a DuckDB release creates the `.wal` with the database's mode.
+
+So keep a sensitive workspace in a directory only its owner can enter, such as
+`0o700` on POSIX or a folder with a private ACL on Windows. That covers the
+database, both `.wal` sidecars, `compact()`'s temp and anything a crash leaves
+behind. remora never changes that directory's permissions: it is yours to set.
+`compact()`'s own temp needs no such help on POSIX, because it is staged in a
+`0o700` directory of its own (see the Permissions row above).
 
 ## Parquet export
 
@@ -680,7 +757,7 @@ operations the peer opens read-write fine.
 | Hit / backfill / refuse | `tests/test_workspace_materialize.py`, `tests/test_workspace_cache.py` |
 | Modes, locking, `compact()` coordination | `tests/test_workspace_lifecycle.py` |
 | `compact()`'s swap primitive, Windows rename semantics | `tests/test_workspace_swap.py` |
-| `compact()`'s permission carry-over, Windows DACLs | `tests/test_workspace_permissions.py` |
+| `compact()`'s permission carry-over and POSIX staging directory, Windows DACLs, the workspace `.wal`'s mode | `tests/test_workspace_permissions.py` |
 | Export destination safety and the two type rewrites | `tests/test_workspace_export.py` |
 | The three query-time refusals, at both the moments they fire | `tests/test_workspace_query.py` |
 | Pcap-path / cache-path parity | `tests/integration/workspace/test_parity_matrix.py` |

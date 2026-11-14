@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import stat
 import sys
 from pathlib import Path
 
@@ -11,7 +12,13 @@ import pytest
 import remora.workspace.swap as swap_module
 from conftest import duckdb_shares_delete
 from remora.workspace.errors import WorkspaceError
-from remora.workspace.swap import explain_rename_error, replace_file
+from remora.workspace.swap import (
+    SourceReplacedError,
+    explain_rename_error,
+    remove_file,
+    replace_file,
+    stat_unfollowed,
+)
 
 windows_only = pytest.mark.skipif(sys.platform != "win32", reason="Windows rename semantics")
 
@@ -24,6 +31,129 @@ def test_replace_file_renames_over_the_destination(tmp_path: Path) -> None:
     replace_file(src, dst)
     assert dst.read_bytes() == b"new"
     assert not src.exists()
+
+
+def _identity(st: os.stat_result) -> tuple[int, int]:
+    return (st.st_dev, st.st_ino)
+
+
+def _replace_quietly(src: Path, dst: Path) -> bool:
+    """Try to put ``src`` at ``dst``, as another program would; whether it landed."""
+    try:
+        os.replace(src, dst)
+    except OSError:
+        return False
+    return True
+
+
+class TestVerifiedReplaceAndRemove:
+    """The check and the act concern one file (#147, R7-F1, R7-F2).
+
+    Another program replacing the file at the name *after* the check must
+    change nothing about which file is renamed or removed. On Windows the
+    handle the check and the act share does not share deletion, so the
+    replacement fails; on POSIX the file was taken into the private holding
+    directory before the check, so the replacement lands at a free name and
+    is left alone.
+    """
+
+    @staticmethod
+    def _setup(tmp_path: Path) -> tuple[Path, Path, Path, tuple[int, int]]:
+        holding = tmp_path / "holding"
+        holding.mkdir(mode=0o700)
+        ours = tmp_path / "ours"
+        ours.write_bytes(b"ours")
+        theirs = tmp_path / "theirs"
+        theirs.write_bytes(b"theirs")
+        return holding, ours, theirs, _identity(stat_unfollowed(ours))
+
+    def test_stat_unfollowed_agrees_with_the_creating_descriptor(self, tmp_path: Path) -> None:
+        path = tmp_path / "f"
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            created = os.fstat(fd)
+        finally:
+            os.close(fd)
+        assert _identity(stat_unfollowed(path)) == _identity(created)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges on Windows")
+    def test_stat_unfollowed_does_not_follow_a_link(self, tmp_path: Path) -> None:
+        (tmp_path / "target").write_bytes(b"x")
+        (tmp_path / "link").symlink_to(tmp_path / "target")
+        assert stat.S_ISLNK(stat_unfollowed(tmp_path / "link").st_mode)
+
+    def test_replace_renames_the_checked_file_despite_a_later_replacement(
+        self, tmp_path: Path
+    ) -> None:
+        holding, ours, theirs, mine = self._setup(tmp_path)
+        dst = tmp_path / "dst"
+        dst.write_bytes(b"old")
+        landed: list[bool] = []
+
+        def verify(st: os.stat_result) -> bool:
+            ok = _identity(st) == mine
+            landed.append(_replace_quietly(theirs, ours))
+            return ok
+
+        replace_file(ours, dst, verify=verify, holding=holding)
+        assert dst.read_bytes() == b"ours"
+        assert landed == [sys.platform != "win32"]
+        assert (ours if landed[0] else theirs).read_bytes() == b"theirs"
+        assert list(holding.iterdir()) == []
+
+    def test_replace_refuses_a_file_verify_rejects(self, tmp_path: Path) -> None:
+        holding, ours, theirs, _ = self._setup(tmp_path)
+        os.replace(theirs, ours)
+        before = _identity(os.lstat(ours))
+        dst = tmp_path / "dst"
+        dst.write_bytes(b"old")
+        with pytest.raises(SourceReplacedError):
+            replace_file(ours, dst, verify=lambda st: False, holding=holding)
+        assert dst.read_bytes() == b"old"
+        assert ours.read_bytes() == b"theirs"
+        assert _identity(os.lstat(ours)) == before
+        assert list(holding.iterdir()) == []
+
+    def test_replace_refuses_a_missing_source(self, tmp_path: Path) -> None:
+        holding, _, _, _ = self._setup(tmp_path)
+        dst = tmp_path / "dst"
+        dst.write_bytes(b"old")
+        with pytest.raises(SourceReplacedError):
+            replace_file(tmp_path / "gone", dst, verify=lambda st: True, holding=holding)
+        assert dst.read_bytes() == b"old"
+
+    def test_remove_removes_the_checked_file_despite_a_later_replacement(
+        self, tmp_path: Path
+    ) -> None:
+        holding, ours, theirs, mine = self._setup(tmp_path)
+        landed: list[bool] = []
+
+        def verify(st: os.stat_result) -> bool:
+            ok = _identity(st) == mine
+            landed.append(_replace_quietly(theirs, ours))
+            return ok
+
+        assert remove_file(ours, verify, holding=holding)
+        assert landed == [sys.platform != "win32"]
+        if landed[0]:
+            assert ours.read_bytes() == b"theirs"
+        else:
+            assert not ours.exists()
+            assert theirs.read_bytes() == b"theirs"
+        assert list(holding.iterdir()) == []
+
+    def test_remove_leaves_a_file_verify_rejects(self, tmp_path: Path) -> None:
+        holding, ours, theirs, mine = self._setup(tmp_path)
+        os.replace(theirs, ours)
+        before = _identity(os.lstat(ours))
+        assert not remove_file(ours, lambda st: _identity(st) == mine, holding=holding)
+        assert ours.read_bytes() == b"theirs"
+        assert _identity(os.lstat(ours)) == before
+        assert list(holding.iterdir()) == []
+
+    def test_remove_of_a_missing_file_removes_nothing(self, tmp_path: Path) -> None:
+        holding, _, _, _ = self._setup(tmp_path)
+        assert not remove_file(tmp_path / "gone", lambda st: True, holding=holding)
 
 
 class TestExplainRenameError:
