@@ -344,8 +344,12 @@ later, so compact creates the temp itself, exclusively (`O_CREAT | O_EXCL`, whic
 fails on an existing entry rather than open it), as an empty DuckDB database,
 and while it still holds the file open a `temp-claim` file in the staging
 directory records the temp's file identity. If the temp is no longer that file
-once attached or before the swap, compact refuses. The temp is swapped in from
-there, and the staging
+once attached or before the swap, compact refuses. Nothing holds the temp
+between its detach and the swap, so another program could replace it at its
+name right after any check by name; the swap therefore checks the identity of
+the very file it renames, through the handle it renames with, which shares no
+deletion while it is open, and so does every removal of the temp. The temp is
+swapped in from there, and the staging
 directory is removed after the swap. Its name is that compact's alone, so
 removing it cannot touch the staging of another compact that has already
 started on the new file.
@@ -357,8 +361,8 @@ workspace was killed before removing: a real directory at an exact
 `remora-compact-<16 hex digits>` name, owned by this user on POSIX, holding the
 marker naming this workspace and nothing but the files a compact puts there. On
 Windows the temp is outside that directory, so its name proves nothing: compact
-removes it, failing or stale, only while it is still the regular file whose
-identity the claim recorded. A compact killed between creating the temp and
+removes it, failing or stale, only as the regular file whose identity the claim
+recorded, checked through the handle that removes it. A compact killed between creating the temp and
 writing the claim leaves its temp for removal by hand, and a file that appears at
 the temp's name, after the swap renamed the temp away or by replacing it while
 the compact runs, is left alone. The Windows temp's `.wal` is a separate file at a

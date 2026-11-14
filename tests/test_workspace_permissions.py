@@ -483,13 +483,13 @@ class TestCompactStaging:
 
         real_replace = replace_file
 
-        def at_swap(src: Path, dst: Path) -> None:
+        def at_swap(src: Path, dst: Path, **kwargs: Any) -> None:
             # Final, closed and without a .wal, the temp is swapped in from
             # inside the staging directory.
             seen["swap"] = staged()
             seen["swap_src"] = (src.parent.name, src.name)
             seen["swap_mode"] = _mode(src)
-            real_replace(src, dst)
+            real_replace(src, dst, **kwargs)
 
         with Workspace(path, mode="rw") as ws:
             _probe_compact(

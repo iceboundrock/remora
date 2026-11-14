@@ -91,7 +91,12 @@ from remora.workspace.permissions import copy_permissions
 from remora.workspace.query import Query
 from remora.workspace.schema import check_compatible, create_schema
 from remora.workspace.streams import StreamsResult, build_streams
-from remora.workspace.swap import replace_file
+from remora.workspace.swap import (
+    SourceReplacedError,
+    remove_file,
+    replace_file,
+    stat_unfollowed,
+)
 
 if TYPE_CHECKING:
     from duckdb import DuckDBPyConnection
@@ -276,22 +281,37 @@ def _write_exclusive(path: Path, data: bytes) -> None:
         f.write(data)
 
 
-def _claim_temp(staging: Path) -> os.stat_result:
-    """Record in ``staging`` the identity of the sibling temp, and return it.
+def _claim_temp(staging: Path, st: os.stat_result | None = None) -> bytes:
+    """Record in ``staging`` the identity of the sibling temp, and return the claim.
 
-    :func:`_create_temp_beside` calls this while it still holds the temp it
-    created open, so the file the claim names is provably this compact's: on
-    Windows nothing can remove or rename a file while a handle without delete
-    sharing is open on it. A sibling is outside the staging directory, so its
-    name alone proves nothing: after the swap whatever appears at the name is
-    another file. :func:`_stale_temp_files` and a failing compact remove the
-    sibling only while it is still the very file claimed here. On NTFS a file
-    ID carries a sequence number, so a file created after the temp is gone
-    does not take over its identity.
+    ``st`` is the temp's status. :func:`_create_temp_beside` passes the
+    :func:`os.fstat` of the descriptor it created the temp with, while it
+    still holds it open, so the file the claim names is provably this
+    compact's: on Windows nothing can remove or rename a file while a handle
+    without delete sharing is open on it. Without ``st`` the file now at the
+    temp's name is claimed, read by :func:`remora.workspace.swap.stat_unfollowed`.
+    A sibling is outside the staging directory, so its name alone proves
+    nothing: after the swap whatever appears at the name is another file.
+    The swap, a failing compact and a later one's cleanup act on the sibling
+    only while it is the very file claimed here, and check that through the
+    handle they act with (see :func:`_remove_temp`). On NTFS a file ID
+    carries a sequence number, so a file created after the temp is gone does
+    not take over its identity.
     """
-    st = os.lstat(_staging_temp(staging))
-    _write_exclusive(staging / _STAGING_CLAIM, _temp_claim(st))
-    return st
+    if st is None:
+        st = stat_unfollowed(_staging_temp(staging))
+    claim = _temp_claim(st)
+    _write_exclusive(staging / _STAGING_CLAIM, claim)
+    return claim
+
+
+def _read_claim(staging: Path) -> bytes | None:
+    """The claim a compact wrote into ``staging``, or ``None`` if there is none."""
+    try:
+        with open(staging / _STAGING_CLAIM, "rb") as claim_file:
+            return claim_file.read(4096)
+    except OSError:
+        return None
 
 
 @functools.cache
@@ -312,22 +332,33 @@ def _empty_database_image() -> bytes:
     return data
 
 
-def _same_file(path: Path, st: os.stat_result) -> bool:
-    """True while ``path`` is the regular file whose ``lstat`` was ``st``."""
+def _is_claimed(st: os.stat_result, claim: bytes) -> bool:
+    """True when ``st`` is the status of the regular file ``claim`` records.
+
+    A reparse point (a symlink or junction, opened as itself) never is.
+    """
+    return (
+        stat.S_ISREG(st.st_mode)
+        and not getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+        and _temp_claim(st) == claim
+    )
+
+
+def _same_file(path: Path, claim: bytes) -> bool:
+    """True when ``path`` is, as of this call, the file ``claim`` records.
+
+    A check by name, which only refuses early: whatever is at a name can
+    change the next instant, so acting on the file goes through
+    :func:`remora.workspace.swap.replace_file` or :func:`_remove_temp`,
+    which check the file they act on.
+    """
     try:
-        now = os.lstat(path)
+        return _is_claimed(stat_unfollowed(path), claim)
     except OSError:
         return False
-    return stat.S_ISREG(now.st_mode) and _temp_claim(now) == _temp_claim(st)
 
 
-def _unlink_if_same(path: Path, st: os.stat_result) -> None:
-    """Remove ``path`` only while it is the file whose ``lstat`` was ``st``."""
-    if _same_file(path, st):
-        path.unlink(missing_ok=True)
-
-
-def _create_temp_beside(staging: Path) -> os.stat_result:
+def _create_temp_beside(staging: Path) -> bytes:
     """Create the Windows sibling temp of ``staging`` as a new, empty database.
 
     A pathname found free proves nothing: another program can create a file
@@ -337,9 +368,9 @@ def _create_temp_beside(staging: Path) -> os.stat_result:
     it, writes :func:`_empty_database_image` into it and, while still holding
     it open, records its identity in the claim (:func:`_claim_temp`). Created
     in place, it inherits the workspace directory's ACL, as a file DuckDB
-    creates there would (#147). The returned identity is what every later
-    removal is checked against, so a file that has since replaced the temp at
-    its name is never removed.
+    creates there would (#147). The returned claim is what the swap and every
+    later removal check the file they act on against, so a file that has
+    since replaced the temp at its name is never swapped in or removed.
 
     Raises:
         FileExistsError: Something is already at the temp's name; it is left
@@ -350,20 +381,22 @@ def _create_temp_beside(staging: Path) -> os.stat_result:
     tmp = _staging_temp(staging)
     image = _empty_database_image()
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
-    st: os.stat_result | None = None
+    claim: bytes | None = None
     try:
         with os.fdopen(fd, "wb") as f:
-            st = os.lstat(tmp)
+            # The descriptor's own status: the file this call created, not
+            # whatever is at its name by now.
+            st = os.fstat(f.fileno())
+            claim = _temp_claim(st)
             f.write(image)
             f.flush()
-            _claim_temp(staging)
+            _claim_temp(staging, st)
     except BaseException:
-        if st is not None:
+        if claim is not None:
             with suppress(OSError):
-                _unlink_if_same(tmp, st)
+                _remove_temp(staging, claim)
         raise
-    assert st is not None
-    return st
+    return claim
 
 
 def _make_staging(target: Path) -> Path:
@@ -388,7 +421,7 @@ def _make_staging(target: Path) -> Path:
         _write_exclusive(staging / _STAGING_MARKER, _staging_marker(target.name))
     except BaseException:
         with suppress(OSError):
-            _remove_staging(staging, ())
+            _remove_staging(staging)
         raise
     return staging
 
@@ -400,7 +433,7 @@ def _is_own_stale_staging(staging: Path, name: str) -> bool:
     owned by this user on POSIX, holding the marker naming ``name`` and
     nothing but the regular files a compact creates there. Anything else may
     belong to someone else and is left alone. On Windows this says nothing
-    about the sibling temp, which :func:`_stale_temp_files` judges.
+    about the sibling temp, which :func:`_remove_temp` judges by its claim.
     """
     try:
         st = os.lstat(staging)
@@ -451,52 +484,38 @@ def _own_stale_stagings(target: Path) -> list[Path]:
     ]
 
 
-def _own_temp_files(tmp: Path, claimed: os.stat_result | None = None) -> tuple[Path, ...]:
-    """What of a compact's temp ``tmp`` and its ``.wal`` compact may remove as its own.
+def _remove_temp(staging: Path, claim: bytes | None) -> None:
+    """Remove what of the temp of ``staging``'s compact provably is that compact's.
 
-    Both, inside a POSIX staging directory, where only the owner can put
-    anything. In the Windows layout the sibling temp only while it is still
-    the file :func:`_create_temp_beside` created, whose identity is
-    ``claimed``: its name alone proves nothing, since the temp may never have
-    been created (another file was there) or something may have replaced it
-    since. Without ``claimed``, nothing. Never the sibling's ``.wal``, a
-    separate file at a derived name, outside the staging directory, that no
-    claim covers. DuckDB creates and deletes that file itself, so a name
-    found occupied may be DuckDB's leftover or anyone else's file (one
-    created after a detach deleted the temp's own, say), and compact leaves
-    it alone (#147).
-    """
-    if _TEMP_BESIDE_STAGING:
-        return (tmp,) if claimed is not None and _same_file(tmp, claimed) else ()
-    return (_wal(tmp), tmp)
-
-
-def _stale_temp_files(staging: Path) -> tuple[Path, ...]:
-    """The temp files of the stale ``staging`` that provably are its compact's.
-
-    Inside a POSIX staging directory that :func:`_is_own_stale_staging`
-    accepted, they are whatever of the temp and its ``.wal`` is there: only
-    the owner can put anything in it. The Windows sibling temp is outside,
-    so it counts only while it is a regular file whose identity is the one
-    :func:`_claim_temp` recorded. Without the claim (a compact killed between
-    creating the temp and writing it), or once the claimed file is gone
-    (renamed over the workspace by the swap), whatever is at its name is
-    left alone. Whatever
-    is at the Windows temp's ``.wal`` name never counts, claimed temp or not
-    (see :func:`_own_temp_files`).
+    Inside a POSIX staging directory, the temp and its ``.wal``, whatever is
+    there: only the owner can put anything in it. In the Windows layout the
+    sibling temp only while it is the very file ``claim`` records, checked
+    and removed as one file (:func:`remora.workspace.swap.remove_file`: one
+    handle that does not share deletion on Windows, a move into the private
+    staging directory in the layout's POSIX stand-in), so a file that
+    replaces the temp at its name at any instant, before the check or after
+    it, is never removed. Without ``claim`` (a compact killed between
+    creating the temp and writing the claim) or once the claimed file is
+    gone (renamed over the workspace by the swap), whatever is at the name
+    is left alone. Never the sibling's ``.wal``, a separate file at a
+    derived name, outside the staging directory, that no claim covers.
+    DuckDB creates and deletes that file itself, so a name found occupied
+    may be DuckDB's leftover or anyone else's file (one created after a
+    detach deleted the temp's own, say), and compact leaves it alone (#147).
     """
     tmp = _staging_temp(staging)
     if not _TEMP_BESIDE_STAGING:
-        return _own_temp_files(tmp)
-    try:
-        with open(staging / _STAGING_CLAIM, "rb") as claim_file:
-            claim = claim_file.read(4096)
-        st = os.lstat(tmp)
-    except OSError:
-        return ()
-    if not stat.S_ISREG(st.st_mode) or claim != _temp_claim(st):
-        return ()
-    return (tmp,)
+        _wal(tmp).unlink(missing_ok=True)
+        tmp.unlink(missing_ok=True)
+        return
+    # The check by name spares a file that plainly is not the temp the move
+    # into the staging directory the POSIX stand-in makes; remove_file checks
+    # again the file it removes, after the last moment it could be replaced.
+    if claim is None:
+        return
+    recorded: bytes = claim
+    if _same_file(tmp, recorded):
+        remove_file(tmp, lambda st: _is_claimed(st, recorded), holding=staging)
 
 
 def _replaced_temp(tmp: Path) -> str:
@@ -508,19 +527,16 @@ def _replaced_temp(tmp: Path) -> str:
     )
 
 
-def _remove_staging(staging: Path, temp: Sequence[Path]) -> None:
-    """Remove a staging directory this compact owns, and the ``temp`` files it owns.
+def _remove_staging(staging: Path) -> None:
+    """Remove a staging directory this compact owns, once its temp is dealt with.
 
-    ``temp`` is what the caller knows to be the compact's: the temp and its
-    ``.wal`` that this compact created, or :func:`_stale_temp_files` for
-    debris. They go first, in order, then the claim, and the marker last
-    before the directory, so a removal that fails part way leaves debris a
-    later compact still recognizes. Only the entries a compact creates are
-    removed, never a tree, so whatever else has appeared in the directory
-    makes the final ``rmdir`` fail rather than be deleted.
+    The caller first removes what of the temp is the compact's
+    (:func:`_remove_temp`). Then the claim goes, and the marker last before
+    the directory, so a removal that fails part way leaves debris a later
+    compact still recognizes. Only the entries a compact creates are removed,
+    never a tree, so whatever else has appeared in the directory makes the
+    final ``rmdir`` fail rather than be deleted.
     """
-    for path in temp:
-        path.unlink(missing_ok=True)
     (staging / _STAGING_CLAIM).unlink(missing_ok=True)
     (staging / _STAGING_MARKER).unlink(missing_ok=True)
     staging.rmdir()
@@ -1472,10 +1488,13 @@ class Workspace:
         staging directory only when it can prove the directory is this
         workspace's: a real directory owned by this user on POSIX, holding
         the marker naming this workspace and only the files a compact puts
-        there. On Windows it removes the sibling temp only while that is
-        still the file the claim names; a compact killed before writing the
-        claim leaves its temp for removal by hand, and whatever appears at
-        the name after the swap is left alone. Nothing claims the Windows
+        there. On Windows it swaps in or removes the sibling temp only as
+        the file the claim names, checked through the very handle the rename
+        or removal uses, so a file that replaces the temp at its name, even
+        right after a check, is never swapped in or removed; a compact
+        killed before writing the claim leaves its temp for removal by hand,
+        and whatever appears at the name after the swap is left alone.
+        Nothing claims the Windows
         temp's ``.wal``, a separate file at a derived name that DuckDB
         creates and deletes itself, so compact never removes one: a stale
         one, which a hard kill mid-copy can leave, is for removal by hand
@@ -1682,8 +1701,8 @@ class Workspace:
             # to anyone else; see _make_staging.
             staging: Path | None = None
             tmp_ours = False
-            # The identity of the Windows sibling temp this compact created.
-            tmp_claimed: os.stat_result | None = None
+            # The claim on the Windows sibling temp this compact created.
+            tmp_claim: bytes | None = None
             attached = False
             tmp_key: _FileKey | None = None
             try:
@@ -1695,7 +1714,8 @@ class Workspace:
                     # is left alone.
                     for stale in _own_stale_stagings(target):
                         try:
-                            _remove_staging(stale, _stale_temp_files(stale))
+                            _remove_temp(stale, _read_claim(stale))
+                            _remove_staging(stale)
                         except OSError as exc:
                             raise WorkspaceError(
                                 f"compact() could not remove {stale}, left by an earlier "
@@ -1729,7 +1749,7 @@ class Workspace:
                         # by a later compact, only while it is still that
                         # very file (see _create_temp_beside).
                         try:
-                            tmp_claimed = _create_temp_beside(staging)
+                            tmp_claim = _create_temp_beside(staging)
                         except FileExistsError as exc:
                             raise WorkspaceError(taken) from exc
                     tmp_ours = True
@@ -1737,7 +1757,7 @@ class Workspace:
                     assert row is not None
                     con.execute(f"ATTACH '{_quote_path(str(tmp))}' AS compact_dst")
                     attached = True
-                    if tmp_claimed is not None and not _same_file(tmp, tmp_claimed):
+                    if tmp_claim is not None and not _same_file(tmp, tmp_claim):
                         # Replaced between its creation and the ATTACH, so
                         # what is attached is someone else's file.
                         raise WorkspaceError(_replaced_temp(tmp))
@@ -1777,7 +1797,9 @@ class Workspace:
                             "rewritten file, so that file may not hold every row; it was "
                             f"not swapped in{left}. The workspace is unchanged"
                         )
-                    if tmp_claimed is not None and not _same_file(tmp, tmp_claimed):
+                    # An early refusal only: the swap below checks again the
+                    # file it renames.
+                    if tmp_claim is not None and not _same_file(tmp, tmp_claim):
                         raise WorkspaceError(_replaced_temp(tmp))
                     tmp_key = new_key = _file_key(tmp)
                     if new_key != key:
@@ -1791,7 +1813,25 @@ class Workspace:
                     # The temp is the target's sibling, or inside a directory
                     # that is, so the rename stays on one filesystem and keeps
                     # the inode.
-                    replace_file(tmp, target)
+                    if tmp_claim is None:
+                        replace_file(tmp, target)
+                    else:
+                        # After DETACH nothing holds the Windows temp, so the
+                        # file at its name can change after any check by
+                        # name. replace_file checks the claim through the
+                        # very handle it renames with (in the POSIX stand-in,
+                        # after moving the temp into the staging directory),
+                        # so what is swapped in is the file compact created.
+                        claim = tmp_claim
+                        try:
+                            replace_file(
+                                tmp,
+                                target,
+                                verify=lambda st: _is_claimed(st, claim),
+                                holding=staging,
+                            )
+                        except SourceReplacedError as exc:
+                            raise WorkspaceError(_replaced_temp(tmp)) from exc
                 except BaseException:
                     # Clean up while the source connection, and with it the
                     # exclusive lock, is still held. Only this compact's own
@@ -1799,7 +1839,7 @@ class Workspace:
                     # the swap has landed (an interrupt just after the rename),
                     # the temp it created, on Windows only while it is still
                     # the file claimed at its creation, and on POSIX the
-                    # temp's .wal (see _own_temp_files). Best effort, so the
+                    # temp's .wal (see _remove_temp). Best effort, so the
                     # error that brought us here is the one that propagates;
                     # whatever is left keeps its marker, and the next compact
                     # removes it.
@@ -1810,12 +1850,9 @@ class Workspace:
                             con.execute("DETACH compact_dst")
                     if staging is not None:
                         with suppress(OSError):
-                            _remove_staging(
-                                staging,
-                                _own_temp_files(tmp, tmp_claimed)
-                                if tmp_ours and not swapped
-                                else (),
-                            )
+                            if tmp_ours and not swapped:
+                                _remove_temp(staging, tmp_claim)
+                            _remove_staging(staging)
                     raise
                 # The temp is the workspace now. What is left is the staging
                 # directory this compact created, holding only its marker; its
@@ -1824,7 +1861,7 @@ class Workspace:
                 # process may already have started on the new file. That one
                 # may also find and remove it first, hence best effort.
                 with suppress(OSError):
-                    _remove_staging(staging, ())
+                    _remove_staging(staging)
             finally:
                 con.close()
         finally:
