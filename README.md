@@ -151,7 +151,11 @@ The planner adds fields needed by residual expressions automatically.
 Supported conjuncts are pushed to tshark as a display filter; other expressions
 are evaluated as Python residuals when supported there. An opaque Python
 callable passed to `filter()` runs in Python and forces whole-packet `-T ek`
-mode, even with `select()`. Other pushable conjuncts can still be pushed down.
+mode, even with `select()`. So does a residual expression that reads an
+`FT_OID` field, such as a value test on `SNMP.name`: `-T fields` would read an
+OID that tshark prints empty as absent (see `docs/semantics.md`). In ek mode
+every field is readable, selected or not. Other pushable conjuncts can still be
+pushed down.
 Inspect `cap.plan().explain()` to see the plan. Invalid literals and unsupported
 operations can raise rather than silently approximate.
 
