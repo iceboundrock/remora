@@ -467,12 +467,16 @@ same thing in `-T fields` and `-T ek`:
 | 5 | `snmp.name` | `2b 06 81` | `1.3.6` |
 | 6 | `snmp.name` | `2b 80 01` | `1.3.1` |
 | 7 | `snmp.name` | (none) | `0` |
+| 8 | `snmp.name` | `2b 06 ff 7f` | `1.3.6.16383` |
+| 9 | `snmp.name` | `2b 06 81 80 00` | `1.3.6.16384` |
+| 10 | `snmp.name` | `2b 06 01 02 01 00` | `1.3.6.1.2.1.0` |
+| 10 | `snmp.name` | `2b 06 01 02 01 03` | `1.3.6.1.2.1.3` |
 
 <!-- oid-forms:end -->
 
 A field value is always numeric dotted decimal. The names Wireshark resolves
 (`iso.3.6.1.4.1.9`, `joint-iso-itu-t.999.1`) appear in the protocol tree and
-the Info column, never in a field value. The last four rows are encodings no
+the Info column, never in a field value. Frames 4 to 7 carry encodings no
 conforming agent sends, and they show that the text does not determine the
 bytes:
 
@@ -484,6 +488,11 @@ bytes:
   from the text.
 - A non-minimal arc (`80 01`) prints as the minimal one would.
 - Empty content prints `0`.
+
+Frames 8 to 10 are well formed. Frames 8 and 9 put the arcs 16383 and 16384
+side by side, where the encoded length of an arc grows from two octets to
+three. Frame 10 carries one varbind on each side of the subtree
+`1.3.6.1.2.1.1` and none inside it.
 
 ### What reaches each engine
 
@@ -502,10 +511,16 @@ neither a string nor a byte needle. tshark does accept a bare dotted literal
 
 - tshark compares the encoded bytes, while Python and SQL compare the printed
   text. `snmp.name == 1.3.6` does not select frame 5, which prints `1.3.6`.
-- tshark orders OIDs arc by arc and the text orders character by character.
-  `snmp.name > 1.3.6.1.2.1.1.9` selects frames 3, 4, 5 and 6 on every build
-  (frame 3 for `.10`, frames 5 and 6 for their encodings), where the text
-  comparison selects frame 4 alone (`2.999.1`).
+- tshark orders OIDs by their content octets, compared byte by byte. That is
+  neither the text's order nor the numeric order of the arcs, even for well
+  formed values. It agrees with arc order at `.9` and `.10`, so
+  `snmp.name > 1.3.6.1.2.1.1.9` selects frame 3, where the text puts `.10`
+  below `.9`. It does not agree past an arc of 16383: `ff 7f` (16383) sorts
+  above `81 80 00` (16384), so `snmp.name > 1.3.6.16384` selects frame 8
+  (`1.3.6.16383`) on every build, which neither the text nor the arcs put
+  above it. The two orders can part only where the first arcs that differ take
+  different numbers of octets and the shorter takes two or more; with equal
+  lengths, or a one-octet arc against a longer one, they agree.
 - Two-arc literals lex differently by version: `snmp.name == 1.3` is an OID on
   4.2.2 and a rejected `Double` on 4.4.19 and 4.6.9.
 
@@ -516,6 +531,14 @@ malformed rows. Three consequences follow from the text representation:
 - `<`, `<=`, `>` and `>=` compare text, so `"1.3.6.1.2.1.1.10" < "1.3.6.1.2.1.1.9"`.
 - `contains("1.3.6.1.2.1.1")` also matches `1.3.6.1.2.1.10`.
 - A subtree test has to anchor on the dot: `matches(r"^1\.3\.6\.1\.2\.1\.1(\.|$)")`.
+
+A fourth holds for any representation. On a multi-value field such as
+`snmp.name`, each comparison is its own any-occurrence test, in Python, in SQL
+and on `-Y` alike. `(name >= "1.3.6.1.2.1.1") & (name < "1.3.6.1.2.1.2")`
+selects frame 10: `1.3.6.1.2.1.3` satisfies the first half and `1.3.6.1.2.1.0`
+the second, and neither is in the subtree. A membership range,
+`name.in_([(lo, hi)])`, is the one ordered test that all three engines apply
+to a single occurrence.
 
 `tests/test_dfilter.py::TestOid` pins the refusals, and the `oid-*` rows of
 `tests/test_semantics_table.py` run the three backends.
@@ -529,8 +552,8 @@ The text type is the one shipped. #149 compared it with two structured forms:
 
 | | `str` (shipped) | `tuple[int, ...]` | `OID` value object |
 | --- | --- | --- | --- |
-| order | text, wrong at `.9`/`.10` | arc by arc, as tshark | arc by arc, as tshark |
-| subtree test | regex anchored on `.` | slice compare | a method, or `>= p` and `< next(p)` |
+| order | text, wrong at `.9`/`.10` | numeric, arc by arc; not tshark's byte order | numeric, arc by arc; not tshark's byte order |
+| subtree test | regex anchored on `.` | slice compare | a method; `>= p` and `< next(p)` on a scalar field only |
 | stub type | `Field[str]` | needs a generic alias in `FTypeInfo.py_type: type[T]` | `Field[OID]`, imported like `UUID` |
 | literal | any string | not in the `Expr` literal union | `OID`, or dotted text through `coerce_literal` |
 | workspace column | `VARCHAR` | `UINTEGER[]` | `UINTEGER[]` |
@@ -539,8 +562,11 @@ The text type is the one shipped. #149 compared it with two structured forms:
 The recommendation is a small immutable `OID` class in `remora.values`. Until
 it lands, `str` stays, with the refusals above. The class should work like this:
 
-- It holds the arcs, orders by them, and renders `str(oid)` as the text tshark
-  prints.
+- It holds the arcs, orders by them numerically, and renders `str(oid)` as the
+  text tshark prints. Numeric arc order is the order this API proposes, not
+  tshark's: tshark orders the content octets, which puts `1.3.6.16383` above
+  `1.3.6.16384` (frames 8 and 9). No representation gives parity with `-Y`
+  ordering, which is one more reason value tests stay off `-Y`.
 - It is not a `str` subclass. A subclass would keep text order under `<`,
   which is the defect the type exists to fix.
 - It reads only canonical dotted decimal (one or more arcs, no leading zeros)
@@ -548,13 +574,25 @@ it lands, `str` stays, with the refusals above. The class should work like this:
   malformed text does, and `get_raw` still returns it.
 - `contains` and `matches` become `TypeError`, as on a GUID. A caller that
   needs the text has `str(oid)`.
-- A subtree query lowers to `>= p` and `< next(p)`, where `next(p)` increments
-  the last arc. Existing operators express that, with no new IR node.
+- A subtree test asks whether one occurrence starts with the arcs of `p`. On a
+  scalar field, `(f >= p) & (f < next(p))` answers it, where `next(p)`
+  increments the last arc, and existing operators express that with no new IR
+  node. On a multi-value field it does not, whatever the arcs' order: the two
+  halves are independent any-occurrence tests, so frame 10 matches
+  `p = 1.3.6.1.2.1.1` with no member of the subtree. `f.in_([(p, next(p))])`
+  does test one occurrence, but its range is closed, so it also selects
+  `next(p)` itself. The multi-value form therefore needs a new IR node, a
+  subtree test such as `f.within(p)` that every backend applies per
+  occurrence: in Python, any occurrence whose leading arcs equal `p`'s; in SQL,
+  the `list_filter` any-occurrence form that `in {lo .. hi}` already uses,
+  over `x[1:len(p)] = p`; on `-Y`, refused like every other value test. A
+  scalar field can lower to the same node, so the API has one spelling.
 - The column type moves to `UINTEGER[]` (`UINTEGER[][]` for a multi-value
   field), because DuckDB orders lists element by element, as the arcs order.
   A `VARCHAR` column would keep SQL on text order and fork it from Python.
-- Value tests stay refused on `-Y`. tshark's byte comparison still forks from
-  the arcs on the malformed rows above.
+- Value tests stay refused on `-Y`. tshark's byte comparison forks from the
+  arcs on the malformed rows above, and its order forks from them on well
+  formed values too (frames 8 and 9).
 
 Migration follows #69's precedent for GUIDs:
 

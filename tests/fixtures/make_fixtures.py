@@ -79,7 +79,7 @@ guid_eui64.pcap (5 packets) — FT_GUID and FT_EUI64 values (issue #69):
    struct order, so an ordered GUID filter that tshark evaluated would split
    the two builds
 
-oid.pcap (7 packets) — FT_OID renderings (issue #149). Every frame is an SNMP
+oid.pcap (10 packets) — FT_OID renderings (issue #149). Every frame is an SNMP
 message ``10.0.5.1 -> 10.0.5.2``; ``snmp.name`` is the varbind name, so it
 occurs once per varbind. Frames 4 to 7 carry encodings no conforming agent
 sends, to pin what tshark prints for them:
@@ -97,6 +97,11 @@ sends, to pin what tshark prints for them:
 6. GetResponse    ``snmp.name`` encoded ``2b 80 01``, a non-minimal arc:
    prints ``1.3.1``
 7. GetResponse    ``snmp.name`` encoded with no content octets: prints ``0``
+8. GetResponse    ``snmp.name`` = ``1.3.6.16383`` (``2b 06 ff 7f``)
+9. GetResponse    ``snmp.name`` = ``1.3.6.16384`` (``2b 06 81 80 00``): the
+   arc one above frame 8's, whose encoding tshark sorts below it
+10. GetResponse   ``snmp.name`` = ``1.3.6.1.2.1.0`` and ``1.3.6.1.2.1.3``: one
+   occurrence on each side of the subtree ``1.3.6.1.2.1.1``, none inside it
 
 Regenerate with::
 
@@ -625,6 +630,9 @@ def build_oid() -> bytes:
         response(5, b"\x2b\x06\x81"),
         response(6, b"\x2b\x80\x01"),
         response(7, b""),
+        response(8, oid_content((1, 3, 6, 16383))),
+        response(9, oid_content((1, 3, 6, 16384))),
+        response(10, oid_content((1, 3, 6, 1, 2, 1, 0)), oid_content((1, 3, 6, 1, 2, 1, 3))),
     ]
     return pcap_file(frames, base_ts=1700000500)
 

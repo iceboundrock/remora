@@ -652,7 +652,7 @@ CASES: tuple[Case, ...] = (
         ),
     ),
     Case(
-        # Text order: ".10" sorts below ".9", where tshark's arc order has it above.
+        # Text order: ".10" sorts below ".9", where tshark's byte order has it above.
         id="oid-gt-is-text-order",
         expr=OID_NAME > "1.3.6.1.2.1.1.9",
         dfilter=None,
@@ -683,6 +683,33 @@ CASES: tuple[Case, ...] = (
             (FakePacket({"snmp.name": ("1.3.6.1.2.1.1",)}), True),
             (FakePacket({"snmp.name": ("1.3.6.1.4.1.9", "1.3.6.1.2.1.1.9")}), True),
             (FakePacket({"snmp.name": ("1.3.6.1.2.1.10",)}), False),
+            # One occurrence on each side of the subtree, none inside it.
+            (FakePacket({"snmp.name": ("1.3.6.1.2.1.0", "1.3.6.1.2.1.3")}), False),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
+        # Not a subtree test on a multi-value field, in any representation: each
+        # half is its own any-occurrence test, so occurrences on opposite sides
+        # of 1.3.6.1.2.1.1 satisfy one half each (docs/semantics.md).
+        id="oid-independent-bounds-straddle-subtree",
+        expr=(OID_NAME >= "1.3.6.1.2.1.1") & (OID_NAME < "1.3.6.1.2.1.2"),
+        dfilter=None,
+        rows=(
+            (FakePacket({"snmp.name": ("1.3.6.1.2.1.0", "1.3.6.1.2.1.3")}), True),
+            (FakePacket({"snmp.name": ("1.3.6.1.2.1.1.9",)}), True),
+            (FakePacket({"snmp.name": ("1.3.6.1.2.1.3",)}), False),
+            (EMPTY, False),
+        ),
+    ),
+    Case(
+        # A membership range tests one occurrence against both bounds.
+        id="oid-range-is-one-occurrence",
+        expr=OID_NAME.in_([("1.3.6.1.2.1.1", "1.3.6.1.2.1.2")]),
+        dfilter=None,
+        rows=(
+            (FakePacket({"snmp.name": ("1.3.6.1.2.1.0", "1.3.6.1.2.1.3")}), False),
+            (FakePacket({"snmp.name": ("1.3.6.1.2.1.1.9",)}), True),
             (EMPTY, False),
         ),
     ),

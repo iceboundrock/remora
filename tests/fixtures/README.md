@@ -79,7 +79,7 @@ and as the epoch in `-T ek`. The capture is dated 2023-11-05, so tshark before
 `FT_OID` renderings (issue #149). Every frame is SNMP `10.0.5.1 → 10.0.5.2`.
 tshark prints each OID as numeric dotted text, the same in `-T fields` and
 `-T ek`, on 4.2.2, 4.4.19 and 4.6.9. Frames 4 to 7 carry encodings no conforming
-agent sends.
+agent sends; frames 8 to 10 are well formed.
 
 | # | Frame | Field values |
 |---|-------|--------------|
@@ -90,3 +90,6 @@ agent sends.
 | 5 | GetResponse, name encoded `2b 06 81` (unterminated arc) | `snmp.name` = `1.3.6` |
 | 6 | GetResponse, name encoded `2b 80 01` (non-minimal arc) | `snmp.name` = `1.3.1` |
 | 7 | GetResponse, name with no content octets | `snmp.name` = `0` |
+| 8 | GetResponse, name encoded `2b 06 ff 7f` | `snmp.name` = `1.3.6.16383` |
+| 9 | GetResponse, name encoded `2b 06 81 80 00` | `snmp.name` = `1.3.6.16384`: one arc above frame 8, but tshark's byte order sorts it below |
+| 10 | GetResponse, two varbinds | `snmp.name` = `1.3.6.1.2.1.0`, `1.3.6.1.2.1.3`: one on each side of the subtree `1.3.6.1.2.1.1`, none inside it |

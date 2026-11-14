@@ -76,8 +76,11 @@ accepted, but not pushed either, for three reasons:
   compare the text tshark prints. The two agree only for well-formed
   encodings. A truncated arc (``2b 06 81``) prints ``1.3.6`` but is not
   ``== 1.3.6`` on ``-Y``, and it sorts above ``1.3.6.1.2.1.1.9`` there.
-- The orders differ even for well-formed values: tshark's is arc by arc
-  (``1.3.6.1.2.1.1.9 < 1.3.6.1.2.1.1.10``) and a string's is not.
+- The orders differ even for well-formed values. tshark orders the content
+  octets byte by byte, which a string's order does not follow
+  (``1.3.6.1.2.1.1.9 < 1.3.6.1.2.1.1.10`` there) and numeric arc order does
+  not follow either: ``ff 7f`` (``1.3.6.16383``) sorts above ``81 80 00``
+  (``1.3.6.16384``).
 - Two-arc literals lex differently by version: ``snmp.name == 1.3`` is an OID
   on 4.2.2 and a rejected ``Double`` on 4.4.19 and 4.6.9.
 
