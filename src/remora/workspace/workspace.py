@@ -44,10 +44,16 @@ the claim retried against the new file on a mismatch.
 
 from __future__ import annotations
 
+import functools
 import os
+import re
+import secrets
+import stat
+import sys
+import tempfile
 import threading
 from collections.abc import Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import datetime
 from pathlib import Path
 from types import TracebackType
@@ -81,11 +87,16 @@ from remora.workspace.materialize import (
     detect_tshark_version,
     materialize_into,
 )
-from remora.workspace.permissions import copy_permissions
+from remora.workspace.permissions import copy_permissions, copy_permissions_to_descriptor
 from remora.workspace.query import Query
 from remora.workspace.schema import check_compatible, create_schema
 from remora.workspace.streams import StreamsResult, build_streams
-from remora.workspace.swap import replace_file
+from remora.workspace.swap import (
+    SourceReplacedError,
+    remove_file,
+    replace_file,
+    stat_unfollowed,
+)
 
 if TYPE_CHECKING:
     from duckdb import DuckDBPyConnection
@@ -95,6 +106,26 @@ __all__ = ["Workspace"]
 Mode = Literal["ro", "rw"]
 
 _MODES: tuple[Mode, ...] = ("ro", "rw")
+
+# compact()'s staging: one directory per compact, created beside the workspace
+# file as ``remora-compact-<16 hex digits>`` and marked as that workspace's by
+# a marker file inside (see _make_staging). The name does not embed the
+# workspace's, so its length is fixed whatever the workspace is called; the
+# marker alone says whose it is. On POSIX it holds the temp database and its
+# .wal; on Windows the temp is the sibling file ``<staging name>.tmp`` (see
+# _staging_temp), whose identity a claim file inside records.
+_STAGING_PREFIX: Final = "remora-compact-"
+_STAGING_TOKEN: Final = re.compile(r"[0-9a-f]{16}")
+_STAGING_MARKER: Final = "remora-compact"
+# The temp inside a POSIX staging directory. A fixed name, never the
+# workspace's, so no workspace name can collide with the marker.
+_STAGING_DB: Final = "compact.duckdb"
+_STAGING_CLAIM: Final = "temp-claim"
+
+# Whether the temp is the staging directory's sibling rather than inside it,
+# as on Windows (see _staging_temp). Read at call time, so a test can run the
+# Windows layout on any platform.
+_TEMP_BESIDE_STAGING: bool = sys.platform == "win32"
 
 # ``(st_dev, st_ino)`` normally; the resolved pathname only as a fallback for
 # a file that cannot be stat'ed (see :func:`_file_key`).
@@ -213,6 +244,325 @@ def _connect(path: str, *, read_only: bool) -> DuckDBPyConnection:
             "the remora workspace requires duckdb; install it with pip install 'remora[workspace]'"
         ) from exc
     return duckdb.connect(path, read_only=read_only)
+
+
+def _staging_marker(name: str) -> bytes:
+    """What compact()'s marker holds in a staging directory for workspace ``name``."""
+    return b"remora compact staging v1\n" + os.fsencode(name) + b"\n"
+
+
+def _wal(path: Path) -> Path:
+    """DuckDB's write-ahead log for the database at ``path``."""
+    return path.with_name(path.name + ".wal")
+
+
+def _staging_temp(staging: Path) -> Path:
+    """The temp database of the compact that owns ``staging``.
+
+    On POSIX the temp is inside the private staging directory. On Windows it
+    is beside the workspace, where DuckDB's share mode protects it and it
+    inherits the workspace directory's ACL rather than the staging
+    directory's (#147); the staging directory only reserves its name.
+    """
+    if _TEMP_BESIDE_STAGING:
+        return staging.with_name(staging.name + ".tmp")
+    return staging / _STAGING_DB
+
+
+def _temp_claim(st: os.stat_result) -> bytes:
+    """What the claim file holds for a sibling temp whose ``lstat`` is ``st``."""
+    return b"remora compact temp v1\n%d %d\n" % (st.st_dev, st.st_ino)
+
+
+def _write_exclusive(path: Path, data: bytes) -> None:
+    """Create ``path``, which must not exist, owner-only, holding ``data``."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+
+
+def _claim_temp(staging: Path, st: os.stat_result | None = None) -> bytes:
+    """Record in ``staging`` the identity of the sibling temp, and return the claim.
+
+    ``st`` is the temp's status. :func:`_create_temp_beside` passes the
+    :func:`os.fstat` of the descriptor it created the temp with, while it
+    still holds it open, so the file the claim names is provably this
+    compact's: on Windows nothing can remove or rename a file while a handle
+    without delete sharing is open on it. Without ``st`` the file now at the
+    temp's name is claimed, read by :func:`remora.workspace.swap.stat_unfollowed`.
+    A sibling is outside the staging directory, so its name alone proves
+    nothing: after the swap whatever appears at the name is another file.
+    The swap, a failing compact and a later one's cleanup act on the sibling
+    only while it is the very file claimed here, and check that through the
+    handle they act with (see :func:`_remove_temp`). On NTFS a file ID
+    carries a sequence number, so a file created after the temp is gone does
+    not take over its identity.
+    """
+    if st is None:
+        st = stat_unfollowed(_staging_temp(staging))
+    claim = _temp_claim(st)
+    _write_exclusive(staging / _STAGING_CLAIM, claim)
+    return claim
+
+
+def _read_claim(staging: Path) -> bytes | None:
+    """The claim a compact wrote into ``staging``, or ``None`` if there is none."""
+    try:
+        with open(staging / _STAGING_CLAIM, "rb") as claim_file:
+            return claim_file.read(4096)
+    except OSError:
+        return None
+
+
+@functools.cache
+def _empty_database_image() -> bytes:
+    """The bytes of a database file DuckDB has just created, holding nothing.
+
+    compact() writes these into the Windows sibling temp it creates itself:
+    DuckDB refuses to attach an empty file, and letting ``ATTACH`` create the
+    temp would leave no proof that what it attached is compact's (see
+    :func:`_create_temp_beside`). Made once per process in a directory of its
+    own; the file holds no row, so where it is made reveals nothing.
+    """
+    with tempfile.TemporaryDirectory(prefix="remora-compact-image-") as scratch:
+        image = Path(scratch) / _STAGING_DB
+        _connect(str(image), read_only=False).close()
+        data = image.read_bytes()
+        _wal(image).unlink(missing_ok=True)
+    return data
+
+
+def _is_claimed(st: os.stat_result, claim: bytes) -> bool:
+    """True when ``st`` is the status of the regular file ``claim`` records.
+
+    A reparse point (a symlink or junction, opened as itself) never is.
+    """
+    return (
+        stat.S_ISREG(st.st_mode)
+        and not getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+        and _temp_claim(st) == claim
+    )
+
+
+def _same_file(path: Path, claim: bytes) -> bool:
+    """True when ``path`` is, as of this call, the file ``claim`` records.
+
+    A check by name, which only refuses early: whatever is at a name can
+    change the next instant, so acting on the file goes through
+    :func:`remora.workspace.swap.replace_file` or :func:`_remove_temp`,
+    which check the file they act on.
+    """
+    try:
+        return _is_claimed(stat_unfollowed(path), claim)
+    except OSError:
+        return False
+
+
+def _create_temp_beside(staging: Path, source: Path) -> bytes:
+    """Create the Windows sibling temp of ``staging`` as a new, empty database.
+
+    A pathname found free proves nothing: another program can create a file
+    there before DuckDB would, and ``ATTACH`` would open it and a failing
+    compact remove it. So compact creates the file itself, with
+    ``O_CREAT | O_EXCL``, which fails on any existing entry instead of opening
+    it, writes :func:`_empty_database_image` into it and, while still holding
+    it open, records its identity in the claim (:func:`_claim_temp`). Created
+    in place, it inherits the workspace directory's ACL, as a file DuckDB
+    creates there would (#147). The returned claim is what the swap and every
+    later removal check the file they act on against, so a file that has
+    since replaced the temp at its name is never swapped in or removed.
+
+    Through the same descriptor, before anything is written into the file,
+    it gets the access restrictions of ``source``, the workspace file
+    (:func:`remora.workspace.permissions.copy_permissions_to_descriptor`).
+    The claim and the restrictions are thus bound to one file, the one this
+    call created: a file another program puts at the temp's name, at any
+    instant, keeps its own permissions (R8-F1), and ``ATTACH`` of it is
+    refused by the claim.
+
+    Raises:
+        FileExistsError: Something is already at the temp's name; it is left
+            alone.
+        WorkspaceError: ``source``'s restrictions could not be carried onto
+            the temp; the temp is removed.
+        OSError: The temp could not be created, filled or claimed; whatever
+            this call created is removed.
+    """
+    tmp = _staging_temp(staging)
+    image = _empty_database_image()
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+    claim: bytes | None = None
+    try:
+        with os.fdopen(fd, "wb") as f:
+            # The descriptor's own status: the file this call created, not
+            # whatever is at its name by now.
+            st = os.fstat(f.fileno())
+            claim = _temp_claim(st)
+            try:
+                copy_permissions_to_descriptor(source, f.fileno(), name=tmp)
+            except OSError as exc:
+                raise WorkspaceError(_restrictions_refused(source, exc)) from exc
+            f.write(image)
+            f.flush()
+            _claim_temp(staging, st)
+    except BaseException:
+        if claim is not None:
+            with suppress(OSError):
+                _remove_temp(staging, claim)
+        raise
+    return claim
+
+
+def _make_staging(target: Path) -> Path:
+    """Create and mark this compact's own staging directory beside ``target``.
+
+    The name is fresh, so nothing another program or another workspace
+    keeps beside ``target`` is ever reused or replaced: ``mkdir`` fails on
+    any existing entry and another name is tried, the way
+    :func:`tempfile.mkdtemp` does. ``0o700`` is never widened by the umask.
+    The marker naming ``target`` is what lets a later compact recognize the
+    directory as its own debris if this one is killed (see
+    :func:`_own_stale_stagings`).
+    """
+    while True:
+        staging = target.with_name(_STAGING_PREFIX + secrets.token_hex(8))
+        try:
+            os.mkdir(staging, 0o700)
+        except FileExistsError:
+            continue
+        break
+    try:
+        _write_exclusive(staging / _STAGING_MARKER, _staging_marker(target.name))
+    except BaseException:
+        with suppress(OSError):
+            _remove_staging(staging)
+        raise
+    return staging
+
+
+def _is_own_stale_staging(staging: Path, name: str) -> bool:
+    """True when ``staging`` is provably a compact staging directory of workspace ``name``.
+
+    Every condition must hold: a real directory (not a symlink or junction),
+    owned by this user on POSIX, holding the marker naming ``name`` and
+    nothing but the regular files a compact creates there. Anything else may
+    belong to someone else and is left alone. On Windows this says nothing
+    about the sibling temp, which :func:`_remove_temp` judges by its claim.
+    """
+    try:
+        st = os.lstat(staging)
+        if not stat.S_ISDIR(st.st_mode):
+            return False
+        if getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+            return False
+        if hasattr(os, "geteuid") and st.st_uid != os.geteuid():
+            return False
+        allowed = {_STAGING_MARKER}
+        if _TEMP_BESIDE_STAGING:
+            allowed.add(_STAGING_CLAIM)
+        else:
+            allowed |= {_STAGING_DB, _STAGING_DB + ".wal"}
+        entries = os.listdir(staging)
+        if _STAGING_MARKER not in entries or not set(entries) <= allowed:
+            return False
+        if not all(stat.S_ISREG(os.lstat(staging / entry).st_mode) for entry in entries):
+            return False
+        expected = _staging_marker(name)
+        with open(staging / _STAGING_MARKER, "rb") as marker:
+            return marker.read(len(expected) + 1) == expected
+    except OSError:
+        return False
+
+
+def _own_stale_stagings(target: Path) -> list[Path]:
+    """The staging directories earlier, interrupted compacts of ``target`` left.
+
+    Only called with ``target``'s exclusive lock held, so no compact of it is
+    in flight: a staging directory of ``target`` is either debris or that of a
+    compact that has already swapped and is about to remove it. Candidates
+    are the exact ``remora-compact-<16 hex digits>`` names, and each must
+    pass :func:`_is_own_stale_staging` for ``target``'s name, so the staging
+    of another workspace in the same directory is never a candidate. A
+    directory that cannot be listed yields none.
+    """
+    try:
+        names = os.listdir(target.parent)
+    except OSError:
+        return []
+    return [
+        target.with_name(entry)
+        for entry in sorted(names)
+        if entry.startswith(_STAGING_PREFIX)
+        and _STAGING_TOKEN.fullmatch(entry[len(_STAGING_PREFIX) :])
+        and _is_own_stale_staging(target.with_name(entry), target.name)
+    ]
+
+
+def _remove_temp(staging: Path, claim: bytes | None) -> None:
+    """Remove what of the temp of ``staging``'s compact provably is that compact's.
+
+    Inside a POSIX staging directory, the temp and its ``.wal``, whatever is
+    there: only the owner can put anything in it. In the Windows layout the
+    sibling temp only while it is the very file ``claim`` records, checked
+    and removed as one file (:func:`remora.workspace.swap.remove_file`: one
+    handle that does not share deletion on Windows, a move into the private
+    staging directory in the layout's POSIX stand-in), so a file that
+    replaces the temp at its name at any instant, before the check or after
+    it, is never removed. Without ``claim`` (a compact killed between
+    creating the temp and writing the claim) or once the claimed file is
+    gone (renamed over the workspace by the swap), whatever is at the name
+    is left alone. Never the sibling's ``.wal``, a separate file at a
+    derived name, outside the staging directory, that no claim covers.
+    DuckDB creates and deletes that file itself, so a name found occupied
+    may be DuckDB's leftover or anyone else's file (one created after a
+    detach deleted the temp's own, say), and compact leaves it alone (#147).
+    """
+    tmp = _staging_temp(staging)
+    if not _TEMP_BESIDE_STAGING:
+        _wal(tmp).unlink(missing_ok=True)
+        tmp.unlink(missing_ok=True)
+        return
+    # The check by name spares a file that plainly is not the temp the move
+    # into the staging directory the POSIX stand-in makes; remove_file checks
+    # again the file it removes, after the last moment it could be replaced.
+    if claim is None:
+        return
+    recorded: bytes = claim
+    if _same_file(tmp, recorded):
+        remove_file(tmp, lambda st: _is_claimed(st, recorded), holding=staging)
+
+
+def _restrictions_refused(source: Path, exc: OSError) -> str:
+    """The refusal when the temp cannot be given the workspace's restrictions."""
+    return (
+        f"compact() could not give the rewritten file the access restrictions of {source} "
+        f"({exc}), and refuses rather than copy the workspace into a file other users may "
+        "be able to open. The workspace is unchanged"
+    )
+
+
+def _replaced_temp(tmp: Path) -> str:
+    """The refusal when the Windows sibling temp is no longer the file compact created."""
+    return (
+        f"compact() found {tmp}, the file it created to rewrite the workspace into, "
+        "replaced by a file it did not create, and refuses rather than write into, swap "
+        "in or remove it. The workspace is unchanged"
+    )
+
+
+def _remove_staging(staging: Path) -> None:
+    """Remove a staging directory this compact owns, once its temp is dealt with.
+
+    The caller first removes what of the temp is the compact's
+    (:func:`_remove_temp`). Then the claim goes, and the marker last before
+    the directory, so a removal that fails part way leaves debris a later
+    compact still recognizes. Only the entries a compact creates are removed,
+    never a tree, so whatever else has appeared in the directory makes the
+    final ``rmdir`` fail rather than be deleted.
+    """
+    (staging / _STAGING_CLAIM).unlink(missing_ok=True)
+    (staging / _STAGING_MARKER).unlink(missing_ok=True)
+    staging.rmdir()
 
 
 def _quote_path(path: str) -> str:
@@ -1138,13 +1488,42 @@ class Workspace:
 
         A checkpoint only truncates trailing free blocks, so a file stays
         large after scattered deletes; this copies every schema, table and
-        row into ``<name>.compacting`` beside the original (same directory,
-        so the final rename never crosses a filesystem) and atomically
-        swaps it in by renaming the temp over the open original. The
-        original is only ever replaced whole: an interruption at any point
-        leaves it intact, and at worst a stale temp file — plus the ``.wal``
-        sidecar a hard kill mid-copy can leave beside it — that the next
-        compact removes.
+        row into a temp database and atomically swaps it in by renaming the
+        temp over the open original. Each compact creates its own staging
+        directory beside the original, ``remora-compact-<16 hex digits>``,
+        under a name nothing else holds, with a marker file naming the
+        workspace. The name is the same length whatever the workspace is
+        called, so a workspace whose name is near the filesystem's limit
+        compacts too. On POSIX the temp is written inside it as
+        ``compact.duckdb``, and only the owner can enter it; on Windows the
+        directory only reserves the name, and the temp is the sibling file
+        ``remora-compact-<16 hex digits>.tmp``, which compact creates itself,
+        exclusively, and fills with an empty database before ``ATTACH``; a
+        claim file in the directory records its identity while the creating
+        handle is still open. Either way the
+        temp is renamed over the original from the same directory or one
+        inside it, so the final rename never crosses a filesystem, and the
+        staging directory is removed after the swap.
+        The original is only ever replaced whole: an interruption at any
+        point leaves it intact, and at worst a stale staging directory (with
+        the temp and the ``.wal`` sidecar a hard kill mid-copy can leave)
+        that the next compact removes once it holds the lock. It removes a
+        staging directory only when it can prove the directory is this
+        workspace's: a real directory owned by this user on POSIX, holding
+        the marker naming this workspace and only the files a compact puts
+        there. On Windows it swaps in or removes the sibling temp only as
+        the file the claim names, checked through the very handle the rename
+        or removal uses, so a file that replaces the temp at its name, even
+        right after a check, is never swapped in or removed; a compact
+        killed before writing the claim leaves its temp for removal by hand,
+        and whatever appears at the name after the swap is left alone.
+        Nothing claims the Windows
+        temp's ``.wal``, a separate file at a derived name that DuckDB
+        creates and deletes itself, so compact never removes one: a stale
+        one, which a hard kill mid-copy can leave, is for removal by hand
+        too. Anything else beside the workspace is never removed,
+        whatever its name, including the ``<name>.compacting`` file a remora
+        from before #147 used as its temp: delete such debris by hand.
 
         A workspace addressed through a symlink is compacted at its
         *resolved* target: the temp lives beside the real file and the swap
@@ -1158,21 +1537,45 @@ class Workspace:
         whole duration), but a hardlinked alias goes on referring to the
         pre-compact file.
 
-        Access restrictions survive the swap, and the temp has them before
-        it holds any data. DuckDB creates the temp with this process's
-        defaults (the umask on POSIX, the directory's inherited ACL on
-        Windows). As soon as the temp exists, while it is still an empty
-        database, :func:`remora.workspace.permissions.copy_permissions`
-        gives it the source's mode bits and, on Windows, the source's DACL
-        and its inheritance setting. A ``0o640`` workspace stays ``0o640``,
-        and a Windows workspace made private inside a shared directory stays
-        private (#132). If the restrictions cannot be carried over, compact
+        Access restrictions survive the swap. The temp and its ``.wal`` are
+        created with this process's defaults (the umask on POSIX, the
+        directory's inherited ACL on Windows): on POSIX DuckDB creates both
+        at ``ATTACH``, and on Windows compact creates the temp itself before
+        ``ATTACH`` and DuckDB creates its ``.wal``. So each platform keeps
+        other users away from them while they hold rows. On POSIX that is the
+        ``0o700`` directory they are created in, which no other user can
+        enter: a descriptor opened on the temp before its mode is set, or on
+        its ``.wal``, which no mode is ever set on, needs a path through that
+        directory (#147). On Windows DuckDB holds both without read or write
+        sharing from ``ATTACH`` on, before any row is written. Whatever the
+        platform, while the temp is still an empty database it gets the
+        source's mode bits and, on Windows, the source's DACL and its
+        inheritance setting, so the compacted file is exactly as restricted
+        as the workspace was: a ``0o640`` workspace stays ``0o640``, and a
+        Windows workspace made private inside a shared directory stays
+        private (#132). On POSIX
+        :func:`remora.workspace.permissions.copy_permissions` sets them by
+        name right after ``ATTACH``, inside the private directory. On Windows,
+        where the temp's name is in the shared directory and another program
+        can put its own file there at any instant,
+        :func:`remora.workspace.permissions.copy_permissions_to_descriptor`
+        sets them before ``ATTACH``, through the descriptor that created the
+        temp and from which its claim was read, so they reach only that file
+        and never one at its name (R8-F1). If the restrictions cannot be carried over, compact
         raises :class:`WorkspaceError` before copying any row, and the
         workspace is unchanged. Ownership and other metadata follow the
         fresh file, because changing them would need privileges compact does
-        not assume. DuckDB creates its ``.wal`` sidecars, the temp's
-        included, with the defaults, so the directory's permissions protect
-        a workspace's data and the file's alone do not (#147).
+        not assume.
+
+        None of that reaches the workspace's *own* ``.wal``, which DuckDB
+        creates with the process defaults when a commit first writes to it
+        (a ``0o600`` database gets a ``0o644`` ``.wal`` under umask ``022``)
+        and which holds committed rows until the next checkpoint. remora has
+        no hook between DuckDB creating it and writing to it, so the boundary
+        that keeps other users from a workspace's data is its *directory*:
+        keep a sensitive workspace in a directory only its owner can enter,
+        such as ``0o700``. compact never changes that directory's
+        permissions.
 
         The swap is :func:`remora.workspace.swap.replace_file`: ``os.replace``
         on POSIX, and on Windows a POSIX-semantics rename
@@ -1206,7 +1609,11 @@ class Workspace:
         Cleanup of stale artifacts from an earlier crash happens only
         *after* that exclusive lock is held, so a compact that loses the
         lock modifies nothing at all — including another process's
-        in-flight temp file.
+        in-flight staging. A failed compact removes its own temp and staging
+        directory before it closes the source connection. After the swap a
+        compact in another process may already have started on the new file;
+        the finishing compact then removes only its own staging directory,
+        whose name no other compact uses.
 
         Within this process the file lock cannot arbitrate, since
         same-process connections share one DuckDB instance; a module-level
@@ -1248,10 +1655,19 @@ class Workspace:
                 the temp (refused before any row is copied), or if the
                 Windows swap is refused (a handle without delete sharing —
                 duckdb older than 1.5.0 or a scanner — or a Windows/volume
-                without POSIX rename semantics, #85).
+                without POSIX rename semantics, #85). Also if a stale
+                staging directory of this workspace from an earlier crash
+                cannot be removed, if on Windows a file it did not create is
+                already at its temp's name or replaces the temp before the
+                swap (that file is left alone), or if the temp's ``.wal``
+                outlives its detach, so the temp may lack rows; the
+                workspace is unchanged in each case.
             OSError: An unclassified failure from the swap, unchanged. This
                 includes :class:`PermissionError` for Windows access denied
-                (error 5), which may mean missing delete permission.
+                (error 5), which may mean missing delete permission. Also a
+                failure to create the staging directory or one of the files
+                compact keeps in it, such as a workspace directory this
+                process cannot write; the workspace is unchanged.
         """
         self._require_open()
         if self._mode == "ro":
@@ -1309,37 +1725,114 @@ class Workspace:
         # identity the live file is about to have (see below).
         claimed_new_key: _FileKey | None = None
         try:
-            tmp = target.with_name(target.name + ".compacting")
-            tmp_wal = tmp.with_name(tmp.name + ".wal")
+            # This compact's own staging directory, with a fresh name and a
+            # marker naming the workspace, so nothing it removes can belong
+            # to anyone else; see _make_staging.
+            staging: Path | None = None
+            tmp_ours = False
+            # The claim on the Windows sibling temp this compact created.
+            tmp_claim: bytes | None = None
+            attached = False
+            tmp_key: _FileKey | None = None
             try:
                 try:
-                    # Now that the lock is ours, any temp beside the source
-                    # is debris from an earlier crash, never a live compact.
-                    tmp.unlink(missing_ok=True)
-                    tmp_wal.unlink(missing_ok=True)
+                    # Now that the lock is ours no compact of this workspace
+                    # is in flight, so a staging directory that provably is
+                    # one of its compacts' is debris from an earlier crash.
+                    # Anything else beside the workspace, whatever its name,
+                    # is left alone.
+                    for stale in _own_stale_stagings(target):
+                        try:
+                            _remove_temp(stale, _read_claim(stale))
+                            _remove_staging(stale)
+                        except OSError as exc:
+                            raise WorkspaceError(
+                                f"compact() could not remove {stale}, left by an earlier "
+                                f"interrupted compact ({exc}); remove it and retry. The "
+                                "workspace is unchanged"
+                            ) from exc
+                    # On POSIX the temp is created inside this private
+                    # directory, so no other user can open it or its .wal
+                    # while rows are written; see the docstring. On Windows
+                    # the temp sits beside the workspace, where DuckDB's
+                    # share mode already shuts other handles out and the file
+                    # inherits the directory's ACL rather than a staging
+                    # directory's.
+                    staging = _make_staging(target)
+                    tmp = _staging_temp(staging)
+                    tmp_wal = _wal(tmp)
+                    taken = (
+                        f"compact() found {tmp} or its .wal already present, which it "
+                        "did not create, and refuses rather than write into or remove "
+                        "it. The workspace is unchanged"
+                    )
+                    if os.path.lexists(tmp) or os.path.lexists(tmp_wal):
+                        # Only possible on Windows, where the temp is outside
+                        # the fresh directory. ATTACH would open what is there.
+                        raise WorkspaceError(taken)
+                    if _TEMP_BESIDE_STAGING:
+                        # A name found free proves nothing: another program
+                        # can create a file there at any moment. So the temp
+                        # is created here, exclusively, and claimed and given
+                        # the workspace's restrictions through the descriptor
+                        # that created it; from then on it is removed, here or
+                        # by a later compact, only while it is still that
+                        # very file (see _create_temp_beside).
+                        try:
+                            tmp_claim = _create_temp_beside(staging, target)
+                        except FileExistsError as exc:
+                            raise WorkspaceError(taken) from exc
+                    tmp_ours = True
                     row = con.execute("SELECT current_database()").fetchone()
                     assert row is not None
                     con.execute(f"ATTACH '{_quote_path(str(tmp))}' AS compact_dst")
-                    # DuckDB has just created the temp with this process's
-                    # defaults (the umask; on Windows the directory's
-                    # inherited ACL), which may be wider than the workspace
-                    # file's own restrictions. Carry those over while the
-                    # temp is still an empty database, so no row is ever
-                    # written into it while it is more open than the
-                    # workspace (its .wal sidecar is out of reach, #147). If
-                    # that is impossible, refuse before copying anything.
-                    try:
-                        copy_permissions(target, tmp)
-                    except OSError as exc:
-                        raise WorkspaceError(
-                            f"compact() could not give the rewritten file the access "
-                            f"restrictions of {target} ({exc}), and refuses rather than copy "
-                            "the workspace into a file other users may be able to open. "
-                            "The workspace is unchanged"
-                        ) from exc
+                    attached = True
+                    if tmp_claim is not None:
+                        # _create_temp_beside already gave the Windows temp
+                        # the workspace's restrictions, through the descriptor
+                        # that created and claimed it, so nothing here changes
+                        # a file by name (R8-F1). Replaced between its
+                        # creation and the ATTACH, what is attached is someone
+                        # else's file, left with its own permissions.
+                        if not _same_file(tmp, tmp_claim):
+                            raise WorkspaceError(_replaced_temp(tmp))
+                    else:
+                        # DuckDB has just created the POSIX temp with the
+                        # umask, which may be wider than the workspace file's
+                        # own mode. Carry that over while the temp is still an
+                        # empty database, so the compacted file ends up exactly
+                        # as restricted as the workspace; if that is
+                        # impossible, refuse before copying. By name, which is
+                        # safe only because the temp is inside the private
+                        # staging directory, where no other user can put a
+                        # file at that name.
+                        try:
+                            copy_permissions(target, tmp)
+                        except OSError as exc:
+                            raise WorkspaceError(_restrictions_refused(target, exc)) from exc
                     con.execute(f"COPY FROM DATABASE {_quote_ident(str(row[0]))} TO compact_dst")
                     con.execute("DETACH compact_dst")
-                    new_key = _file_key(tmp)
+                    attached = False
+                    # DETACH checkpoints the temp and deletes its .wal. Only
+                    # the database file is swapped in, so rows still in a .wal
+                    # would be lost with it: refuse rather than install them.
+                    if os.path.lexists(tmp_wal):
+                        left = (
+                            ", and the .wal is left for removal by hand, since nothing "
+                            "proves it is the temp's own"
+                            if _TEMP_BESIDE_STAGING
+                            else ""
+                        )
+                        raise WorkspaceError(
+                            f"compact() found {tmp_wal} still present after detaching the "
+                            "rewritten file, so that file may not hold every row; it was "
+                            f"not swapped in{left}. The workspace is unchanged"
+                        )
+                    # An early refusal only: the swap below checks again the
+                    # file it renames.
+                    if tmp_claim is not None and not _same_file(tmp, tmp_claim):
+                        raise WorkspaceError(_replaced_temp(tmp))
+                    tmp_key = new_key = _file_key(tmp)
                     if new_key != key:
                         # The temp is private to this compact (fresh file, held
                         # exclusive lock on the source), so claiming its identity
@@ -1348,15 +1841,60 @@ class Workspace:
                         # after the swap but before this compact fully ends.
                         _begin_compact(new_key, target)
                         claimed_new_key = new_key
-                    replace_file(tmp, target)
-                finally:
-                    con.close()
-            except BaseException:
-                # Only artifacts this compact created: the connect above
-                # succeeded, so nothing here belongs to another process.
-                tmp.unlink(missing_ok=True)
-                tmp_wal.unlink(missing_ok=True)
-                raise
+                    # The temp is the target's sibling, or inside a directory
+                    # that is, so the rename stays on one filesystem and keeps
+                    # the inode.
+                    if tmp_claim is None:
+                        replace_file(tmp, target)
+                    else:
+                        # After DETACH nothing holds the Windows temp, so the
+                        # file at its name can change after any check by
+                        # name. replace_file checks the claim through the
+                        # very handle it renames with (in the POSIX stand-in,
+                        # after moving the temp into the staging directory),
+                        # so what is swapped in is the file compact created.
+                        claim = tmp_claim
+                        try:
+                            replace_file(
+                                tmp,
+                                target,
+                                verify=lambda st: _is_claimed(st, claim),
+                                holding=staging,
+                            )
+                        except SourceReplacedError as exc:
+                            raise WorkspaceError(_replaced_temp(tmp)) from exc
+                except BaseException:
+                    # Clean up while the source connection, and with it the
+                    # exclusive lock, is still held. Only this compact's own
+                    # artifacts are removed: its staging directory and, unless
+                    # the swap has landed (an interrupt just after the rename),
+                    # the temp it created, on Windows only while it is still
+                    # the file claimed at its creation, and on POSIX the
+                    # temp's .wal (see _remove_temp). Best effort, so the
+                    # error that brought us here is the one that propagates;
+                    # whatever is left keeps its marker, and the next compact
+                    # removes it.
+                    swapped = tmp_key is not None and _file_key(target) == tmp_key
+                    if attached:
+                        # Windows cannot remove a file DuckDB holds open.
+                        with suppress(Exception):
+                            con.execute("DETACH compact_dst")
+                    if staging is not None:
+                        with suppress(OSError):
+                            if tmp_ours and not swapped:
+                                _remove_temp(staging, tmp_claim)
+                            _remove_staging(staging)
+                    raise
+                # The temp is the workspace now. What is left is the staging
+                # directory this compact created, holding only its marker; its
+                # name is this compact's alone, so removing it cannot touch
+                # another compact's staging even though a compact in another
+                # process may already have started on the new file. That one
+                # may also find and remove it first, hence best effort.
+                with suppress(OSError):
+                    _remove_staging(staging)
+            finally:
+                con.close()
         finally:
             # Both identities stay flagged until here, which is *after* the
             # inner finally closed the source connection: DuckDB's instance
