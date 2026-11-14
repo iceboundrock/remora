@@ -26,12 +26,27 @@ A capture forced into ek mode this way parses whole packets, and, having no
 projection, answers every field name, including fields it never selected.
 ``plan().mode`` says which mode a query runs in.
 
-The two modes differ in exactly one observable way, and it is deliberate: a
-field *outside* a fields-mode projection raises ``FieldNotProjectedError``,
-because not having asked for a field is a caller bug rather than field absence,
-while ek mode has no projection to be outside of and answers every field name.
-Absence itself is unchanged either way — ``()`` from ``get_raw``, ``None`` from
-scalar instance access, ``()`` from multi instance access.
+The two modes differ observably in two ways. One is deliberate: a field
+*outside* a fields-mode projection raises ``FieldNotProjectedError``, because
+not having asked for a field is a caller bug rather than field absence, while
+ek mode has no projection to be outside of and answers every field name.
+
+The other is a reader limitation, not a design choice: ``-T fields`` prints a
+field whose only occurrence is the empty string as an empty column, which is
+how it prints absence too, so the fields reader reports such a field as absent,
+while ``-T ek`` keeps the empty occurrence. A selected ``snmp.name`` whose lone
+value is an OID tshark prints empty reads ``("",)`` from ``get_raw`` in ek mode
+and ``()`` in fields mode; a lone empty value of any other field differs the
+same way. Empty occurrences among several survive both modes. The "Absent vs.
+empty" section of :mod:`remora.reader.fields_reader` documents the limitation,
+and ``docs/semantics.md`` ("Reader representation: object identifiers") what it
+costs for OIDs; it is why an OID residual forces ek mode above.
+
+So the absence *contract* is the same in both modes — an absent field is ``()``
+from ``get_raw``, ``None`` from scalar instance access and ``()`` from multi
+instance access — but which fields count as absent is not: fields mode cannot
+tell a lone empty value from absence and so reports it through that contract,
+where ek mode reports the empty value.
 
 Lifecycle: the ``try/finally`` in ``__iter__`` guarantees ``close()`` on the
 subprocess however iteration ends — exhaustion, early ``break``, a consumer
@@ -97,8 +112,16 @@ class Capture:
     opaque callable, and a residual ``Expr`` that reads an ``FT_OID`` field.
     Such a capture parses whole packets and answers every field name, selected
     or not; ``plan().mode`` says which mode a query runs in. See :meth:`select`
-    and the module docstring for why, and for why the projection check is the
-    one difference between the two modes.
+    and the module docstring for why.
+
+    The projection check is not the only difference between the modes. A
+    selected field whose only occurrence is the empty string (an OID with an
+    arc of 2**32 or more, say) reads as that empty occurrence in ek mode but as
+    absent in fields mode, because ``-T fields`` prints both as an empty
+    column; the module docstring and the "Absent vs. empty" section of
+    :mod:`remora.reader.fields_reader` have the details. Absence is reported
+    the same way in both modes; fields mode just counts that one case as
+    absence.
 
     "Immutable" is about the *query*: the terms, the path and the binary
     never change after construction. The one mutable field is a memo —

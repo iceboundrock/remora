@@ -214,7 +214,9 @@ class TestProjectedPath:
         assert dns[TCP].port == ()
 
     def test_unprojected_field_raises_rather_than_reading_as_absent(self) -> None:
-        # The one observable difference between the two modes. udp.dstport is
+        # The deliberate difference between the two modes (the other, a lone
+        # empty value reading as absent in fields mode, is a reader limitation
+        # tests/integration/test_oid.py pins). udp.dstport is
         # genuinely present on frame 3 — the ek path answers 53 for it — so a
         # row that reported () here would be indistinguishable from real
         # absence and would silently drop the packet from a residual.
