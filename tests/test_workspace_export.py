@@ -186,6 +186,19 @@ class TestPathQuoting:
         assert read_table(out).num_rows == len(ROWS)
 
 
+def symlink_or_skip(link: Path, target: Path) -> None:
+    """Create ``link`` pointing at ``target``, or skip where this OS refuses.
+
+    ``windows-latest`` creates symlinks unprivileged, but a Windows host
+    without Developer Mode or ``SeCreateSymbolicLinkPrivilege`` refuses with
+    an ``OSError``; that is the one real obstacle, so it is the skip's reason.
+    """
+    try:
+        link.symlink_to(target)
+    except OSError as exc:
+        pytest.skip(f"cannot create a symlink here: {exc}")
+
+
 def assert_still_a_workspace(path: Path) -> None:
     """The workspace file is untouched: not Parquet, and still openable."""
     with open(path, "rb") as handle:
@@ -206,17 +219,15 @@ class TestDestinationGuard:
             ws.export_parquet("pkts", ws_path)
         assert_still_a_workspace(ws_path)
 
-    @pytest.mark.skipif(os.name != "posix", reason="symlinks need privileges on Windows")
     def test_symlink_to_the_workspace_is_refused(self, ws_path: Path, tmp_path: Path) -> None:
         # A pathname comparison misses this; file identity does not.
         alias = tmp_path / "alias.duckdb"
-        alias.symlink_to(ws_path)
+        symlink_or_skip(alias, ws_path)
         with Workspace(ws_path) as ws, pytest.raises(WorkspaceError, match="database file itself"):
             ws.export_parquet("pkts", alias)
         assert alias.is_symlink()
         assert_still_a_workspace(ws_path)
 
-    @pytest.mark.skipif(os.name != "posix", reason="hard links need privileges on Windows")
     def test_hard_link_to_the_workspace_is_refused(self, ws_path: Path, tmp_path: Path) -> None:
         alias = tmp_path / "hardlink.duckdb"
         os.link(ws_path, alias)
@@ -225,14 +236,13 @@ class TestDestinationGuard:
         assert os.stat(alias).st_ino == os.stat(ws_path).st_ino
         assert_still_a_workspace(ws_path)
 
-    @pytest.mark.skipif(os.name != "posix", reason="symlinks need privileges on Windows")
     def test_workspace_opened_through_a_symlink_is_protected_both_ways(
         self, ws_path: Path, tmp_path: Path
     ) -> None:
         # DuckDB reports the resolved path, so the guard checks the resolved
         # form as well as the reported one and catches either spelling.
         alias = tmp_path / "opened-through.duckdb"
-        alias.symlink_to(ws_path)
+        symlink_or_skip(alias, ws_path)
         with Workspace(alias) as ws:
             with pytest.raises(WorkspaceError, match="database file itself"):
                 ws.export_parquet("pkts", ws_path)
@@ -271,7 +281,6 @@ class TestDestinationGuard:
             con.close()
         assert out.exists()
 
-    @pytest.mark.skipif(os.name != "posix", reason="symlinks need privileges on Windows")
     def test_link_planted_after_the_check_cannot_reach_the_workspace(
         self, ws_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -283,7 +292,7 @@ class TestDestinationGuard:
         # link, so the workspace inode is never opened.
         monkeypatch.setattr(export_module, "_check_destination", lambda target, database: None)
         out = tmp_path / "planted.parquet"
-        out.symlink_to(ws_path)
+        symlink_or_skip(out, ws_path)
         with Workspace(ws_path) as ws:
             ws.export_parquet("pkts", out)
         assert not out.is_symlink()
@@ -291,7 +300,6 @@ class TestDestinationGuard:
             assert handle.read(4) == b"PAR1"
         assert_still_a_workspace(ws_path)
 
-    @pytest.mark.skipif(os.name != "posix", reason="hard links need privileges on Windows")
     def test_hard_link_planted_after_the_check_cannot_reach_the_workspace(
         self, ws_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -299,6 +307,9 @@ class TestDestinationGuard:
         out = tmp_path / "planted-hard.parquet"
         os.link(ws_path, out)
         db_inode = os.stat(ws_path).st_ino
+        # On Windows too the rename replaces the planted name although the ro
+        # Workspace holds the database open through its other name: duckdb
+        # >= 1.5.0 opens it with FILE_SHARE_DELETE (src/remora/workspace/AGENTS.md).
         with Workspace(ws_path) as ws:
             ws.export_parquet("pkts", out)
         assert os.stat(out).st_ino != db_inode
