@@ -250,14 +250,57 @@ def _probe_compact(
     monkeypatch.setattr(workspace_module, "_connect", connect)
 
 
-def _compact_temp(path: Path) -> Path:
-    """Where compact() creates its temp database for the workspace at ``path``.
+def _stagings(path: Path) -> list[Path]:
+    """compact()'s staging directories beside the workspace at ``path`` (#147)."""
+    prefix = path.name + ".compacting-"
+    return sorted(
+        p
+        for p in path.parent.iterdir()
+        if p.name.startswith(prefix) and p.is_dir() and not p.is_symlink()
+    )
 
-    On POSIX inside the private ``<name>.compacting`` directory, on Windows
-    the file ``<name>.compacting`` beside the workspace.
+
+def _compact_temp(path: Path) -> Path:
+    """The temp database of the one compact in flight on the workspace at ``path``.
+
+    On POSIX ``<name>`` inside its private staging directory, on Windows the
+    staging directory's sibling ``<staging name>.tmp``.
     """
-    scratch = path.with_name(path.name + ".compacting")
-    return scratch if sys.platform == "win32" else scratch / path.name
+    (staging,) = _stagings(path)
+    return workspace_module._staging_temp(staging, path.name)
+
+
+def _stale_staging(path: Path) -> Path:
+    """Leave what a compact of ``path`` killed mid-copy leaves: its marked
+    staging directory, the temp and the temp's ``.wal``."""
+    staging = workspace_module._make_staging(path)
+    tmp = workspace_module._staging_temp(staging, path.name)
+    tmp.write_bytes(b"garbage from an interrupted compact")
+    tmp.with_name(tmp.name + ".wal").write_bytes(b"garbage wal")
+    return staging
+
+
+def _snapshot(root: Path, *, but: str | None = None) -> dict[str, tuple[str, object, int]]:
+    """Everything under ``root`` without following links: kind, content and mode.
+
+    ``but`` leaves out one top-level entry, such as the workspace a compact
+    rewrites.
+    """
+    found: dict[str, tuple[str, object, int]] = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        for entry in (*dirnames, *filenames):
+            p = Path(dirpath) / entry
+            rel = p.relative_to(root).as_posix()
+            if rel == but:
+                continue
+            st = os.lstat(p)
+            if stat.S_ISLNK(st.st_mode):
+                found[rel] = ("link", os.readlink(p), 0)
+            elif stat.S_ISDIR(st.st_mode):
+                found[rel] = ("dir", None, stat.S_IMODE(st.st_mode))
+            else:
+                found[rel] = ("file", p.read_bytes(), stat.S_IMODE(st.st_mode))
+    return found
 
 
 def _insert_row(ws: Workspace) -> None:
@@ -305,7 +348,6 @@ class TestCompactPermissions:
         self, shared_dir: Path, monkeypatch: pytest.MonkeyPatch, restriction: str
     ) -> None:
         path = shared_dir / "ws.duckdb"
-        tmp = _compact_temp(path)
         with Workspace(path, mode="rw") as ws:
             _insert_row(ws)
         _restrict(path, restriction)
@@ -315,6 +357,7 @@ class TestCompactPermissions:
         seen: list[object] = []
 
         def at_copy() -> None:
+            tmp = _compact_temp(path)
             seen.append(_access(tmp))
             if sys.platform == "win32":
                 # DuckDB holds the temp without read sharing, so nobody the
@@ -325,6 +368,7 @@ class TestCompactPermissions:
             if sys.platform == "win32":
                 # The temp's .wal, which copy_permissions does not reach, is
                 # held the same way while it holds rows.
+                tmp = _compact_temp(path)
                 wal = tmp.with_name(tmp.name + ".wal")
                 assert wal.exists()
                 assert _read_open_error(wal) == _ERROR_SHARING_VIOLATION
@@ -345,18 +389,20 @@ class TestCompactPermissions:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         path = tmp_path / "ws.duckdb"
-        tmp = _compact_temp(path)
-        error = PermissionError(13, "simulated: cannot set permissions", str(tmp))
+        error = PermissionError(13, "simulated: cannot set permissions", "the temp")
         copies: list[str] = []
+        temps: list[Path] = []
 
         def cannot_copy(src: Path, dst: Path) -> None:
             # Names only: compact works on the realpath, which may respell
             # the directory (macOS /private/var, Windows 8.3 short names).
+            tmp = _compact_temp(path)
             assert (src.name, dst.parent.name, dst.name) == (
                 path.name,
                 tmp.parent.name,
                 tmp.name,
             )
+            temps.append(tmp)
             raise error
 
         with Workspace(path, mode="rw") as ws:
@@ -369,8 +415,10 @@ class TestCompactPermissions:
             assert excinfo.value.__cause__ is error
             assert "unchanged" in str(excinfo.value)
             assert copies == []
+            (tmp,) = temps
             assert not tmp.exists()
             assert not tmp.with_name(tmp.name + ".wal").exists()
+            assert _stagings(path) == []
             with ws.read() as con:
                 rows = con.execute("SELECT frame_number FROM pkts").fetchall()
             assert rows == [(7,)]
@@ -391,42 +439,43 @@ class TestCompactStaging:
         self, shared_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         path = shared_dir / "ws.duckdb"
-        scratch = path.with_name(path.name + ".compacting")
-        tmp = _compact_temp(path)
-        tmp_wal = tmp.with_name(tmp.name + ".wal")
         with Workspace(path, mode="rw") as ws:
             _insert_row(ws)
         os.chmod(path, 0o600)
         # The directory everyone may enter: what the temp would sit in otherwise.
         assert _mode(shared_dir) & 0o005 == 0o005
         seen: dict[str, object] = {}
+        scratch: list[Path] = []
 
         def staged() -> dict[str, object]:
+            (staging,) = _stagings(path)
+            scratch.append(staging)
             return {
                 "beside": sorted(p.name for p in shared_dir.iterdir()),
-                "scratch_mode": _mode(scratch),
-                "scratch_owner": os.lstat(scratch).st_uid,
-                "inside": sorted(p.name for p in scratch.iterdir()),
+                "scratch_mode": _mode(staging),
+                "scratch_owner": os.lstat(staging).st_uid,
+                "inside": sorted(p.name for p in staging.iterdir()),
             }
 
         def at_copy() -> None:
             seen["copy"] = staged()
-            seen["tmp_mode"] = _mode(tmp)
+            seen["tmp_mode"] = _mode(_compact_temp(path))
 
         def at_detach() -> None:
             # COPY wrote rows into the temp's .wal, created with the umask's
             # 0o644; only the directory keeps other users from it.
             seen["detach"] = staged()
+            tmp_wal = _compact_temp(path).with_name("ws.duckdb.wal")
             seen["wal_mode"] = _mode(tmp_wal)
             seen["wal_size"] = tmp_wal.stat().st_size
 
         real_replace = replace_file
 
         def at_swap(src: Path, dst: Path) -> None:
-            # Final, closed and without a .wal, the temp has left the
-            # staging directory, which is already gone.
-            seen["swap"] = sorted(p.name for p in shared_dir.iterdir())
-            seen["swap_src"] = src.name
+            # Final, closed and without a .wal, the temp is swapped in from
+            # inside the staging directory.
+            seen["swap"] = staged()
+            seen["swap_src"] = (src.parent.name, src.name)
             seen["swap_mode"] = _mode(src)
             real_replace(src, dst)
 
@@ -439,19 +488,26 @@ class TestCompactStaging:
             monkeypatch.undo()
             with ws.read() as con:
                 rows = con.execute("SELECT frame_number FROM pkts").fetchall()
+        # One staging directory, this compact's, throughout.
+        assert len(set(scratch)) == 1
+        name = scratch[0].name
+        assert re.fullmatch(r"ws\.duckdb\.compacting-[0-9a-f]{16}", name)
         private = {
-            "beside": ["ws.duckdb", "ws.duckdb.compacting"],
+            "beside": sorted(["ws.duckdb", name]),
             "scratch_mode": 0o700,
             "scratch_owner": os.stat(path).st_uid,  # this process's user
         }
-        assert seen["copy"] == {**private, "inside": ["ws.duckdb"]}
-        assert seen["detach"] == {**private, "inside": ["ws.duckdb", "ws.duckdb.wal"]}
+        assert seen["copy"] == {**private, "inside": ["remora-compact", "ws.duckdb"]}
+        assert seen["detach"] == {
+            **private,
+            "inside": ["remora-compact", "ws.duckdb", "ws.duckdb.wal"],
+        }
         assert seen["tmp_mode"] == 0o600
         assert seen["wal_mode"] == 0o644
         assert isinstance(seen["wal_size"], int)
         assert seen["wal_size"] > 0
-        assert seen["swap"] == ["ws.duckdb", "ws.duckdb.compacting.new"]
-        assert seen["swap_src"] == "ws.duckdb.compacting.new"
+        assert seen["swap"] == {**private, "inside": ["remora-compact", "ws.duckdb"]}
+        assert seen["swap_src"] == (name, "ws.duckdb")
         assert seen["swap_mode"] == 0o600
         # The compacted file keeps the workspace's mode, and nothing of the
         # compact is left beside it.
@@ -463,7 +519,6 @@ class TestCompactStaging:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         path = tmp_path / "ws.duckdb"
-        scratch = path.with_name(path.name + ".compacting")
         with Workspace(path, mode="rw") as ws:
             _insert_row(ws)
         modes: list[int] = []
@@ -471,7 +526,8 @@ class TestCompactStaging:
         try:
             with Workspace(path, mode="rw") as ws:
                 _probe_compact(
-                    monkeypatch, {"COPY FROM DATABASE": lambda: modes.append(_mode(scratch))}
+                    monkeypatch,
+                    {"COPY FROM DATABASE": lambda: modes.append(_mode(_compact_temp(path).parent))},
                 )
                 ws.compact()
         finally:
@@ -485,17 +541,9 @@ class TestCompactStaging:
         path = tmp_path / "ws.duckdb"
         with Workspace(path, mode="rw") as ws:
             _insert_row(ws)
-        # What a compact killed mid-copy leaves, in whatever mode: the temp,
-        # its .wal, and the pre-#147 name of a stale .wal beside them.
-        scratch = path.with_name(path.name + ".compacting")
-        scratch.mkdir()
-        (scratch / "ws.duckdb").write_bytes(b"garbage from an interrupted compact")
-        (scratch / "ws.duckdb.wal").write_bytes(b"garbage wal")
-        (scratch / "nested").mkdir()
-        (scratch / "nested" / "x").write_bytes(b"x")
+        # What a compact killed mid-copy leaves, in whatever mode.
+        scratch = _stale_staging(path)
         os.chmod(scratch, stale_mode)
-        legacy_wal = path.with_name(path.name + ".compacting.wal")
-        legacy_wal.write_bytes(b"pre-#147 garbage wal")
         try:
             with Workspace(path, mode="rw") as ws:
                 if stale_mode == 0o500:
@@ -516,25 +564,32 @@ class TestCompactStaging:
         assert rows == [(7,)]
         assert sorted(p.name for p in tmp_path.iterdir()) == ["ws.duckdb"]
 
-    def test_stale_symlink_is_removed_not_followed(self, tmp_path: Path) -> None:
+    def test_symlinks_at_staging_names_are_not_followed_or_removed(self, tmp_path: Path) -> None:
+        # A symlink is never a compact's own staging, even one pointing at a
+        # directory that would pass for it; neither it nor its target is
+        # touched.
         path = tmp_path / "ws.duckdb"
-        elsewhere = tmp_path / "elsewhere"
-        elsewhere.mkdir()
-        (elsewhere / "keep").write_bytes(b"not compact's")
         with Workspace(path, mode="rw") as ws:
             _insert_row(ws)
-        scratch = path.with_name(path.name + ".compacting")
-        scratch.symlink_to(elsewhere, target_is_directory=True)
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        lookalike = _stale_staging(elsewhere / "ws.duckdb")
+        (tmp_path / ("ws.duckdb.compacting-" + "0" * 16)).symlink_to(
+            lookalike, target_is_directory=True
+        )
+        (tmp_path / "ws.duckdb.compacting").symlink_to(elsewhere, target_is_directory=True)
+        before = _snapshot(tmp_path)
         with Workspace(path, mode="rw") as ws:
             ws.compact()
-        assert (elsewhere / "keep").read_bytes() == b"not compact's"
-        assert sorted(p.name for p in tmp_path.iterdir()) == ["elsewhere", "ws.duckdb"]
+        assert _snapshot(tmp_path, but="ws.duckdb") == {
+            k: v for k, v in before.items() if k != "ws.duckdb"
+        }
+        assert before["ws.duckdb.compacting-" + "0" * 16][0] == "link"
 
     def test_refuses_to_swap_when_the_temp_wal_outlives_detach(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         path = tmp_path / "ws.duckdb"
-        tmp = _compact_temp(path)
         with Workspace(path, mode="rw") as ws:
             _insert_row(ws)
         real_connect = workspace_module._connect
@@ -544,6 +599,7 @@ class TestCompactStaging:
                 result = super().execute(query, *args)
                 if query.startswith("DETACH compact_dst"):
                     # A DuckDB whose detach did not fold the .wal back in.
+                    tmp = _compact_temp(path)
                     tmp.with_name(tmp.name + ".wal").write_bytes(b"rows not in the temp")
                 return result
 

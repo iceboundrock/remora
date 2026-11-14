@@ -45,7 +45,8 @@ the claim retried against the new file on a mismatch.
 from __future__ import annotations
 
 import os
-import shutil
+import re
+import secrets
 import stat
 import sys
 import threading
@@ -99,9 +100,14 @@ Mode = Literal["ro", "rw"]
 
 _MODES: tuple[Mode, ...] = ("ro", "rw")
 
-# compact()'s scratch entry beside the workspace file: on POSIX a private
-# directory holding the temp database, on Windows the temp database itself.
-_COMPACT_SUFFIX: Final = ".compacting"
+# compact()'s staging: one directory per compact, created beside the
+# workspace file as ``<name>.compacting-<16 hex digits>`` and marked as that
+# workspace's by a marker file inside (see _make_staging). On POSIX it holds
+# the temp database and its .wal; on Windows the temp is the sibling file
+# ``<staging name>.tmp`` (see _staging_temp).
+_STAGING_INFIX: Final = ".compacting-"
+_STAGING_TOKEN: Final = re.compile(r"[0-9a-f]{16}")
+_STAGING_MARKER: Final = "remora-compact"
 
 # ``(st_dev, st_ino)`` normally; the resolved pathname only as a fallback for
 # a file that cannot be stat'ed (see :func:`_file_key`).
@@ -222,22 +228,132 @@ def _connect(path: str, *, read_only: bool) -> DuckDBPyConnection:
     return duckdb.connect(path, read_only=read_only)
 
 
-def _remove_entry(path: Path) -> None:
-    """Remove whatever ``path`` names: a directory tree, or a file or link.
+def _staging_marker(name: str) -> bytes:
+    """What compact()'s marker holds in a staging directory for workspace ``name``."""
+    return b"remora compact staging v1\n" + os.fsencode(name) + b"\n"
 
-    compact()'s scratch name holds a directory on POSIX and a file on Windows,
-    and a file on POSIX too when an older remora left it there, so a stale
-    entry is removed whatever kind it is. A symlink is removed itself, never
-    followed, and :func:`shutil.rmtree` does not follow links inside the tree.
+
+def _staging_temp(staging: Path, name: str) -> Path:
+    """The temp database of the compact that owns ``staging``, for workspace ``name``.
+
+    On POSIX the temp is inside the private staging directory. On Windows it
+    is beside the workspace, where DuckDB's share mode protects it and it
+    inherits the workspace directory's ACL rather than the staging
+    directory's (#147); the staging directory only reserves its name.
+    """
+    if sys.platform == "win32":
+        return staging.with_name(staging.name + ".tmp")
+    return staging / name
+
+
+def _make_staging(target: Path) -> Path:
+    """Create and mark this compact's own staging directory beside ``target``.
+
+    The name is fresh, so nothing another program or another workspace
+    keeps beside ``target`` is ever reused or replaced: ``mkdir`` fails on
+    any existing entry and another name is tried, the way
+    :func:`tempfile.mkdtemp` does. ``0o700`` is never widened by the umask.
+    The marker naming ``target`` is what lets a later compact recognize the
+    directory as its own debris if this one is killed (see
+    :func:`_own_stale_stagings`).
+    """
+    while True:
+        staging = target.with_name(target.name + _STAGING_INFIX + secrets.token_hex(8))
+        try:
+            os.mkdir(staging, 0o700)
+        except FileExistsError:
+            continue
+        break
+    try:
+        fd = os.open(
+            staging / _STAGING_MARKER,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+            0o600,
+        )
+        with os.fdopen(fd, "wb") as marker:
+            marker.write(_staging_marker(target.name))
+    except BaseException:
+        with suppress(OSError):
+            _remove_staging(staging, target.name, temp=False)
+        raise
+    return staging
+
+
+def _is_own_stale_staging(staging: Path, name: str) -> bool:
+    """True when ``staging`` is provably a compact staging directory of workspace ``name``.
+
+    Every condition must hold: a real directory (not a symlink or junction),
+    owned by this user on POSIX, holding the marker naming ``name`` and
+    nothing but the regular files a compact of ``name`` creates there; on
+    Windows the sibling temp and its ``.wal``, if present, are regular files
+    too. Anything else may belong to someone else and is left alone.
     """
     try:
-        mode = os.lstat(path).st_mode
-    except FileNotFoundError:
-        return
-    if stat.S_ISDIR(mode):
-        shutil.rmtree(path)
-    else:
-        path.unlink(missing_ok=True)
+        st = os.lstat(staging)
+        if not stat.S_ISDIR(st.st_mode):
+            return False
+        if getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+            return False
+        if hasattr(os, "geteuid") and st.st_uid != os.geteuid():
+            return False
+        allowed = {_STAGING_MARKER}
+        if sys.platform != "win32":
+            allowed |= {name, name + ".wal"}
+        entries = os.listdir(staging)
+        if _STAGING_MARKER not in entries or not set(entries) <= allowed:
+            return False
+        if not all(stat.S_ISREG(os.lstat(staging / entry).st_mode) for entry in entries):
+            return False
+        if sys.platform == "win32":
+            tmp = _staging_temp(staging, name)
+            for sibling in (tmp, tmp.with_name(tmp.name + ".wal")):
+                if os.path.lexists(sibling) and not stat.S_ISREG(os.lstat(sibling).st_mode):
+                    return False
+        expected = _staging_marker(name)
+        with open(staging / _STAGING_MARKER, "rb") as marker:
+            return marker.read(len(expected) + 1) == expected
+    except OSError:
+        return False
+
+
+def _own_stale_stagings(target: Path) -> list[Path]:
+    """The staging directories earlier, interrupted compacts of ``target`` left.
+
+    Only called with ``target``'s exclusive lock held, so no compact of it is
+    in flight: a staging directory of ``target`` is either debris or that of a
+    compact that has already swapped and is about to remove it. Candidates
+    are the exact ``<name>.compacting-<16 hex digits>`` names, and each must
+    pass :func:`_is_own_stale_staging`. A directory that cannot be listed
+    yields none.
+    """
+    prefix = target.name + _STAGING_INFIX
+    try:
+        names = os.listdir(target.parent)
+    except OSError:
+        return []
+    return [
+        target.with_name(entry)
+        for entry in sorted(names)
+        if entry.startswith(prefix)
+        and _STAGING_TOKEN.fullmatch(entry[len(prefix) :])
+        and _is_own_stale_staging(target.with_name(entry), target.name)
+    ]
+
+
+def _remove_staging(staging: Path, name: str, *, temp: bool) -> None:
+    """Remove a staging directory this compact owns, and with ``temp`` its temp.
+
+    The marker goes last before the directory, so a removal that fails part
+    way leaves debris a later compact still recognizes. Only the entries a
+    compact creates are removed, never a tree, so whatever else has appeared
+    in the directory makes the final ``rmdir`` fail rather than be deleted.
+    """
+    if temp:
+        tmp = _staging_temp(staging, name)
+        tmp.unlink(missing_ok=True)
+        tmp.with_name(tmp.name + ".wal").unlink(missing_ok=True)
+    (staging / _STAGING_MARKER).unlink(missing_ok=True)
+    staging.rmdir()
 
 
 def _quote_path(path: str) -> str:
@@ -1164,16 +1280,26 @@ class Workspace:
         A checkpoint only truncates trailing free blocks, so a file stays
         large after scattered deletes; this copies every schema, table and
         row into a temp database and atomically swaps it in by renaming the
-        temp over the open original. On POSIX the temp is written as
-        ``<name>.compacting/<name>``, inside a directory only the owner can
-        enter, and once it is final it moves out to ``<name>.compacting.new``
-        and the directory is removed, all before the swap; on Windows it is
-        the file ``<name>.compacting``. Either way it is swapped in from
-        beside the original, so the final rename never crosses a filesystem.
+        temp over the open original. Each compact creates its own staging
+        directory beside the original, ``<name>.compacting-<16 hex digits>``,
+        under a name nothing else holds, with a marker file naming the
+        workspace. On POSIX the temp is written inside it as ``<name>``, and
+        only the owner can enter it; on Windows the directory only reserves
+        the name, and the temp is the sibling file
+        ``<name>.compacting-<16 hex digits>.tmp``. Either way the temp is
+        renamed over the original from the same directory or one inside it,
+        so the final rename never crosses a filesystem, and the staging
+        directory is removed after the swap.
         The original is only ever replaced whole: an interruption at any
-        point leaves it intact, and at worst a stale ``<name>.compacting``
-        or ``<name>.compacting.new`` — plus the ``.wal`` sidecar a hard kill
-        mid-copy can leave beside the temp — that the next compact removes.
+        point leaves it intact, and at worst a stale staging directory (with
+        the temp and the ``.wal`` sidecar a hard kill mid-copy can leave)
+        that the next compact removes once it holds the lock. It removes a
+        staging directory only when it can prove the directory is this
+        workspace's: a real directory owned by this user on POSIX, holding
+        the marker naming this workspace and only the files a compact puts
+        there. Anything else beside the workspace is never removed, whatever
+        its name, including the ``<name>.compacting`` file a remora from
+        before #147 used as its temp: delete such debris by hand.
 
         A workspace addressed through a symlink is compacted at its
         *resolved* target: the temp lives beside the real file and the swap
@@ -1250,12 +1376,11 @@ class Workspace:
         Cleanup of stale artifacts from an earlier crash happens only
         *after* that exclusive lock is held, so a compact that loses the
         lock modifies nothing at all — including another process's
-        in-flight temp file. Every removal compact makes happens under that
-        lock: a failed compact removes its own artifacts before it closes
-        the source connection, and a successful one has removed its staging
-        directory before the swap and touches nothing on disk after it,
-        because from the swap on another process's compact may already own
-        the scratch names.
+        in-flight staging. A failed compact removes its own temp and staging
+        directory before it closes the source connection. After the swap a
+        compact in another process may already have started on the new file;
+        the finishing compact then removes only its own staging directory,
+        whose name no other compact uses.
 
         Within this process the file lock cannot arbitrate, since
         same-process connections share one DuckDB instance; a module-level
@@ -1298,16 +1423,17 @@ class Workspace:
                 Windows swap is refused (a handle without delete sharing —
                 duckdb older than 1.5.0 or a scanner — or a Windows/volume
                 without POSIX rename semantics, #85). Also if a stale
-                ``<name>.compacting`` or ``<name>.compacting.new`` from an
-                earlier crash cannot be removed, or if the temp's ``.wal``
+                staging directory of this workspace from an earlier crash
+                cannot be removed, if on Windows a file it did not create is
+                already at its temp's name, or if the temp's ``.wal``
                 outlives its detach, so the temp may lack rows; the
                 workspace is unchanged in each case.
             OSError: An unclassified failure from the swap, unchanged. This
                 includes :class:`PermissionError` for Windows access denied
                 (error 5), which may mean missing delete permission. On
                 POSIX, also a failure to create the staging directory, such
-                as a workspace directory this process cannot write, or to
-                move the finished temp out of it; the workspace is unchanged.
+                as a workspace directory this process cannot write; the
+                workspace is unchanged.
         """
         self._require_open()
         if self._mode == "ro":
@@ -1365,42 +1491,49 @@ class Workspace:
         # identity the live file is about to have (see below).
         claimed_new_key: _FileKey | None = None
         try:
-            # On POSIX the temp is created inside a private directory, so no
-            # other user can open it or its .wal while rows are written; see
-            # the docstring. Windows keeps the temp beside the workspace,
-            # where DuckDB's share mode already shuts other handles out and
-            # the file inherits the directory's ACL rather than a staging
-            # directory's.
-            scratch = target.with_name(target.name + _COMPACT_SUFFIX)
-            tmp = scratch if sys.platform == "win32" else scratch / target.name
-            tmp_wal = tmp.with_name(tmp.name + ".wal")
-            # On POSIX the finished temp leaves the staging directory under
-            # this name, so the directory is gone before the swap (below).
-            ready = tmp if sys.platform == "win32" else scratch.with_name(scratch.name + ".new")
-            # On POSIX this is only ever a pre-#147 remora's stale .wal.
-            scratch_wal = scratch.with_name(scratch.name + ".wal")
-            # On Windows ready is the scratch name itself.
-            leftovers = tuple(dict.fromkeys((scratch, ready, scratch_wal)))
+            name = target.name
+            # This compact's own staging directory, with a fresh name and a
+            # marker naming the workspace, so nothing it removes can belong
+            # to anyone else; see _make_staging.
+            staging: Path | None = None
+            tmp_ours = False
             attached = False
-            ready_key: _FileKey | None = None
+            tmp_key: _FileKey | None = None
             try:
                 try:
-                    # Now that the lock is ours, anything at the scratch names
-                    # is debris from an earlier crash, never a live compact.
-                    try:
-                        for leftover in leftovers:
-                            _remove_entry(leftover)
-                    except OSError as exc:
+                    # Now that the lock is ours no compact of this workspace
+                    # is in flight, so a staging directory that provably is
+                    # one of its compacts' is debris from an earlier crash.
+                    # Anything else beside the workspace, whatever its name,
+                    # is left alone.
+                    for stale in _own_stale_stagings(target):
+                        try:
+                            _remove_staging(stale, name, temp=True)
+                        except OSError as exc:
+                            raise WorkspaceError(
+                                f"compact() could not remove {stale}, left by an earlier "
+                                f"interrupted compact ({exc}); remove it and retry. The "
+                                "workspace is unchanged"
+                            ) from exc
+                    # On POSIX the temp is created inside this private
+                    # directory, so no other user can open it or its .wal
+                    # while rows are written; see the docstring. On Windows
+                    # the temp sits beside the workspace, where DuckDB's
+                    # share mode already shuts other handles out and the file
+                    # inherits the directory's ACL rather than a staging
+                    # directory's.
+                    staging = _make_staging(target)
+                    tmp = _staging_temp(staging, name)
+                    tmp_wal = tmp.with_name(tmp.name + ".wal")
+                    if os.path.lexists(tmp) or os.path.lexists(tmp_wal):
+                        # Only possible on Windows, where the temp is outside
+                        # the fresh directory. ATTACH would open what is there.
                         raise WorkspaceError(
-                            f"compact() could not remove {leftover}, left by an earlier "
-                            f"interrupted compact ({exc}); remove it and retry. The "
-                            "workspace is unchanged"
-                        ) from exc
-                    if sys.platform != "win32":
-                        # mkdir with 0o700 is never wider than owner-only,
-                        # whatever the umask, and fails rather than adopting a
-                        # directory someone else created at this name.
-                        os.mkdir(scratch, 0o700)
+                            f"compact() found {tmp} or its .wal already present, which it "
+                            "did not create, and refuses rather than write into or remove "
+                            "it. The workspace is unchanged"
+                        )
+                    tmp_ours = True
                     row = con.execute("SELECT current_database()").fetchone()
                     assert row is not None
                     con.execute(f"ATTACH '{_quote_path(str(tmp))}' AS compact_dst")
@@ -1434,19 +1567,7 @@ class Workspace:
                             "rewritten file, so that file may not hold every row; it was "
                             "not swapped in. The workspace is unchanged"
                         )
-                    if ready != tmp:
-                        # The temp is now final: closed, holding every row in
-                        # the database file itself, with the workspace's own
-                        # mode, so outside the directory it is no more open
-                        # than the workspace it is about to become. Move it
-                        # out and remove the directory while the lock still
-                        # excludes every other compact: the swap installs a
-                        # new inode that lock does not cover, after which
-                        # another process's compact may own the scratch names,
-                        # so nothing is removed after it.
-                        os.rename(tmp, ready)
-                        scratch.rmdir()
-                    ready_key = new_key = _file_key(ready)
+                    tmp_key = new_key = _file_key(tmp)
                     if new_key != key:
                         # The temp is private to this compact (fresh file, held
                         # exclusive lock on the source), so claiming its identity
@@ -1455,29 +1576,35 @@ class Workspace:
                         # after the swap but before this compact fully ends.
                         _begin_compact(new_key, target)
                         claimed_new_key = new_key
-                    # The temp is the target's sibling, so the rename stays on
-                    # one filesystem and keeps the inode.
-                    replace_file(ready, target)
+                    # The temp is the target's sibling, or inside a directory
+                    # that is, so the rename stays on one filesystem and keeps
+                    # the inode.
+                    replace_file(tmp, target)
                 except BaseException:
                     # Clean up while the source connection, and with it the
-                    # exclusive lock, is still held: until the swap lands no
-                    # other compact can start, so everything at the scratch
-                    # names is this compact's own or debris it was already
-                    # allowed to remove. Once the swap has landed (an
-                    # interrupt just after the rename), another process's
-                    # compact may own those names, so nothing is removed.
-                    # Best effort, so the error that brought us here is the
-                    # one that propagates; whatever is left, the next compact
-                    # removes under the lock.
-                    if ready_key is None or _file_key(target) != ready_key:
-                        if attached:
-                            # Windows cannot remove a file DuckDB holds open.
-                            with suppress(Exception):
-                                con.execute("DETACH compact_dst")
-                        for leftover in leftovers:
-                            with suppress(OSError):
-                                _remove_entry(leftover)
+                    # exclusive lock, is still held. Only this compact's own
+                    # artifacts are removed: its staging directory and, unless
+                    # the swap has landed (an interrupt just after the rename),
+                    # the temp it created. Best effort, so the error that
+                    # brought us here is the one that propagates; whatever is
+                    # left keeps its marker, and the next compact removes it.
+                    swapped = tmp_key is not None and _file_key(target) == tmp_key
+                    if attached:
+                        # Windows cannot remove a file DuckDB holds open.
+                        with suppress(Exception):
+                            con.execute("DETACH compact_dst")
+                    if staging is not None:
+                        with suppress(OSError):
+                            _remove_staging(staging, name, temp=tmp_ours and not swapped)
                     raise
+                # The temp is the workspace now. What is left is the staging
+                # directory this compact created, holding only its marker; its
+                # name is this compact's alone, so removing it cannot touch
+                # another compact's staging even though a compact in another
+                # process may already have started on the new file. That one
+                # may also find and remove it first, hence best effort.
+                with suppress(OSError):
+                    _remove_staging(staging, name, temp=False)
             finally:
                 con.close()
         finally:
