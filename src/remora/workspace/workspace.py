@@ -374,6 +374,22 @@ def _own_stale_stagings(target: Path) -> list[Path]:
     ]
 
 
+def _own_temp_files(tmp: Path) -> tuple[Path, ...]:
+    """What of a compact's temp ``tmp`` and its ``.wal`` compact may remove as its own.
+
+    Both, inside a POSIX staging directory, where only the owner can put
+    anything. The Windows sibling temp alone: its identity is claimed, but
+    its ``.wal`` is a separate file at a derived name, outside the staging
+    directory, that no claim covers. DuckDB creates and deletes that file
+    itself, so a name found occupied may be DuckDB's leftover or anyone
+    else's file (one created after a detach deleted the temp's own, say),
+    and compact leaves it alone (#147).
+    """
+    if _TEMP_BESIDE_STAGING:
+        return (tmp,)
+    return (_wal(tmp), tmp)
+
+
 def _stale_temp_files(staging: Path) -> tuple[Path, ...]:
     """The temp files of the stale ``staging`` that provably are its compact's.
 
@@ -381,16 +397,15 @@ def _stale_temp_files(staging: Path) -> tuple[Path, ...]:
     accepted, they are whatever of the temp and its ``.wal`` is there: only
     the owner can put anything in it. The Windows sibling temp is outside,
     so it counts only while it is a regular file whose identity is the one
-    :func:`_claim_temp` recorded, and its ``.wal`` only beside that file,
-    whose ``.wal`` DuckDB would open as its own. Without the claim (a compact
-    killed before it was written), or once the claimed file is gone (renamed
-    over the workspace by the swap), whatever is at those names is left
-    alone. The ``.wal`` comes first, so a removal that stops part way leaves
-    the claimed temp, and with it the ``.wal``'s ownership, in place.
+    :func:`_claim_temp` recorded. Without the claim (a compact killed before
+    it was written), or once the claimed file is gone (renamed over the
+    workspace by the swap), whatever is at its name is left alone. Whatever
+    is at the Windows temp's ``.wal`` name never counts, claimed temp or not
+    (see :func:`_own_temp_files`).
     """
     tmp = _staging_temp(staging)
     if not _TEMP_BESIDE_STAGING:
-        return (_wal(tmp), tmp)
+        return _own_temp_files(tmp)
     try:
         with open(staging / _STAGING_CLAIM, "rb") as claim_file:
             claim = claim_file.read(4096)
@@ -399,11 +414,7 @@ def _stale_temp_files(staging: Path) -> tuple[Path, ...]:
         return ()
     if not stat.S_ISREG(st.st_mode) or claim != _temp_claim(st):
         return ()
-    try:
-        wal_st = os.lstat(_wal(tmp))
-    except OSError:
-        return (tmp,)
-    return (_wal(tmp), tmp) if stat.S_ISREG(wal_st.st_mode) else (tmp,)
+    return _own_temp_files(tmp)
 
 
 def _remove_staging(staging: Path, temp: Sequence[Path]) -> None:
@@ -1369,10 +1380,13 @@ class Workspace:
         workspace's: a real directory owned by this user on POSIX, holding
         the marker naming this workspace and only the files a compact puts
         there. On Windows it removes the sibling temp only while that is
-        still the file the claim names, and the temp's ``.wal`` only beside
-        it; a compact killed before writing the claim leaves its temp for
-        removal by hand, and whatever appears at the name after the swap is
-        left alone. Anything else beside the workspace is never removed,
+        still the file the claim names; a compact killed before writing the
+        claim leaves its temp for removal by hand, and whatever appears at
+        the name after the swap is left alone. Nothing claims the Windows
+        temp's ``.wal``, a separate file at a derived name that DuckDB
+        creates and deletes itself, so compact never removes one: a stale
+        one, which a hard kill mid-copy can leave, is for removal by hand
+        too. Anything else beside the workspace is never removed,
         whatever its name, including the ``<name>.compacting`` file a remora
         from before #147 used as its temp: delete such debris by hand.
 
@@ -1642,10 +1656,16 @@ class Workspace:
                     # the database file is swapped in, so rows still in a .wal
                     # would be lost with it: refuse rather than install them.
                     if os.path.lexists(tmp_wal):
+                        left = (
+                            ", and the .wal is left for removal by hand, since nothing "
+                            "proves it is the temp's own"
+                            if _TEMP_BESIDE_STAGING
+                            else ""
+                        )
                         raise WorkspaceError(
                             f"compact() found {tmp_wal} still present after detaching the "
                             "rewritten file, so that file may not hold every row; it was "
-                            "not swapped in. The workspace is unchanged"
+                            f"not swapped in{left}. The workspace is unchanged"
                         )
                     tmp_key = new_key = _file_key(tmp)
                     if new_key != key:
@@ -1665,7 +1685,8 @@ class Workspace:
                     # exclusive lock, is still held. Only this compact's own
                     # artifacts are removed: its staging directory and, unless
                     # the swap has landed (an interrupt just after the rename),
-                    # the temp it created. Best effort, so the error that
+                    # the temp it created, and on POSIX the temp's .wal (see
+                    # _own_temp_files). Best effort, so the error that
                     # brought us here is the one that propagates; whatever is
                     # left keeps its marker, and the next compact removes it.
                     swapped = tmp_key is not None and _file_key(target) == tmp_key
@@ -1676,7 +1697,7 @@ class Workspace:
                     if staging is not None:
                         with suppress(OSError):
                             _remove_staging(
-                                staging, (tmp_wal, tmp) if tmp_ours and not swapped else ()
+                                staging, _own_temp_files(tmp) if tmp_ours and not swapped else ()
                             )
                     raise
                 # The temp is the workspace now. What is left is the staging

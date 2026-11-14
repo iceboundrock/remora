@@ -875,11 +875,13 @@ class TestCompact:
         assert _snapshot(tmp_path, but=path.name) == before
 
     @pytest.mark.usefixtures("windows_layout")
-    def test_windows_layout_kill_at_swap_leaves_claimed_debris_the_next_one_removes(
+    def test_windows_layout_kill_at_swap_removes_the_claimed_temp_not_a_file_at_its_wal(
         self, tmp_path: Path
     ) -> None:
-        # The other side of R3-F1: the temp a killed compact claimed, and the
-        # .wal beside it, are still removed.
+        # The other side of R3-F1: the temp a killed compact claimed is still
+        # removed. R4-F1: killed after DETACH deleted the temp's .wal, the
+        # compact leaves the .wal's name free for anyone; a file created
+        # there is not the temp's, claim or no claim, and stays byte for byte.
         path = tmp_path / "ws.duckdb"
         with Workspace(path, mode="rw") as ws, ws.write() as con:
             con.execute(
@@ -906,14 +908,66 @@ class TestCompact:
         tmp = workspace_module._staging_temp(staging)
         assert tmp.is_file()
         assert sorted(p.name for p in staging.iterdir()) == ["remora-compact", "temp-claim"]
-        # A .wal beside the claimed temp is the temp's own.
-        tmp.with_name(tmp.name + ".wal").write_bytes(b"wal of the killed compact")
+        wal = tmp.with_name(tmp.name + ".wal")
+        assert not wal.exists()
+        wal.write_bytes(b"someone else's file")
         with Workspace(path, mode="rw") as ws:
             ws.compact()
             with ws.read() as con:
                 rows = con.execute("SELECT frame_number FROM pkts").fetchall()
         assert rows == [(7,)]
-        assert sorted(p.name for p in tmp_path.iterdir()) == [path.name]
+        assert sorted(p.name for p in tmp_path.iterdir()) == sorted([path.name, wal.name])
+        assert wal.read_bytes() == b"someone else's file"
+
+    @pytest.mark.usefixtures("windows_layout")
+    def test_windows_failed_compact_leaves_a_file_at_its_temps_wal_alone(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # R4-F1, in flight: once DETACH has deleted the temp's .wal, a file
+        # that appears at its name before the swap fails is not the temp's.
+        # The failing compact removes its claimed temp and its staging
+        # directory and leaves that file byte for byte.
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw") as ws, ws.write() as con:
+            con.execute(
+                "INSERT INTO pkts (frame_number, frame_time) "
+                "VALUES (7, TIMESTAMP '2024-01-01 00:00:00')"
+            )
+        monkeypatch.setattr("secrets.token_hex", lambda n: "5" * 16)
+        wal = tmp_path / ("remora-compact-" + "5" * 16 + ".tmp.wal")
+
+        def collide_then_fail(src: Path, dst: Path) -> None:
+            assert not wal.exists()
+            wal.write_bytes(b"someone else's file")
+            raise OSError("swap refused")
+
+        with Workspace(path, mode="rw") as ws:
+            with monkeypatch.context() as m:
+                m.setattr(workspace_module, "replace_file", collide_then_fail)
+                with pytest.raises(OSError, match="swap refused"):
+                    ws.compact()
+            with ws.read() as con:
+                rows = con.execute("SELECT frame_number FROM pkts").fetchall()
+        assert rows == [(7,)]
+        assert sorted(p.name for p in tmp_path.iterdir()) == sorted([path.name, wal.name])
+        assert wal.read_bytes() == b"someone else's file"
+
+    @pytest.mark.usefixtures("windows_layout")
+    def test_windows_stale_wal_beside_a_claimed_temp_is_left_alone(self, tmp_path: Path) -> None:
+        # R4-F1: a claim covers the temp, not a file at the temp's .wal name,
+        # whoever made it. The claimed temp and the staging directory go; the
+        # .wal stays for removal by hand.
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw") as ws:
+            pass
+        stale = _stale_staging(path)
+        tmp = workspace_module._staging_temp(stale)
+        wal = tmp.with_name(tmp.name + ".wal")
+        assert workspace_module._stale_temp_files(stale) == (tmp,)
+        with Workspace(path, mode="rw") as ws:
+            ws.compact()
+        assert sorted(p.name for p in tmp_path.iterdir()) == sorted([path.name, wal.name])
+        assert wal.read_bytes() == b"garbage wal"
 
     def test_compact_leaves_other_workspaces_at_colliding_names_alone(self, tmp_path: Path) -> None:
         # Workspaces named like an older remora's temp, like the marker, and
@@ -1791,9 +1845,14 @@ class TestCompact:
                 with contextlib.suppress(subprocess.TimeoutExpired):
                     proc.wait(timeout=30)
         # The compacted file is in place; its staging directory holds only
-        # the marker.
+        # the marker, and on Windows the claim on the temp that is now the
+        # workspace (R4-F2).
         (staging,) = _stagings(path)
-        assert sorted(p.name for p in staging.iterdir()) == ["remora-compact"]
+        assert sorted(p.name for p in staging.iterdir()) == (
+            ["remora-compact", "temp-claim"]
+            if workspace_module._TEMP_BESIDE_STAGING
+            else ["remora-compact"]
+        )
         with Workspace(path, mode="rw") as ws:
             ws.compact()
             with ws.read() as con:

@@ -353,9 +353,13 @@ workspace was killed before removing: a real directory at an exact
 marker naming this workspace and nothing but the files a compact puts there. On
 Windows the temp is outside that directory, so its name proves nothing: compact
 removes it only while it is still the regular file whose identity the claim
-recorded, and the temp's `.wal` only beside that file. A compact killed before
-it wrote the claim leaves its temp for removal by hand, and a file that appears
-at the temp's name after the swap renamed the temp away is left alone. Anything
+recorded. A compact killed before it wrote the claim leaves its temp for removal
+by hand, and a file that appears at the temp's name after the swap renamed the
+temp away is left alone. The Windows temp's `.wal` is a separate file at a
+derived name, which DuckDB creates and deletes itself and no claim covers, so
+compact never removes one: a file at that name may be another program's, created
+after a detach deleted the temp's own. A stale one, which a hard kill mid-copy
+can leave, is for removal by hand too. Anything
 else beside the workspace is left alone, whatever its name: a symlink, another
 program's file or directory, another workspace (even one named like a staging
 directory), or a staging directory with anything extra in it. That includes the
@@ -368,7 +372,7 @@ by hand.
 | Mode | `rw` only; `WorkspaceModeError` in ro |
 | Concurrency | Needs **sole access**. Any other connection — including a read-only reader in another process, or an ro-mode `Workspace` on the same file in this one — makes it fail fast on the lock with **nothing modified** |
 | In-process | A `write()` or rw-mode `read()` in flight on *any* `Workspace` for this file raises `WorkspaceError`, and for compaction's duration writers and rw-mode readers fail fast the same way |
-| Interruption | The original is replaced whole, so a crash at any point leaves it intact, and at worst a stale marked staging directory (with the temp and its `.wal`, if the crash came before the swap) that the next compact removes once it holds the lock. On Windows a temp the crash left before its claim was written is not provably compact's and stays for removal by hand. A compact that fails removes its own artifacts before it releases the lock. A stale staging directory of this workspace that cannot be removed, such as one whose mode its owner made read-only, makes compact raise `WorkspaceError` naming the path, with the workspace unchanged |
+| Interruption | The original is replaced whole, so a crash at any point leaves it intact, and at worst a stale marked staging directory (with the temp and its `.wal`, if the crash came before the swap) that the next compact removes once it holds the lock. On Windows a temp the crash left before its claim was written, and the temp's `.wal` whatever the claim, are not provably compact's and stay for removal by hand. A compact that fails removes its own artifacts before it releases the lock. A stale staging directory of this workspace that cannot be removed, such as one whose mode its owner made read-only, makes compact raise `WorkspaceError` naming the path, with the workspace unchanged |
 | Symlinks | Compacts the *resolved* target, so a symlink survives as a symlink. A **hard link** cannot survive an atomic swap: the replaced name gets the new inode, the other name keeps the old one, and the two diverge |
 | Permissions | The compacted file keeps the workspace file's restrictions: the mode bits, and on Windows also the DACL and whether it inherits (#132). A `0o640` workspace stays `0o640`, and a Windows file made private inside a shared folder stays private. They are set as soon as DuckDB creates the temp, before any row is copied, and if they cannot be, `compact()` raises `WorkspaceError` and the workspace is unchanged. Ownership follows the fresh file. While the temp and its `.wal` hold rows, other users are kept from them on POSIX by the `0o700` staging directory, since a mode set after creation cannot revoke a descriptor opened before it and the `.wal` never gets the file's mode, and on Windows by DuckDB opening both without read or write sharing (#147). None of this covers the workspace's own `.wal`: see [File permissions](#file-permissions-the-directory-is-the-boundary) |
 | Platform | POSIX, and **Windows with duckdb ≥ 1.5.0** (which opens its database with `FILE_SHARE_DELETE`, so the file can be renamed over while compact's exclusive connection holds it) on Windows 10 1607 / Server 2016 or later, NTFS (ReFS unverified). A sharing violation (Windows error 32, such as an older duckdb or a handle without delete sharing) or a volume without POSIX rename semantics makes `compact()` raise `WorkspaceError` naming the requirement, with the workspace unchanged (#85). Access denied (Windows error 5) propagates as the original `PermissionError`: it may mean missing delete permission on the workspace file and its directory, not a sharing conflict. Paths longer than 260 characters are unverified on Windows |
