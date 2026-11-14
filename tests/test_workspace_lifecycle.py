@@ -77,6 +77,19 @@ def windows_layout(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(workspace_module, "_TEMP_BESIDE_STAGING", True)
 
 
+@pytest.fixture(params=["native", "windows"])
+def layout(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> bool:
+    """Run compact() in this platform's layout and in the Windows one.
+
+    Returns whether the temp is beside the staging directory. A test that
+    starts a compact in a subprocess passes its script through
+    :func:`_beside` when this is true.
+    """
+    if request.param == "windows":
+        monkeypatch.setattr(workspace_module, "_TEMP_BESIDE_STAGING", True)
+    return workspace_module._TEMP_BESIDE_STAGING
+
+
 def _snapshot(root: Path, *, but: str | None = None) -> dict[str, tuple[str, object]]:
     """Everything under ``root`` without following links: kind and content.
 
@@ -613,18 +626,29 @@ class TestCompact:
         leftovers = [p.name for p in tmp_path.iterdir() if p.name != path.name]
         assert leftovers == []
 
-    def test_compact_removes_stale_temp_from_earlier_crash(self, tmp_path: Path) -> None:
+    def test_compact_removes_stale_temp_from_earlier_crash(
+        self, tmp_path: Path, layout: bool
+    ) -> None:
         # What a compact killed mid-copy leaves: its marked staging
-        # directory, the temp and the temp's .wal.
+        # directory, the temp and the temp's .wal. All of it goes, except a
+        # Windows sibling temp's .wal, which no claim covers (R4-F1): that
+        # stays byte for byte, for removal by hand.
         path = tmp_path / "ws.duckdb"
         with Workspace(path, mode="rw") as ws:
             pass
         stale = _stale_staging(path)
+        tmp = workspace_module._staging_temp(stale)
+        wal = tmp.with_name(tmp.name + ".wal")
         with Workspace(path, mode="rw") as ws:
             ws.compact()
         assert not stale.exists()
+        assert not tmp.exists()
         leftovers = [p.name for p in tmp_path.iterdir() if p.name != path.name]
-        assert leftovers == []
+        if layout:
+            assert leftovers == [wal.name]
+            assert wal.read_bytes() == b"garbage wal"
+        else:
+            assert leftovers == []
 
     def test_compact_leaves_entries_it_cannot_prove_its_own_alone(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -968,6 +992,151 @@ class TestCompact:
             ws.compact()
         assert sorted(p.name for p in tmp_path.iterdir()) == sorted([path.name, wal.name])
         assert wal.read_bytes() == b"garbage wal"
+
+    @pytest.mark.usefixtures("windows_layout")
+    def test_windows_temp_name_taken_after_the_check_is_refused_not_removed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # R5-F1: a name found free proves nothing. A file another program
+        # creates at the temp's name after compact checked it makes the
+        # exclusive create fail; compact refuses and leaves the file alone.
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw") as ws:
+            pass
+        monkeypatch.setattr("secrets.token_hex", lambda n: "6" * 16)
+        theirs = tmp_path / ("remora-compact-" + "6" * 16 + ".tmp")
+        real_image = workspace_module._empty_database_image
+
+        def collide() -> bytes:
+            theirs.write_bytes(b"someone else's file")
+            return real_image()
+
+        monkeypatch.setattr(workspace_module, "_empty_database_image", collide)
+        with (
+            Workspace(path, mode="rw") as ws,
+            pytest.raises(WorkspaceError, match="did not create"),
+        ):
+            ws.compact()
+        assert theirs.read_bytes() == b"someone else's file"
+        assert sorted(p.name for p in tmp_path.iterdir()) == sorted([path.name, theirs.name])
+
+    @pytest.mark.parametrize(
+        "when", ["SELECT current_database()", "ATTACH", "COPY FROM DATABASE", "DETACH"]
+    )
+    @pytest.mark.parametrize("theirs_kind", ["file", "database"])
+    @pytest.mark.usefixtures("windows_layout")
+    def test_windows_temp_replaced_in_flight_is_never_removed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, when: str, theirs_kind: str
+    ) -> None:
+        # R5-F1: the temp compact created can be replaced at its name by
+        # another program's file before ATTACH, while compact works, or
+        # before the swap. Whatever then fails, here a raise at the next
+        # statement or compact's own refusal, the failing compact removes
+        # only the file it created and claimed: the other file stays byte for
+        # byte and is neither attached into, nor swapped in, nor removed.
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw") as ws, ws.write() as con:
+            con.execute(
+                "INSERT INTO pkts (frame_number, frame_time) "
+                "VALUES (7, TIMESTAMP '2024-01-01 00:00:00')"
+            )
+        monkeypatch.setattr("secrets.token_hex", lambda n: "7" * 16)
+        tmp = tmp_path / ("remora-compact-" + "7" * 16 + ".tmp")
+        # Made beside it first, so the replacement cannot take a freed inode.
+        theirs = tmp_path / "theirs"
+        if theirs_kind == "database":
+            with Workspace(theirs, mode="rw") as other, other.write() as con:
+                con.execute(
+                    "INSERT INTO pkts (frame_number, frame_time) "
+                    "VALUES (99, TIMESTAMP '2024-01-01 00:00:00')"
+                )
+        else:
+            theirs.write_bytes(b"someone else's file")
+        content = theirs.read_bytes()
+        mode = stat.S_IMODE(os.lstat(theirs).st_mode)
+        real_connect = workspace_module._connect
+        replaced: list[str] = []
+
+        class _Probe:
+            def __init__(self, real: Any) -> None:
+                self._real = real
+
+            def execute(self, sql: str, *args: object) -> object:
+                if sql.startswith(when) and not replaced:
+                    if when == "DETACH":
+                        result = self._real.execute(sql, *args)
+                        os.replace(theirs, tmp)
+                        replaced.append(sql)
+                        return result
+                    os.replace(theirs, tmp)
+                    replaced.append(sql)
+                    if when != "ATTACH":
+                        raise RuntimeError("simulated failure after the replacement")
+                return self._real.execute(sql, *args)
+
+            def close(self) -> None:
+                self._real.close()
+
+        def probed_connect(path_: str, *, read_only: bool) -> Any:
+            return _Probe(real_connect(path_, read_only=read_only))
+
+        with Workspace(path, mode="rw") as ws:
+            with monkeypatch.context() as m:
+                m.setattr(workspace_module, "_connect", probed_connect)
+                with pytest.raises(Exception) as excinfo:
+                    ws.compact()
+            assert replaced
+            if when in ("ATTACH", "DETACH") and theirs_kind == "database":
+                # Attached or about to be swapped in, it is refused.
+                assert isinstance(excinfo.value, WorkspaceError)
+                assert "replaced by a file it did not create" in str(excinfo.value)
+            with ws.read() as con:
+                rows = con.execute("SELECT frame_number FROM pkts").fetchall()
+        assert rows == [(7,)]
+        assert tmp.read_bytes() == content
+        assert stat.S_IMODE(os.lstat(tmp).st_mode) == mode
+        assert sorted(p.name for p in tmp_path.iterdir()) == sorted([path.name, tmp.name])
+
+    @pytest.mark.usefixtures("windows_layout")
+    def test_windows_failed_attach_removes_the_temp_compact_created(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The other side of R5-F1: the temp compact created and claimed is
+        # its own, so a failure at ATTACH removes it with the staging
+        # directory and leaves nothing behind.
+        path = tmp_path / "ws.duckdb"
+        with Workspace(path, mode="rw") as ws:
+            pass
+        real_connect = workspace_module._connect
+        seen: list[Path] = []
+
+        class _Probe:
+            def __init__(self, real: Any) -> None:
+                self._real = real
+
+            def execute(self, sql: str, *args: object) -> object:
+                if sql.startswith("ATTACH"):
+                    (staging,) = _stagings(path)
+                    seen.append(workspace_module._staging_temp(staging))
+                    assert seen[0].is_file()
+                    assert (staging / "temp-claim").is_file()
+                    raise RuntimeError("simulated failure at ATTACH")
+                return self._real.execute(sql, *args)
+
+            def close(self) -> None:
+                self._real.close()
+
+        def probed_connect(path_: str, *, read_only: bool) -> Any:
+            return _Probe(real_connect(path_, read_only=read_only))
+
+        with Workspace(path, mode="rw") as ws:
+            with monkeypatch.context() as m:
+                m.setattr(workspace_module, "_connect", probed_connect)
+                with pytest.raises(RuntimeError, match="at ATTACH"):
+                    ws.compact()
+            ws.compact()
+        assert len(seen) == 1
+        assert sorted(p.name for p in tmp_path.iterdir()) == [path.name]
 
     def test_compact_leaves_other_workspaces_at_colliding_names_alone(self, tmp_path: Path) -> None:
         # Workspaces named like an older remora's temp, like the marker, and
@@ -1420,7 +1589,7 @@ class TestCompact:
             # Both instances can compact again, one after the other.
             ws2.compact()
 
-    def test_lock_conflicted_compact_modifies_nothing(self, tmp_path: Path) -> None:
+    def test_lock_conflicted_compact_modifies_nothing(self, tmp_path: Path, layout: bool) -> None:
         path = tmp_path / "ws.duckdb"
         sentinel = b"other compaction in flight"
         sentinel_wal = b"other compaction wal in flight"
@@ -1436,7 +1605,7 @@ class TestCompact:
             decoy_wal = decoy.with_name(decoy.name + ".wal")
             decoy.write_bytes(sentinel)
             decoy_wal.write_bytes(sentinel_wal)
-            if workspace_module._TEMP_BESIDE_STAGING:
+            if layout:
                 workspace_module._claim_temp(staging)
             holder = subprocess.Popen(
                 [
@@ -1479,13 +1648,20 @@ class TestCompact:
                 row = con.execute("SELECT count(*) FROM pkts").fetchone()
                 assert row is not None
                 assert row[0] == 1
-            # With the lock free, compaction runs and reclaims the debris.
+            # With the lock free, compaction runs and reclaims the debris:
+            # all of it on POSIX, where it is inside the private staging
+            # directory. In the Windows layout the claimed temp goes but its
+            # .wal, which no claim covers, stays byte for byte (R4-F1, R5-F2).
             ws.compact()
         assert not staging.exists()
         assert not decoy.exists()
-        assert not decoy_wal.exists()
         leftovers = [p.name for p in tmp_path.iterdir() if p.name != path.name]
-        assert leftovers == []
+        if layout:
+            assert decoy_wal.read_bytes() == sentinel_wal
+            assert leftovers == [decoy_wal.name]
+        else:
+            assert not decoy_wal.exists()
+            assert leftovers == []
 
     def test_swap_refusal_leaves_original_intact(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1690,7 +1866,7 @@ class TestCompact:
 
     @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file locks and renames")
     def test_compact_removes_only_its_own_staging_after_its_swap(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, layout: bool
     ) -> None:
         # The swap installs an inode the finishing compact's lock does not
         # cover, so another process's compact may start at once and create
@@ -1707,8 +1883,9 @@ class TestCompact:
                     "INSERT INTO pkts (frame_number, frame_time) "
                     "VALUES (7, TIMESTAMP '2024-01-01 00:00:00')"
                 )
+        script = _beside(_BLOCK_AFTER_SWAP) if layout else _BLOCK_AFTER_SWAP
         proc = subprocess.Popen(
-            [sys.executable, "-c", _BLOCK_AFTER_SWAP, str(path)],
+            [sys.executable, "-c", script, str(path)],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             text=True,
@@ -1717,9 +1894,12 @@ class TestCompact:
             assert proc.stdout is not None
             assert proc.stdin is not None
             assert proc.stdout.readline().strip() == "SWAPPED"
-            # The first compact's staging directory, holding only its marker.
+            # The first compact's staging directory, holding only its marker,
+            # and in the Windows layout the claim on its swapped-in temp.
             (first,) = _stagings(path)
-            assert sorted(p.name for p in first.iterdir()) == ["remora-compact"]
+            assert sorted(p.name for p in first.iterdir()) == (
+                ["remora-compact", "temp-claim"] if layout else ["remora-compact"]
+            )
             stdin, stdout = proc.stdin, proc.stdout
             finished: list[str] = []
             successor: list[Path] = []
@@ -1733,7 +1913,7 @@ class TestCompact:
                 finished.append(stdout.readline().strip())
                 assert proc.wait(timeout=60) == 0
                 assert _stagings(path) == [mine]
-                assert _compact_temp(path).parent == mine
+                assert _compact_temp(path) == workspace_module._staging_temp(mine)
 
             real_connect = workspace_module._connect
 
@@ -1770,7 +1950,7 @@ class TestCompact:
         assert leftovers == []
 
     def test_hard_killed_compact_leaves_original_and_next_compact_recovers(
-        self, tmp_path: Path
+        self, tmp_path: Path, layout: bool
     ) -> None:
         path = tmp_path / "ws.duckdb"
         with Workspace(path, mode="rw") as ws:  # noqa: SIM117
@@ -1780,7 +1960,12 @@ class TestCompact:
                     "VALUES (7, TIMESTAMP '2024-01-01 00:00:00')"
                 )
         proc = subprocess.Popen(
-            [sys.executable, "-c", _BLOCK_AT_SWAP, str(path)],
+            [
+                sys.executable,
+                "-c",
+                _beside(_BLOCK_AT_SWAP) if layout else _BLOCK_AT_SWAP,
+                str(path),
+            ],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             text=True,
@@ -1804,8 +1989,9 @@ class TestCompact:
         ready = _compact_temp(path)
         assert ready.is_file()
         assert (staging / "remora-compact").is_file()
-        if sys.platform != "win32":
+        if not layout:
             assert ready.parent == staging
+        if sys.platform != "win32":
             assert stat.S_IMODE(os.lstat(ready).st_mode) == stat.S_IMODE(os.lstat(path).st_mode)
         with Workspace(path) as ws, ws.read() as con:
             rows = con.execute("SELECT frame_number FROM pkts").fetchall()
