@@ -87,7 +87,7 @@ from remora.workspace.materialize import (
     detect_tshark_version,
     materialize_into,
 )
-from remora.workspace.permissions import copy_permissions
+from remora.workspace.permissions import copy_permissions, copy_permissions_to_descriptor
 from remora.workspace.query import Query
 from remora.workspace.schema import check_compatible, create_schema
 from remora.workspace.streams import StreamsResult, build_streams
@@ -358,7 +358,7 @@ def _same_file(path: Path, claim: bytes) -> bool:
         return False
 
 
-def _create_temp_beside(staging: Path) -> bytes:
+def _create_temp_beside(staging: Path, source: Path) -> bytes:
     """Create the Windows sibling temp of ``staging`` as a new, empty database.
 
     A pathname found free proves nothing: another program can create a file
@@ -372,9 +372,19 @@ def _create_temp_beside(staging: Path) -> bytes:
     later removal check the file they act on against, so a file that has
     since replaced the temp at its name is never swapped in or removed.
 
+    Through the same descriptor, before anything is written into the file,
+    it gets the access restrictions of ``source``, the workspace file
+    (:func:`remora.workspace.permissions.copy_permissions_to_descriptor`).
+    The claim and the restrictions are thus bound to one file, the one this
+    call created: a file another program puts at the temp's name, at any
+    instant, keeps its own permissions (R8-F1), and ``ATTACH`` of it is
+    refused by the claim.
+
     Raises:
         FileExistsError: Something is already at the temp's name; it is left
             alone.
+        WorkspaceError: ``source``'s restrictions could not be carried onto
+            the temp; the temp is removed.
         OSError: The temp could not be created, filled or claimed; whatever
             this call created is removed.
     """
@@ -388,6 +398,10 @@ def _create_temp_beside(staging: Path) -> bytes:
             # whatever is at its name by now.
             st = os.fstat(f.fileno())
             claim = _temp_claim(st)
+            try:
+                copy_permissions_to_descriptor(source, f.fileno(), name=tmp)
+            except OSError as exc:
+                raise WorkspaceError(_restrictions_refused(source, exc)) from exc
             f.write(image)
             f.flush()
             _claim_temp(staging, st)
@@ -516,6 +530,15 @@ def _remove_temp(staging: Path, claim: bytes | None) -> None:
     recorded: bytes = claim
     if _same_file(tmp, recorded):
         remove_file(tmp, lambda st: _is_claimed(st, recorded), holding=staging)
+
+
+def _restrictions_refused(source: Path, exc: OSError) -> str:
+    """The refusal when the temp cannot be given the workspace's restrictions."""
+    return (
+        f"compact() could not give the rewritten file the access restrictions of {source} "
+        f"({exc}), and refuses rather than copy the workspace into a file other users may "
+        "be able to open. The workspace is unchanged"
+    )
 
 
 def _replaced_temp(tmp: Path) -> str:
@@ -1525,14 +1548,20 @@ class Workspace:
         its ``.wal``, which no mode is ever set on, needs a path through that
         directory (#147). On Windows DuckDB holds both without read or write
         sharing from ``ATTACH`` on, before any row is written. Whatever the
-        platform, as soon as the temp is attached and while it is still an
-        empty database,
-        :func:`remora.workspace.permissions.copy_permissions` gives it the
+        platform, while the temp is still an empty database it gets the
         source's mode bits and, on Windows, the source's DACL and its
         inheritance setting, so the compacted file is exactly as restricted
         as the workspace was: a ``0o640`` workspace stays ``0o640``, and a
         Windows workspace made private inside a shared directory stays
-        private (#132). If the restrictions cannot be carried over, compact
+        private (#132). On POSIX
+        :func:`remora.workspace.permissions.copy_permissions` sets them by
+        name right after ``ATTACH``, inside the private directory. On Windows,
+        where the temp's name is in the shared directory and another program
+        can put its own file there at any instant,
+        :func:`remora.workspace.permissions.copy_permissions_to_descriptor`
+        sets them before ``ATTACH``, through the descriptor that created the
+        temp and from which its claim was read, so they reach only that file
+        and never one at its name (R8-F1). If the restrictions cannot be carried over, compact
         raises :class:`WorkspaceError` before copying any row, and the
         workspace is unchanged. Ownership and other metadata follow the
         fresh file, because changing them would need privileges compact does
@@ -1744,12 +1773,13 @@ class Workspace:
                     if _TEMP_BESIDE_STAGING:
                         # A name found free proves nothing: another program
                         # can create a file there at any moment. So the temp
-                        # is created here, exclusively, and claimed while it
-                        # is held open; from then on it is removed, here or
+                        # is created here, exclusively, and claimed and given
+                        # the workspace's restrictions through the descriptor
+                        # that created it; from then on it is removed, here or
                         # by a later compact, only while it is still that
                         # very file (see _create_temp_beside).
                         try:
-                            tmp_claim = _create_temp_beside(staging)
+                            tmp_claim = _create_temp_beside(staging, target)
                         except FileExistsError as exc:
                             raise WorkspaceError(taken) from exc
                     tmp_ours = True
@@ -1757,28 +1787,29 @@ class Workspace:
                     assert row is not None
                     con.execute(f"ATTACH '{_quote_path(str(tmp))}' AS compact_dst")
                     attached = True
-                    if tmp_claim is not None and not _same_file(tmp, tmp_claim):
-                        # Replaced between its creation and the ATTACH, so
-                        # what is attached is someone else's file.
-                        raise WorkspaceError(_replaced_temp(tmp))
-                    # The temp has just been created, by DuckDB or on Windows
-                    # by _create_temp_beside, with this process's defaults
-                    # (the umask; on Windows the directory's inherited ACL),
-                    # which may be wider than the workspace file's own
-                    # restrictions. Carry those over while the temp is still
-                    # an empty database, so the compacted file ends up exactly
-                    # as restricted as the workspace, and on Windows no row is
-                    # ever written into it while it is more open. If that is
-                    # impossible, refuse before copying.
-                    try:
-                        copy_permissions(target, tmp)
-                    except OSError as exc:
-                        raise WorkspaceError(
-                            f"compact() could not give the rewritten file the access "
-                            f"restrictions of {target} ({exc}), and refuses rather than copy "
-                            "the workspace into a file other users may be able to open. "
-                            "The workspace is unchanged"
-                        ) from exc
+                    if tmp_claim is not None:
+                        # _create_temp_beside already gave the Windows temp
+                        # the workspace's restrictions, through the descriptor
+                        # that created and claimed it, so nothing here changes
+                        # a file by name (R8-F1). Replaced between its
+                        # creation and the ATTACH, what is attached is someone
+                        # else's file, left with its own permissions.
+                        if not _same_file(tmp, tmp_claim):
+                            raise WorkspaceError(_replaced_temp(tmp))
+                    else:
+                        # DuckDB has just created the POSIX temp with the
+                        # umask, which may be wider than the workspace file's
+                        # own mode. Carry that over while the temp is still an
+                        # empty database, so the compacted file ends up exactly
+                        # as restricted as the workspace; if that is
+                        # impossible, refuse before copying. By name, which is
+                        # safe only because the temp is inside the private
+                        # staging directory, where no other user can put a
+                        # file at that name.
+                        try:
+                            copy_permissions(target, tmp)
+                        except OSError as exc:
+                            raise WorkspaceError(_restrictions_refused(target, exc)) from exc
                     con.execute(f"COPY FROM DATABASE {_quote_ident(str(row[0]))} TO compact_dst")
                     con.execute("DETACH compact_dst")
                     attached = False

@@ -31,7 +31,7 @@ import pytest
 
 import remora.workspace.workspace as workspace_module
 from remora.workspace.errors import WorkspaceError
-from remora.workspace.permissions import copy_permissions
+from remora.workspace.permissions import copy_permissions, copy_permissions_to_descriptor
 from remora.workspace.swap import replace_file
 from remora.workspace.workspace import Workspace
 
@@ -224,6 +224,19 @@ def shared_dir(tmp_path: Path) -> Iterator[Path]:
 RESTRICTIONS = ["private", pytest.param("deny-guests", marks=windows_only)]
 
 
+@pytest.fixture(params=["native", "windows"])
+def layout(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> bool:
+    """Run compact() in this platform's layout and in the Windows one.
+
+    Returns whether the temp is beside the staging directory, as on Windows,
+    where compact creates it and sets its restrictions through the creating
+    descriptor rather than by name.
+    """
+    if request.param == "windows":
+        monkeypatch.setattr(workspace_module, "_TEMP_BESIDE_STAGING", True)
+    return workspace_module._TEMP_BESIDE_STAGING
+
+
 class _ProbingConnection:
     """compact()'s source connection, running a probe as a statement starts."""
 
@@ -338,6 +351,45 @@ class TestCopyPermissions:
         assert _access(dst) == _access(src)
         assert dst.read_bytes() == b"dst"
 
+    @pytest.mark.parametrize("restriction", RESTRICTIONS)
+    def test_descriptor_gets_the_source_restrictions(
+        self, shared_dir: Path, restriction: str
+    ) -> None:
+        src = shared_dir / "src"
+        src.write_bytes(b"src")
+        _restrict(src, restriction)
+        dst = shared_dir / "dst"
+        fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o666)
+        try:
+            assert _access(dst) != _access(src)  # the directory's default is wider
+            copy_permissions_to_descriptor(src, fd, name=dst)
+            os.write(fd, b"dst")  # the descriptor stays writable
+        finally:
+            os.close(fd)
+        assert _access(dst) == _access(src)
+        assert dst.read_bytes() == b"dst"
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="renames over an open CRT file")
+    def test_descriptor_never_reaches_a_file_put_at_its_name(self, shared_dir: Path) -> None:
+        # R8-F1: the restrictions go to the file the descriptor is open on,
+        # not to whatever is at its name by then.
+        src = shared_dir / "src"
+        src.write_bytes(b"src")
+        os.chmod(src, 0o600)
+        dst = shared_dir / "dst"
+        theirs = shared_dir / "theirs"
+        theirs.write_bytes(b"someone else's file")
+        os.chmod(theirs, 0o604)
+        fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        try:
+            os.replace(theirs, dst)
+            copy_permissions_to_descriptor(src, fd, name=dst)
+            assert stat.S_IMODE(os.fstat(fd).st_mode) == 0o600
+        finally:
+            os.close(fd)
+        assert dst.read_bytes() == b"someone else's file"
+        assert stat.S_IMODE(os.lstat(dst).st_mode) == 0o604
+
     @windows_only
     def test_inherited_entries_stay_inherited(self, shared_dir: Path) -> None:
         src = shared_dir / "src"
@@ -357,7 +409,7 @@ class TestCopyPermissions:
 class TestCompactPermissions:
     @pytest.mark.parametrize("restriction", RESTRICTIONS)
     def test_temp_is_restricted_before_any_row_is_copied(
-        self, shared_dir: Path, monkeypatch: pytest.MonkeyPatch, restriction: str
+        self, shared_dir: Path, monkeypatch: pytest.MonkeyPatch, restriction: str, layout: bool
     ) -> None:
         path = shared_dir / "ws.duckdb"
         with Workspace(path, mode="rw") as ws:
@@ -386,11 +438,9 @@ class TestCompactPermissions:
                 assert _read_open_error(wal) == _ERROR_SHARING_VIOLATION
 
         with Workspace(path, mode="rw") as ws:
-            _probe_compact(
-                monkeypatch, {"COPY FROM DATABASE": at_copy, "DETACH compact_dst": at_detach}
-            )
-            ws.compact()
-            monkeypatch.undo()
+            with monkeypatch.context() as m:
+                _probe_compact(m, {"COPY FROM DATABASE": at_copy, "DETACH compact_dst": at_detach})
+                ws.compact()
             with ws.read() as con:
                 rows = con.execute("SELECT frame_number FROM pkts").fetchall()
         assert seen == [restricted]
@@ -398,14 +448,15 @@ class TestCompactPermissions:
         assert rows == [(7,)]
 
     def test_refuses_before_copying_when_restrictions_cannot_be_carried(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, layout: bool
     ) -> None:
         path = tmp_path / "ws.duckdb"
         error = PermissionError(13, "simulated: cannot set permissions", "the temp")
         copies: list[str] = []
+        attaches: list[str] = []
         temps: list[Path] = []
 
-        def cannot_copy(src: Path, dst: Path) -> None:
+        def check(src: Path, dst: Path) -> None:
             # Names only: compact works on the realpath, which may respell
             # the directory (macOS /private/var, Windows 8.3 short names).
             tmp = _compact_temp(path)
@@ -415,15 +466,37 @@ class TestCompactPermissions:
                 tmp.name,
             )
             temps.append(tmp)
+
+        def cannot_copy(src: Path, dst: Path) -> None:
+            assert not layout  # the Windows layout never sets them by name
+            check(src, dst)
+            raise error
+
+        def cannot_copy_to_descriptor(src: Path, fd: int, *, name: Path | None = None) -> None:
+            assert layout
+            assert name is not None
+            # Through the descriptor that created the temp, before ATTACH.
+            assert os.path.samestat(os.fstat(fd), os.lstat(name))
+            assert attaches == []
+            check(src, name)
             raise error
 
         with Workspace(path, mode="rw") as ws:
             _insert_row(ws)
-            monkeypatch.setattr(workspace_module, "copy_permissions", cannot_copy)
-            _probe_compact(monkeypatch, {"COPY FROM DATABASE": lambda: copies.append("copy")})
-            with pytest.raises(WorkspaceError, match="access restrictions") as excinfo:
-                ws.compact()
-            monkeypatch.undo()
+            with monkeypatch.context() as m:
+                m.setattr(workspace_module, "copy_permissions", cannot_copy)
+                m.setattr(
+                    workspace_module, "copy_permissions_to_descriptor", cannot_copy_to_descriptor
+                )
+                _probe_compact(
+                    m,
+                    {
+                        "ATTACH": lambda: attaches.append("attach"),
+                        "COPY FROM DATABASE": lambda: copies.append("copy"),
+                    },
+                )
+                with pytest.raises(WorkspaceError, match="access restrictions") as excinfo:
+                    ws.compact()
             assert excinfo.value.__cause__ is error
             assert "unchanged" in str(excinfo.value)
             assert copies == []
@@ -437,6 +510,71 @@ class TestCompactPermissions:
             ws.compact()  # the refusal released the lock and both identity flags
         leftovers = [p.name for p in tmp_path.iterdir() if p.name != path.name]
         assert leftovers == []
+
+    @pytest.mark.parametrize("when", ["at ATTACH", "after the check"])
+    def test_windows_temp_replaced_in_flight_keeps_its_own_permissions(
+        self, shared_dir: Path, monkeypatch: pytest.MonkeyPatch, when: str
+    ) -> None:
+        # R8-F1: in the Windows layout the temp's name is in the shared
+        # directory, so another program can put its own file there at any
+        # instant: as ATTACH starts, or right after compact's identity check
+        # following it. The workspace's restrictions go to the temp through
+        # the descriptor that created and claimed it, never by name, so the
+        # other file keeps its own (narrower) permissions and its content;
+        # compact refuses it, and the workspace keeps its rows and its own
+        # restrictions.
+        monkeypatch.setattr(workspace_module, "_TEMP_BESIDE_STAGING", True)
+        path = shared_dir / "ws.duckdb"
+        with Workspace(path, mode="rw") as ws:
+            _insert_row(ws)
+        workspace_access = _access(path)
+        # Made beside it first, so the replacement cannot take a freed inode.
+        theirs = shared_dir / "theirs"
+        with Workspace(theirs, mode="rw") as other, other.write() as con:
+            con.execute(
+                "INSERT INTO pkts (frame_number, frame_time) "
+                "VALUES (99, TIMESTAMP '2024-01-01 00:00:00')"
+            )
+        _restrict(theirs, "private")
+        their_access = _access(theirs)
+        # Given the workspace's restrictions, their file would be wider.
+        assert their_access != workspace_access
+        content = theirs.read_bytes()
+        monkeypatch.setattr("secrets.token_hex", lambda n: "7" * 16)
+        tmp = path.with_name("remora-compact-" + "7" * 16 + ".tmp")
+        replaced: list[str] = []
+
+        def replace() -> None:
+            # replace_file, not os.replace: after ATTACH the temp is held by
+            # DuckDB, and on Windows only a POSIX-semantics rename can
+            # replace a file DuckDB holds open.
+            replace_file(theirs, tmp)
+            replaced.append(when)
+
+        with Workspace(path, mode="rw") as ws:
+            with monkeypatch.context() as m:
+                if when == "at ATTACH":
+                    _probe_compact(m, {"ATTACH": lambda: None if replaced else replace()})
+                else:
+                    real_same_file = workspace_module._same_file
+
+                    def check_then_replace(p: Path, claim: bytes) -> bool:
+                        ok = real_same_file(p, claim)
+                        if ok and not replaced:
+                            replace()
+                        return ok
+
+                    m.setattr(workspace_module, "_same_file", check_then_replace)
+                with pytest.raises(WorkspaceError, match="replaced by a file it did not create"):
+                    ws.compact()
+            with ws.read() as con:
+                rows = con.execute("SELECT frame_number FROM pkts").fetchall()
+        assert replaced == [when]
+        assert rows == [(7,)]
+        assert _access(path) == workspace_access
+        assert tmp.read_bytes() == content
+        assert _access(tmp) == their_access
+        assert sorted(p.name for p in shared_dir.iterdir()) == sorted([path.name, tmp.name])
 
 
 def _mode(path: Path) -> int:
