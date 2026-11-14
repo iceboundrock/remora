@@ -22,6 +22,7 @@ from dfilter_corpus import (
     DF_SRC_AND_PORT,
     DF_SRC_OR_PORT,
 )
+from remora.expr import Expr
 from remora.fields import FieldRef, RawPacket
 from remora.planner import Plan, make_plan
 
@@ -33,6 +34,7 @@ TIME = FieldRef[datetime]("frame.time", "FT_ABSOLUTE_TIME", False)
 # (empty bytes) — the simplest way to force a residual Expr that references
 # an already-known field NAME; projection dedup only ever looks at .name.
 PORT_BYTES = FieldRef[bytes]("tcp.port", "FT_BYTES", True)
+OID_NAME = FieldRef[str]("snmp.name", "FT_OID", True)
 
 JULY_2021 = datetime(2021, 7, 1, tzinfo=timezone.utc)  # epoch 1625097600
 
@@ -108,6 +110,45 @@ class TestUnsupportedExprFallback:
     def test_user_error_literal_raises_and_is_not_swallowed(self) -> None:
         with pytest.raises(ValueError, match="not-an-ip"):
             make_plan([SRC == "not-an-ip"])
+
+
+class TestOidResidualReadsEk:
+    """A residual over an OID forces ek mode (#149): fields mode reads a lone
+    empty OID, which an arc of 2**32 or more prints, as absence."""
+
+    @pytest.mark.parametrize(
+        "term",
+        [
+            OID_NAME == "",
+            OID_NAME != "1.3.6.1",
+            OID_NAME < "1.3.6",
+            OID_NAME.matches("^$"),
+            (SRC == "10.0.0.1") | (OID_NAME == "1.3.6.1"),
+        ],
+        ids=["eq-empty", "ne", "lt", "matches", "inside-or"],
+    )
+    def test_oid_residual_forces_ek_under_a_projection(self, term: Expr) -> None:
+        plan = make_plan([term], select=[SRC])
+        assert plan.residual is not None
+        assert plan.mode == "ek"
+        assert plan.projection is None
+
+    def test_the_residual_sees_the_lone_empty_value_ek_keeps(self) -> None:
+        plan = make_plan([OID_NAME == ""], select=[SRC])
+        assert plan.residual is not None
+        assert plan.residual(FakePacket({"snmp.name": ("",)})) is True
+        assert plan.residual(FakePacket({})) is False
+
+    def test_pushed_oid_presence_keeps_fields_mode(self) -> None:
+        plan = make_plan([OID_NAME.present()], select=[SRC])
+        assert plan.dfilter == "(snmp.name)"
+        assert plan.residual is None
+        assert plan.mode == "fields"
+
+    def test_a_selected_oid_without_an_oid_residual_keeps_fields_mode(self) -> None:
+        plan = make_plan([TIME >= JULY_2021], select=[OID_NAME])
+        assert plan.residual is not None
+        assert plan.mode == "fields"
 
 
 class TestExtendedOperatorPlanning:

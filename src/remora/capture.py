@@ -10,17 +10,43 @@ mode-appropriate reader, and yields packets that pass the residual predicate.
 ``-T fields`` branch reachable from the public surface: a ``Capture`` carrying
 a projection plans to fields mode, where tshark renders only the named columns,
 instead of the ``-T ek`` whole-packet NDJSON a bare ``Capture`` falls back to.
-Without a projection ``plan()`` passes ``select=None`` and the plan is ek-mode,
-which is also what an opaque callable term forces regardless of any projection
-— nothing bounds the fields an arbitrary lambda reads, so it must be handed all
-of them.
+Without a projection ``plan()`` passes ``select=None`` and the plan is ek-mode.
+Two kinds of term force ek mode regardless of any projection:
 
-The two modes differ in exactly one observable way, and it is deliberate: a
-field *outside* a fields-mode projection raises ``FieldNotProjectedError``,
-because not having asked for a field is a caller bug rather than field absence,
-while ek mode has no projection to be outside of and answers every field name.
-Absence itself is unchanged either way — ``()`` from ``get_raw``, ``None`` from
-scalar instance access, ``()`` from multi instance access.
+* an opaque callable — nothing bounds the fields an arbitrary lambda reads, so
+  it must be handed all of them;
+* a residual ``Expr`` that reads an ``FT_OID`` field (#149) — tshark prints an
+  OID with an arc of 2**32 or more as the empty string, and ``-T fields``
+  cannot tell a lone empty value from absence, so the residual reads ``-T ek``
+  to get the same row set with or without ``select()``. Value tests on an OID
+  are never pushed to ``-Y``, so ``SNMP.name == "..."`` is such a residual; a
+  bare presence test is pushed and does not force anything.
+
+A capture forced into ek mode this way parses whole packets, and, having no
+projection, answers every field name, including fields it never selected.
+``plan().mode`` says which mode a query runs in.
+
+The two modes differ observably in two ways. One is deliberate: a field
+*outside* a fields-mode projection raises ``FieldNotProjectedError``, because
+not having asked for a field is a caller bug rather than field absence, while
+ek mode has no projection to be outside of and answers every field name.
+
+The other is a reader limitation, not a design choice: ``-T fields`` prints a
+field whose only occurrence is the empty string as an empty column, which is
+how it prints absence too, so the fields reader reports such a field as absent,
+while ``-T ek`` keeps the empty occurrence. A selected ``snmp.name`` whose lone
+value is an OID tshark prints empty reads ``("",)`` from ``get_raw`` in ek mode
+and ``()`` in fields mode; a lone empty value of any other field differs the
+same way. Empty occurrences among several survive both modes. The "Absent vs.
+empty" section of :mod:`remora.reader.fields_reader` documents the limitation,
+and ``docs/semantics.md`` ("Reader representation: object identifiers") what it
+costs for OIDs; it is why an OID residual forces ek mode above.
+
+So the absence *contract* is the same in both modes — an absent field is ``()``
+from ``get_raw``, ``None`` from scalar instance access and ``()`` from multi
+instance access — but which fields count as absent is not: fields mode cannot
+tell a lone empty value from absence and so reports it through that contract,
+where ek mode reports the empty value.
 
 Lifecycle: the ``try/finally`` in ``__iter__`` guarantees ``close()`` on the
 subprocess however iteration ends — exhaustion, early ``break``, a consumer
@@ -80,10 +106,22 @@ class Capture:
     typed access.
 
     A ``Capture`` with no ``select()`` reads whole packets (``-T ek``) and so
-    answers any field name; one carrying a projection reads only its columns
-    (``-T fields``) and raises ``FieldNotProjectedError`` for anything else.
-    See :meth:`select` and the module docstring for why that is the one
-    difference between the two modes.
+    answers any field name; one carrying a projection normally reads only its
+    columns (``-T fields``) and raises ``FieldNotProjectedError`` for anything
+    else. Two kinds of term override the projection and force ``-T ek``: an
+    opaque callable, and a residual ``Expr`` that reads an ``FT_OID`` field.
+    Such a capture parses whole packets and answers every field name, selected
+    or not; ``plan().mode`` says which mode a query runs in. See :meth:`select`
+    and the module docstring for why.
+
+    The projection check is not the only difference between the modes. A
+    selected field whose only occurrence is the empty string (an OID with an
+    arc of 2**32 or more, say) reads as that empty occurrence in ek mode but as
+    absent in fields mode, because ``-T fields`` prints both as an empty
+    column; the module docstring and the "Absent vs. empty" section of
+    :mod:`remora.reader.fields_reader` have the details. Absence is reported
+    the same way in both modes; fields mode just counts that one case as
+    absence.
 
     "Immutable" is about the *query*: the terms, the path and the binary
     never change after construction. The one mutable field is a memo —
@@ -148,7 +186,7 @@ class Capture:
         projected at all unless selected, since tshark has already filtered on
         them.
 
-        Two things do not follow from calling this, both by planner design
+        Three things do not follow from calling this, all by planner design
         (:func:`remora.planner.make_plan`) rather than by anything decided here:
 
         * an opaque callable term still forces ek mode, projection or not.
@@ -156,6 +194,16 @@ class Capture:
           planner must hand it all of them; a projection alongside one is
           honoured as far as it can be (every named field is readable) but
           buys no ``-T fields`` run. ``plan().mode`` says which happened.
+        * a residual ``Expr`` that reads an ``FT_OID`` field also forces ek
+          mode, projection or not (#149). Every value test on an OID is a
+          residual, since none is pushed to ``-Y``; a bare presence test is
+          pushed and forces nothing. ``-T fields`` reads an OID that tshark
+          prints empty as absent when it is the only occurrence, while ``-T
+          ek`` keeps it, so ek mode is what gives the residual the same row
+          set with and without a projection. As with a callable, the
+          projection then buys no ``-T fields`` run: tshark parses whole
+          packets, and fields outside the projection are readable rather than
+          raising ``FieldNotProjectedError``.
         * ``select()`` with no arguments is a no-op rather than "project
           nothing". An empty projection and no projection at all are one
           state, and that state means ek mode — ``-T fields`` with no ``-e``

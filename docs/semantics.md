@@ -445,6 +445,200 @@ workspace schema version to 4, and a version 3 file is refused at open and at
 attach (`docs/workspace.md`, "A parser change can change what a stored value
 means").
 
+## Reader representation: object identifiers
+
+`FT_OID` fields are `str`: #69 kept the text tshark prints and left a richer
+type to #149. #149 measured that text on 4.2.2 (the Ubuntu 24.04 package),
+4.4.19 and 4.6.9 (Debian) over `tests/fixtures/oid.pcap`. All three print the
+same thing in `-T fields` and `-T ek`, except that `-T fields` reads frame 11's
+lone empty value as absence:
+
+<!-- oid-forms:start -->
+
+| frame | field | content octets | prints |
+| --- | --- | --- | --- |
+| 1 | `snmp.name` | `2b 06 01 02 01 01 02 00` | `1.3.6.1.2.1.1.2.0` |
+| 1 | `snmp.value.oid` | `2b 06 01 04 01 bf 08 03 02 0a` | `1.3.6.1.4.1.8072.3.2.10` |
+| 2 | `snmp.enterprise` | `2b 06 01 04 01 09` | `1.3.6.1.4.1.9` |
+| 3 | `snmp.name` | `2b 06 01 02 01 01 0a` | `1.3.6.1.2.1.1.10` |
+| 3 | `snmp.name` | `2b 06 01 02 01 01 09` | `1.3.6.1.2.1.1.9` |
+| 4 | `snmp.name` | `2b` | `1.3` |
+| 4 | `snmp.name` | `88 37 01` | `2.999.1` |
+| 4 | `snmp.name` | `2b 06 01 04 01 90 80 80 80 00` | (empty) |
+| 5 | `snmp.name` | `2b 06 81` | `1.3.6` |
+| 6 | `snmp.name` | `2b 80 01` | `1.3.1` |
+| 7 | `snmp.name` | (none) | `0` |
+| 8 | `snmp.name` | `2b 06 ff 7f` | `1.3.6.16383` |
+| 9 | `snmp.name` | `2b 06 81 80 00` | `1.3.6.16384` |
+| 10 | `snmp.name` | `2b 06 01 02 01 00` | `1.3.6.1.2.1.0` |
+| 10 | `snmp.name` | `2b 06 01 02 01 03` | `1.3.6.1.2.1.3` |
+| 11 | `snmp.name` | `2b 06 01 04 01 90 80 80 80 00` | (empty) |
+
+<!-- oid-forms:end -->
+
+A field value is always numeric dotted decimal. The names Wireshark resolves
+(`iso.3.6.1.4.1.9`, `joint-iso-itu-t.999.1`) appear in the protocol tree and
+the Info column, never in a field value. Frames 4 to 7 and 11 carry encodings
+no conforming agent sends, and they show that the text does not determine the
+bytes:
+
+- An arc of 2^32 or more does not fit Wireshark's 32-bit arcs. The value prints
+  as the empty string, the field is still present, and dissection of the packet
+  stops there. `-T ek` keeps the empty value. `-T fields` keeps it among
+  other occurrences (frame 4), but a lone empty value (frame 11) prints as an
+  empty column, which is how absence prints too: the reader limitation
+  `src/remora/reader/fields_reader.py` documents. The next section says what
+  that costs.
+- An arc whose last octet keeps the continuation bit (`2b 06 81`) is dropped
+  from the text.
+- A non-minimal arc (`80 01`) prints as the minimal one would.
+- Empty content prints `0`.
+
+Frames 8 to 10 are well formed. Frames 8 and 9 put the arcs 16383 and 16384
+side by side, where the encoded length of an arc grows from two octets to
+three. Frame 10 carries one varbind on each side of the subtree
+`1.3.6.1.2.1.1` and none inside it.
+
+### What reaches each engine
+
+| shape | `FT_OID` |
+| --- | --- |
+| presence | pushed to `-Y` |
+| `==`, `!=`, `in {a, b}`, `<`, `<=`, `>`, `>=`, `in {lo .. hi}` | refused on `-Y`, residual in Python; SQL on a `VARCHAR` column |
+| `contains`, `matches` | refused on `-Y`, residual in Python; SQL on a `VARCHAR` column |
+
+Before #149, each of these filters was pushed with a quoted string literal.
+4.2.2, 4.4.19 and 4.6.9 all reject a quoted OID (`ASN.1 object identifier cannot
+be converted from a string`), so any value filter on an OID field failed the
+whole capture. `matches` is rejected on every build, and `contains` accepts
+neither a string nor a byte needle. tshark does accept a bare dotted literal
+(`snmp.name == 1.3.6.1.2.1.1.2.0`). That form is still not pushed:
+
+- tshark compares the encoded bytes, while Python and SQL compare the printed
+  text. `snmp.name == 1.3.6` does not select frame 5, which prints `1.3.6`.
+- tshark orders OIDs by their content octets, compared byte by byte. That is
+  neither the text's order nor the numeric order of the arcs, even for well
+  formed values. It agrees with arc order at `.9` and `.10`, so
+  `snmp.name > 1.3.6.1.2.1.1.9` selects frame 3, where the text puts `.10`
+  below `.9`. It does not agree past an arc of 16383: `ff 7f` (16383) sorts
+  above `81 80 00` (16384), so `snmp.name > 1.3.6.16384` selects frame 8
+  (`1.3.6.16383`) on every build, which neither the text nor the arcs put
+  above it. The two orders can part only where the first arcs that differ take
+  different numbers of octets and the shorter takes two or more; with equal
+  lengths, or a one-octet arc against a longer one, they agree.
+- Two-arc literals lex differently by version: `snmp.name == 1.3` is an OID on
+  4.2.2 and a rejected `Double` on 4.4.19 and 4.6.9.
+
+So every value test runs over the printed text, in Python on the pcap path and
+in SQL over the stored text in the workspace. A residual that reads an OID field
+makes the planner read `-T ek` even when the query has a projection
+(`src/remora/planner.py`, step 6). In `-T fields` mode the residual would see
+frame 11 as a packet without `snmp.name`, so `name == ""` would miss it and
+`name != ""` would select it, and the row set would depend on whether the query
+called `select()`.
+
+The workspace does not get that choice: it materializes through `-T fields`,
+so it stores frame 11's lone empty value as absent (`NULL` in a scalar column,
+`[]` in a list column), as it stores a lone empty value of any field. The pcap
+path and the workspace's SQL agree on every frame except such a packet, and on
+it only for a test whose answer differs between the empty string and absence:
+`name == ""`, `name != ""`, `name < x` for any non-empty `x`, `name <= x`,
+a `matches` the empty string satisfies, and presence, which `-Y` answers from
+the dissection on the pcap path. The malformed frames 4 to 7 agree. Keeping the
+value would take a reader change: on 4.4.19, `-E quote=d` prints a present
+empty value as `""` and an absent one as nothing, but it reframes every column
+and changes every stored cache key, so it is outside #149.
+
+Three consequences follow from the text representation:
+
+- `<`, `<=`, `>` and `>=` compare text, so `"1.3.6.1.2.1.1.10" < "1.3.6.1.2.1.1.9"`.
+- `contains("1.3.6.1.2.1.1")` also matches `1.3.6.1.2.1.10`.
+- A subtree test has to anchor on the dot: `matches(r"^1\.3\.6\.1\.2\.1\.1(\.|$)")`.
+
+A fourth holds for any representation. On a multi-value field such as
+`snmp.name`, each comparison is its own any-occurrence test, in Python, in SQL
+and on `-Y` alike. `(name >= "1.3.6.1.2.1.1") & (name < "1.3.6.1.2.1.2")`
+selects frame 10: `1.3.6.1.2.1.3` satisfies the first half and `1.3.6.1.2.1.0`
+the second, and neither is in the subtree. A membership range,
+`name.in_([(lo, hi)])`, is the one ordered test that all three engines apply
+to a single occurrence.
+
+`tests/test_dfilter.py::TestOid` pins the refusals, and the `oid-*` rows of
+`tests/test_semantics_table.py` run the three backends.
+`tests/integration/test_oid.py` checks the table above against a live tshark in
+both reader modes. It also pins the tshark behavior behind the refusal and
+asserts that the plan, with and without a projection, and the residual over
+`-T ek` select the declared frames, and that the workspace's SQL selects them
+too except for the frame 11 rows above, which it pins.
+
+### A structured representation (#149's recommendation)
+
+The text type is the one shipped. #149 compared it with two structured forms:
+
+| | `str` (shipped) | `tuple[int, ...]` | `OID` value object |
+| --- | --- | --- | --- |
+| order | text, wrong at `.9`/`.10` | numeric, arc by arc; not tshark's byte order | numeric, arc by arc; not tshark's byte order |
+| subtree test | regex anchored on `.` | slice compare | `f.within(p)`, a new per-occurrence IR node |
+| stub type | `Field[str]` | needs a generic alias in `FTypeInfo.py_type: type[T]` | `Field[OID]`, imported like `UUID` |
+| literal | any string | not in the `Expr` literal union | `OID`, or dotted text through `coerce_literal` |
+| workspace column | `VARCHAR` | `UINTEGER[]` | `UINTEGER[]` |
+| parse cost | none | about 1 µs | about 1 µs, as `uuid.UUID` |
+
+The recommendation is a small immutable `OID` class in `remora.values`. Until
+it lands, `str` stays, with the refusals above. The class should work like this:
+
+- It holds the arcs, orders by them numerically, and renders `str(oid)` as the
+  text tshark prints. Numeric arc order is the order this API proposes, not
+  tshark's: tshark orders the content octets, which puts `1.3.6.16383` above
+  `1.3.6.16384` (frames 8 and 9). No representation gives parity with `-Y`
+  ordering, which is one more reason value tests stay off `-Y`.
+- It is not a `str` subclass. A subclass would keep text order under `<`,
+  which is the defect the type exists to fix.
+- It reads only canonical dotted decimal (one or more arcs, no leading zeros)
+  with arcs below 2^32. The empty rendering raises `ValueError`, as every
+  malformed text does, and `get_raw` still returns it.
+- `contains` and `matches` become `TypeError`, as on a GUID. A caller that
+  needs the text has `str(oid)`.
+- A subtree test asks whether one occurrence starts with the arcs of `p`. It
+  gets a new IR node, a subtree test such as `f.within(p)` that every backend
+  applies per occurrence: in Python, any occurrence whose leading arcs equal
+  `p`'s; in SQL, `f[1:len(p)] = p` on a scalar column and, on a list column,
+  the `list_filter` any-occurrence form that `in {lo .. hi}` already uses,
+  over `x[1:len(p)] = p`; on `-Y`, refused like every other value test.
+  Scalar and multi-value fields lower to the same node, so the API has one
+  spelling, and a prefix compare needs no upper bound.
+
+  Existing operators are not a substitute. On a multi-value field,
+  `(f >= p) & (f < next(p))` is two independent any-occurrence tests, so
+  frame 10 matches `p = 1.3.6.1.2.1.1` with no member of the subtree, whatever
+  the arcs' order. `f.in_([(p, next(p))])` does test one occurrence, but its
+  range is closed, so it also selects `next(p)` itself. On a scalar field the
+  two bounds are exact only if `next(p)` is the smallest OID above every
+  descendant of `p`. That is `p` with its last arc incremented, unless the
+  last arc is 2^32 - 1, which has no successor below 2^32. Then the increment
+  carries: drop the trailing arcs equal to 2^32 - 1 and increment the last
+  arc left, so `next(1.3.6.4294967295)` is `1.3.7`. Nothing lies between them
+  but descendants of `p`, because no arc can exceed 2^32 - 1. If every arc is
+  2^32 - 1, nothing sorts above the subtree and `f >= p` alone is the test.
+  The node avoids that boundary altogether.
+- The column type moves to `UINTEGER[]` (`UINTEGER[][]` for a multi-value
+  field), because DuckDB orders lists element by element, as the arcs order.
+  A `VARCHAR` column would keep SQL on text order and fork it from Python.
+- Value tests stay refused on `-Y`. tshark's byte comparison forks from the
+  arcs on the malformed rows above, and its order forks from them on well
+  formed values too (frames 8 and 9).
+
+Migration follows #69's precedent for GUIDs:
+
+- One PR changes the static type of every `FT_OID` field, regenerates the
+  stubs and raises the workspace `SCHEMA_VERSION`. A version 4 file is refused
+  at open and at attach.
+- Today that is the six core `snmp` and `tls` fields. No extra ships one.
+- A dotted `str` literal keeps compiling through `coerce_literal`, so
+  `SNMP.name == "1.3.6.1.2.1.1.2.0"` keeps its meaning. Instance access returns
+  an `OID` where it returned `str`, which breaks callers that use string
+  methods on the value. There is no flag and no dual mode.
+
 ## What is still divergent
 
 - **`matches` on non-string fields** is a `TypeError` on all three backends —
@@ -456,6 +650,15 @@ means").
   display filters either (#69, measured above), because tshark's answer
   depends on its version. The planner keeps them as residual Python
   predicates; the row set is unchanged.
+- **Value tests on an OID** are not pushed down at all (#149, measured
+  above). tshark rejects the quoted literal, and its bare-literal comparison
+  reads the encoded bytes where the other two read the text. The planner
+  evaluates them as Python predicates over the text, which is what the
+  workspace's SQL compares too, and reads `-T ek` to do it, so the row set does
+  not depend on the projection or the tshark build. The workspace differs on
+  one malformed case: it stores an OID whose only occurrence prints empty (an
+  arc of 2^32 or more) as absent, so a test the empty string answers
+  differently from absence diverges on that packet (measured above).
 - **IEEE-754 NaN literals** reach the same row set three different ways, so this
   is a mechanism difference rather than a semantic one. Python's comparisons
   with NaN are all false, which is what `predicate.py` evaluates directly and

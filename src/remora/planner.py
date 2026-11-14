@@ -31,6 +31,14 @@ Planning algorithm
    deduplicated by field name (select order first, then residual-field
    order). Fields of *pushed* conjuncts are not projected — tshark already
    filtered on them — unless they are also selected: no over-projection.
+6. One exception to 5 (#149): a residual ``Expr`` that reads an ``FT_OID``
+   field forces ``"ek"`` even under a projection. tshark prints an OID with an
+   arc of 2**32 or more as the empty string, and ``-T fields`` cannot tell a
+   lone empty value from absence (:mod:`remora.reader.fields_reader`), while
+   ``-T ek`` keeps it. A presence test is pushed to ``-Y`` and sees the field,
+   but a value test on an OID is never pushed, so in fields mode
+   ``SNMP.name == ""`` would miss the packet and ``!= ""`` would select it.
+   ek mode costs a slower parse, not a different row set.
 """
 
 from __future__ import annotations
@@ -121,6 +129,19 @@ class Plan:
         )
 
 
+#: FTypes with a reachable empty rendering a residual must see: ``-T fields``
+#: reads a lone empty value as absent, so a residual over one of them reads
+#: ``-T ek`` (module docstring, step 6). Other string fields keep fields mode:
+#: their value tests are pushed to ``-Y``, which sees the value, and reach a
+#: residual only beside a refused term in an ``|``.
+_LONE_EMPTY_FTYPES = frozenset({"FT_OID"})
+
+
+def _reads_lone_empty(expr: Expr) -> bool:
+    """Whether a residual ``Expr`` reads a field whose lone empty value fields mode drops."""
+    return any(field.ftype in _LONE_EMPTY_FTYPES for field in field_refs(expr))
+
+
 def make_plan(
     terms: Sequence[QueryTerm],
     *,
@@ -162,7 +183,7 @@ def make_plan(
     predicates.extend(opaque)
     residual = _AndResidual(tuple(predicates)) if predicates else None
 
-    if opaque or select is None:
+    if opaque or select is None or any(_reads_lone_empty(expr) for expr in residual_exprs):
         return Plan(dfilter=dfilter, mode="ek", projection=None, residual=residual)
 
     projected: dict[str, FieldRef[Any]] = {}

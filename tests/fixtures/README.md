@@ -73,3 +73,25 @@ and as the epoch in `-T ek`. The capture is dated 2023-11-05, so tshark before
 | 3 | DNS response, one EUI64 (type 109) record | `dns.eui64` = `02:11:22:33:44:55:66:77` |
 | 4 | ICMPv6 Neighbor Solicitation with a 16-byte SLLA option and an ARO | `icmpv6.opt.src_linkaddr_eui64` = `fe:00:00:00:00:00:a1:b2`, `icmpv6.opt.aro.eui64` = `02:11:22:33:44:55:66:77` |
 | 5 | DHCP DISCOVER, client UUID `34 00 .. 00` on the wire | `dhcp.client_id.uuid` = `00000034-0000-0000-0000-000000000000`: below frame 1's by text order, above it by tshark 4.2.2's host-endian struct order |
+
+## oid.pcap
+
+`FT_OID` renderings (issue #149). Every frame is SNMP `10.0.5.1 → 10.0.5.2`.
+tshark prints each OID as numeric dotted text, the same in `-T fields` and
+`-T ek`, on 4.2.2, 4.4.19 and 4.6.9, except that `-T fields` cannot tell frame
+11's lone empty value from absence. Frames 4 to 7 and 11 carry encodings no
+conforming agent sends; frames 8 to 10 are well formed.
+
+| # | Frame | Field values |
+|---|-------|--------------|
+| 1 | GetResponse, sysObjectID.0 and sysDescr.0 | `snmp.name` = `1.3.6.1.2.1.1.2.0`, `1.3.6.1.2.1.1.1.0`; `snmp.value.oid` = `1.3.6.1.4.1.8072.3.2.10` |
+| 2 | SNMPv1 Trap | `snmp.enterprise` = `1.3.6.1.4.1.9` |
+| 3 | GetResponse | `snmp.name` = `1.3.6.1.2.1.1.10`, `1.3.6.1.2.1.1.9`: arc order and text order disagree |
+| 4 | GetResponse | `snmp.name` = `1.3`, `2.999.1`, then an arc of 2**32, which prints as the empty string and ends dissection (`[Malformed Packet]`) |
+| 5 | GetResponse, name encoded `2b 06 81` (unterminated arc) | `snmp.name` = `1.3.6` |
+| 6 | GetResponse, name encoded `2b 80 01` (non-minimal arc) | `snmp.name` = `1.3.1` |
+| 7 | GetResponse, name with no content octets | `snmp.name` = `0` |
+| 8 | GetResponse, name encoded `2b 06 ff 7f` | `snmp.name` = `1.3.6.16383` |
+| 9 | GetResponse, name encoded `2b 06 81 80 00` | `snmp.name` = `1.3.6.16384`: one arc above frame 8, but tshark's byte order sorts it below |
+| 10 | GetResponse, two varbinds | `snmp.name` = `1.3.6.1.2.1.0`, `1.3.6.1.2.1.3`: one on each side of the subtree `1.3.6.1.2.1.1`, none inside it |
+| 11 | GetResponse, one varbind | `snmp.name` = an arc of 2**32 alone: prints as the empty string, which `-T ek` keeps and `-T fields` reads as absent |

@@ -278,3 +278,51 @@ class TestGuidAndEui64:
         # Wireshark rejects "02:11" for an EUI-64 field; so does every backend.
         with pytest.raises(ValueError, match="EUI-64"):
             compile_dfilter(EUI64 == EUI48)
+
+
+SNMP_NAME = StubField("snmp.name", "FT_OID", multi=True)
+SYS_OBJECT_ID = "1.3.6.1.2.1.1.2.0"
+
+
+class TestOid:
+    """FT_OID pushes presence only (#149).
+
+    tshark rejects the quoted literal the str rendering would produce, on
+    4.2.2, 4.4.19 and 4.6.9, and compares a bare one by its encoded bytes
+    where the other backends compare the printed text (module docstring of
+    remora.compile.dfilter; tests/integration/test_oid.py pins both live).
+    """
+
+    def test_presence_is_pushed(self) -> None:
+        assert compile_dfilter(SNMP_NAME.present()) == "snmp.name"
+
+    @pytest.mark.parametrize(
+        "expr",
+        [
+            SNMP_NAME == SYS_OBJECT_ID,
+            SNMP_NAME != SYS_OBJECT_ID,
+            SNMP_NAME < SYS_OBJECT_ID,
+            SNMP_NAME <= SYS_OBJECT_ID,
+            SNMP_NAME > SYS_OBJECT_ID,
+            SNMP_NAME >= SYS_OBJECT_ID,
+            SNMP_NAME.in_([SYS_OBJECT_ID, "1.3.6.1.2.1.1.1.0"]),
+            SNMP_NAME.in_([("1.3.6.1.2.1.1", "1.3.6.1.2.1.2")]),
+            SNMP_NAME.contains("1.3.6.1.2.1.1."),
+            SNMP_NAME.matches(r"^1\.3\.6\.1\.2\.1\.1\."),
+        ],
+        ids=["eq", "ne", "lt", "le", "gt", "ge", "in-set", "in-range", "contains", "matches"],
+    )
+    def test_every_value_test_is_refused(self, expr: Expr) -> None:
+        with pytest.raises(UnsupportedExprError, match="FT_OID"):
+            compile_dfilter(expr)
+
+    def test_a_refused_term_takes_its_whole_disjunction_with_it(self) -> None:
+        with pytest.raises(UnsupportedExprError, match="FT_OID"):
+            compile_dfilter((SNMP_NAME == SYS_OBJECT_ID) | (HOST == "example.com"))
+
+    def test_user_errors_surface_before_the_refusal(self) -> None:
+        # The predicate backend raises the same errors, so the timing is identical.
+        with pytest.raises(ValueError, match="inverted"):
+            compile_dfilter(SNMP_NAME.in_([("1.3.6.1.2.1.2", "1.3.6.1.2.1.1")]))
+        with pytest.raises(TypeError):
+            compile_dfilter(SNMP_NAME.contains(b"\x2b\x06"))
