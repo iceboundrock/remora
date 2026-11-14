@@ -1,105 +1,63 @@
 # Remora
 
-A type-safe, IDE-friendly Python DSL for Wireshark/tshark capture analysis. Remora drives tshark subprocesses directly (no pyshark dependency): field access is statically typed, display filters are built from real expression trees instead of bare strings, and predicates are pushed down to tshark where possible.
+A type-safe Python DSL for analyzing Wireshark/tshark capture files.
 
-```text
-pyshark (stringly typed)                 Remora (typed DSL)
-------------------------                 ------------------
-pkt["ip"].src            # str? None?    pkt[IP].src        # IPv4Address | None
-cap = pyshark.FileCapture(               cap = Capture("x.pcap").filter(
-    "x.pcap",                                (IP.src == "10.0.0.1")
-    display_filter="ip.src==10.0.0.1 "       & (TCP.port == 443)
-                   "&& tcp.port==443")   )    # built, validated, pushed down
-```
+Remora gives Python developers typed protocol fields and composable queries
+instead of hand-written display-filter strings and dynamic field access. It
+drives tshark directly, pushes supported filters down to it, and can optionally
+cache selected fields in a DuckDB workspace for repeated analysis. It does not
+depend on pyshark.
 
-- **Typed fields.** `pkt[IP].src` is an `IPv4Address | None`, `pkt[TCP].port` is a `tuple[int, ...]` — generated `.pyi` stubs give your IDE completion for every field, and mypy knows the parsed type of each one.
-- **No bare filter strings.** `IP.src == "10.0.0.1"` builds an expression tree; Remora compiles it to a Wireshark display filter and hands it to tshark (`-Y`) whenever it can, and falls back to an equivalent Python predicate when it can't.
-- **No orphaned processes.** Iteration owns the tshark subprocess lifecycle; early `break`, exceptions, and GC all terminate it.
+## Why Remora?
 
-## Installation
+Compared with a string-based pyshark query:
 
-Remora is pre-1.0 and is **not** on PyPI. Do not `pip install remora` — that name on PyPI belongs to an unrelated 2015 project ("a replacement for NRPE"). Install from git:
-
-```sh
-pip install "remora @ git+https://github.com/iceboundrock/remora"
-```
-
-The distribution name is not settled yet, so the eventual PyPI install command may differ. The repository is also private for now, so an anonymous clone of that URL 404s — use an authenticated remote (`git+ssh://git@github.com/iceboundrock/remora`) until it opens up.
-
-Requirements:
-
-- Python ≥ 3.10.
-- A `tshark` binary on `PATH` (or point at one with `$TSHARK`, or `Capture(..., tshark="/path/to/tshark")`). tshark ships with [Wireshark](https://www.wireshark.org/download.html); on macOS `brew install --cask wireshark` or `brew install tshark`, on Debian/Ubuntu `apt install tshark`.
-
-### Where protocol classes live
-
-The core package ships typed modules for ~30 everyday protocols (`eth`, `ip`, `ipv6`, `tcp`, `udp`, `dns`, `http`, `http2`, `tls`, `quic`, `icmp`, `arp`, `dhcp`, `ntp`, `ssh`, `sip`, `rtp`, `sctp`, …). **They all live in `remora.proto`.** The top level re-exports only `Capture` and the five most common protocols (`ETH`, `IP`, `TCP`, `UDP`, `DNS`) as a convenience — everything else, including every extras protocol, is imported from `remora.proto`:
-
-<!-- The ci: comment markers below opt a fence into tests/test_readme.py, which
-     mypy-checks it and — in the exec and run modes — executes it in CI. A
-     marker must sit on its own line immediately above its ```python fence. -->
-<!-- ci:exec -->
 ```python
-from remora import IP, Capture  # top-level convenience re-exports
-from remora.proto import HTTP, QUIC, TLS  # everything else
-
-query = (IP.src == "10.0.0.1") & (HTTP.request_method == "GET")
-handshake = QUIC.long_packet_type.present() | TLS.handshake_type.present()
+cap = pyshark.FileCapture("capture.pcap", display_filter="ip.src == 10.0.0.1 && tcp.port == 443")
+src = pkt["ip"].src  # dynamic field access
 ```
 
-Core protocols are re-exported by name from `remora.proto`, so that import is fully typed.
-
-### Protocol extras
-
-Domain-specific protocol sets ship as separate distributions, selected with an extra:
-
-| Extra | Adds to `remora.proto` | Distribution |
-|---|---|---|
-| `wireless` | `WLAN`, `RADIOTAP` | `remora-wireless` |
-| `industrial` | `MODBUS`, `MBTCP`, `DNP3` | `remora-industrial` |
-| `telecom` | `GTP`, `DIAMETER` | `remora-telecom` |
-| `all` | everything above, plus `workspace` and `arrow` | all three, plus `duckdb` and `pyarrow` |
-
-Two extras are not protocol sets. `workspace` pulls in DuckDB for the materialized workspace (M4 — `from remora.workspace import Workspace` gives you open/read/write/compact, `ws.materialize(pcap, [IP.src, IP.dst, TCP.port])` dissects a capture into columns once, and `ws.query().filter(TCP.port == 443)` runs the same `Expr` trees over those columns instead of over tshark). `arrow` adds pyarrow, which only `ws.query().arrow()` needs — duckdb does not pull pyarrow in, and a workspace user who never exports to Arrow should not carry it, so the two are separate. `all` means everything, so it includes both.
-
-The protocol extras' *distributions* are unpublished, so `pip install "remora[wireless]"` cannot resolve — the extra points at a `remora-wireless` distribution that no index carries. Until they ship, install them from a checkout, alongside core. Each extra lives at `packages/<distribution>`, so name the ones you want:
-
-```sh
-git clone https://github.com/iceboundrock/remora
-pip install ./remora ./remora/packages/remora-wireless
-```
-
-Listing all three covers the protocol half of `remora[all]`. The other half is `workspace` and `arrow`, which are ordinary extras of *core* — no unpublished distribution involved, so they resolve from PyPI — and you ask for them on the core path:
-
-```sh
-pip install './remora[workspace,arrow]' \
-  ./remora/packages/remora-wireless \
-  ./remora/packages/remora-industrial \
-  ./remora/packages/remora-telecom
-```
-
-That is the source-checkout equivalent of `remora[all]`: duckdb and pyarrow come along, so `ws.query().arrow()` works. Quote the core path — most shells treat `[...]` as a glob pattern. Drop either extra if you do not need it (`'./remora[workspace]'` alone gives you the workspace without pyarrow), and drop the package lines for protocol sets you do not use.
-
-Working inside the repository, there is nothing to do: `uv sync` already installs all three extras as workspace members, and the dev group brings duckdb and pyarrow.
-
-An extras distribution grafts its modules into `remora.proto` at install time, so no import path changes when you add one. Two import spellings, and the difference matters — the convenient one:
+Remora builds a query from typed fields and returns parsed Python values:
 
 <!-- ci:exec -->
 ```python
-from remora.proto import WLAN  # runtime convenience — a type checker sees `object`
+from remora import IP, TCP, Capture
+
+cap = Capture("capture.pcap").filter((IP.src == "10.0.0.1") & (TCP.port == 443))
 ```
 
-and the typed one:
+Generated stubs provide IDE completion and types such as `IPv4Address | None`
+for `pkt[IP].src`. Queries are lazy: iteration starts tshark, and Remora cleans
+up the subprocess when iteration finishes or the iterator is closed. Projections
+limit the fields read, and a workspace lets you query materialized columns
+without re-dissecting the capture each time.
 
-```python
-from remora.proto.wlan import WLAN  # resolves the shipped .pyi stub
+## Quick start
+
+### Prerequisites
+
+- Python 3.10 or later. CI tests Python 3.10–3.14 on Linux and Python 3.12 on Windows.
+- [tshark](https://www.wireshark.org/download.html) installed and on `PATH`.
+  Alternatively, set `TSHARK` or pass `tshark="/path/to/tshark"` to `Capture`.
+  For example, Debian/Ubuntu users can install the `tshark` package.
+
+### Installation
+
+Install from the public GitHub repository:
+
+```sh
+python -m pip install "remora @ git+https://github.com/iceboundrock/remora.git"
 ```
 
-`remora.proto` reaches extras through a module-level `__getattr__`, which a type checker cannot follow, so prefer the submodule import in typed code. (Core protocols have no such caveat — they are re-exported by name.) Importing an extras protocol without its extra installed raises an `ImportError` naming the exact extra to install. Anything not shipped at all can be generated locally — see [Local generation](#local-generation-psdsl-gen).
+This project is pre-1.0. **Do not install `remora` by name from PyPI**: that
+name belongs to an unrelated project. See [protocol extensions](#protocol-extensions)
+and [workspace](#duckdb-workspace) for optional dependencies.
 
-## Quickstart
+### Your first query
 
-Point `Capture` at a pcap, filter with typed field comparisons, iterate:
+Place a pcap named `capture.pcap` in your working directory, or replace the path
+below with your own capture. To try the exact example, download the repository's
+[sample capture](tests/data/sample.pcap) and save it as `capture.pcap`.
 
 <!-- ci:run -->
 ```python
@@ -111,21 +69,38 @@ for pkt in cap.filter((IP.src == "10.0.0.1") & (TCP.port == 443)):
     print(pkt[IP].src, pkt[TCP].dstport)
 ```
 
-That's pcap → typed query → results:
+The loop prints the source IP and TCP destination port of each matching packet.
+The sample includes a matching packet; your own capture may produce different results or no
+output. This example is typechecked and run against a real tshark in CI.
 
-- `Capture` is lazy and immutable — `.filter()` returns a new capture, iteration spawns tshark and yields matching packets.
-- `IP.src == "10.0.0.1"` (class access) builds an expression; Remora compiles the whole conjunction to the display filter `(ip.src == 10.0.0.1) && (tcp.port == 443)` and pushes it down to tshark, so filtering happens at capture speed, not in Python.
-- `pkt[IP].src` (instance access) returns a parsed `IPv4Address | None` — never a bare string, never an exception for an absent field.
-- Opaque Python predicates work too — `cap.filter(lambda pkt: some_check(pkt))` — Remora runs what it can't push down as a residual filter in Python.
-- `.select()` narrows what comes back: name the fields you read and tshark renders only those columns instead of every field of every packet — see [Projections](#projections-ask-only-for-the-fields-you-read).
+## Usage
 
-This snippet is executed by CI against a test pcap on every pull request and every push to `main` (see `tests/test_readme.py`), so it cannot rot.
+### Typed fields
 
-## Two rules to learn before anything else
+Accessing a field on a protocol class, such as `IP.src`, creates a field
+reference for expressions. Accessing it on a packet view, `pkt[IP].src`, returns
+the parsed value. Scalar fields return a value or `None` when absent;
+multi-value fields return a tuple, or `()` when absent. For example,
+`pkt[TCP].port` is a `tuple[int, ...]`.
 
-### Combine with `&` `|` `~`, never `and` `or` `not`
+Core protocols are available from `remora.proto`; `ETH`, `IP`, `TCP`, `UDP`
+and `DNS` are also exported from `remora`:
 
-Python's `and`/`or`/`not` (and chained comparisons like `80 <= TCP.port <= 90`) need a boolean *now*; a Remora expression is a tree to be compiled *later*. Truth-testing an expression raises `TypeError` immediately — you can't silently get the wrong filter. Use the operator forms, and parenthesize comparisons (`&`/`|` bind tighter than `==`):
+<!-- ci:exec -->
+```python
+from remora import IP, Capture
+from remora.proto import HTTP, QUIC, TLS
+
+query = (IP.src == "10.0.0.1") & (HTTP.request_method == "GET")
+handshake = QUIC.long_packet_type.present() | TLS.handshake_type.present()
+cap = Capture("capture.pcap").filter(query)
+```
+
+### Filtering
+
+Combine expressions with `&`, `|`, and `~`, and parenthesize comparisons.
+Do not use `and`, `or`, `not`, or chained comparisons: they require a Python
+truth value, and an expression raises `TypeError` when truth-tested.
 
 <!-- ci:exec -->
 ```python
@@ -136,22 +111,28 @@ alternative = (IP.src == "10.0.0.1") | (IP.dst == "10.0.0.1")
 negated = ~(TCP.port == 443)
 ```
 
-### Multi-value fields: `==` means "any occurrence", `!=` means "no occurrence"
-
-Some fields occur several times per packet — `tcp.port` dissects as *both* the source and destination port, so its typed access is `pkt[TCP].port` → `tuple[int, ...]`. Comparisons follow Wireshark's any-occurrence semantics: `TCP.port == 443` matches if **any** occurrence equals 443.
-
-Wireshark's own `!=` is a famous footgun: `tcp.port != 80` there means "any occurrence differs from 80", which still matches most packets *touching* port 80. Remora makes that pitfall unrepresentable — there is no `!=` node at all. `TCP.port != 80` compiles to `!(tcp.port == 80)`: *no* occurrence equals 80, i.e. genuinely "not port 80".
+A comparison on a multi-value field matches when **any occurrence** matches.
+`TCP.port != 80` means **no occurrence** equals 80: it is `~(TCP.port == 80)`,
+not Wireshark's “any occurrence differs” interpretation. It also matches
+packets where `tcp.port` is absent; add `TCP.port.present()` if absence should
+not match.
 
 <!-- ci:exec -->
 ```python
 from remora import TCP
 
-not_port_80 = TCP.port != 80  # compiles to !(tcp.port == 80)
+not_port_80 = TCP.port != 80
+present_and_not_80 = TCP.port.present() & (TCP.port != 80)
 ```
 
-## Projections: ask only for the fields you read
+Fields also support `in_()`, `contains()`, `matches()`, and `present()`.
+See the [semantics guide](docs/semantics.md) for absence, regex portability,
+and backend restrictions.
 
-A `Capture` with no projection reads whole packets (`-T ek`), so it answers any field name — convenient, and it makes tshark render every field of every packet. `.select()` names the columns you actually read; the query then plans to `-T fields`, where tshark renders only those, which is markedly cheaper. Like `.filter()`, it returns a new `Capture` and chains:
+### Projection and query planning
+
+Use `select()` to name the fields your code reads. The planner normally uses
+`-T fields` for a projection rather than the whole-packet `-T ek` reader:
 
 <!-- ci:exec -->
 ```python
@@ -159,16 +140,42 @@ from remora import IP, TCP, Capture
 
 cap = Capture("capture.pcap").filter(TCP.port == 443).select(IP.src, TCP.dstport)
 
-assert cap.plan().mode == "fields"  # only ip.src and tcp.dstport are rendered
+assert cap.plan().mode == "fields"
 ```
 
-The trade-off: inside a projection, a field you did not name is a *mistake*, not an absence — `pkt[TCP].flags` here raises `FieldNotProjectedError`, because not having asked for a field is a caller bug. Fields that are genuinely absent still come back as `None` / `()` exactly as they do without a projection.
+In fields mode, reading a field outside the projection raises
+`FieldNotProjectedError`. A projected field that is absent still returns `None`
+or `()`.
+The planner adds fields needed by residual expressions automatically.
 
-Two things do not follow from calling it. Fields a residual Python filter needs are added to the projection for you, so name only what you read yourself; and an opaque `lambda` term forces whole-packet mode regardless, since nothing bounds the fields an arbitrary callable reads. `cap.plan().mode` says which happened. (`select()` with no arguments is a deliberate no-op.)
+Supported conjuncts are pushed to tshark as a display filter; other expressions
+are evaluated as Python residuals when supported there. An opaque Python
+callable passed to `filter()` runs in Python and forces whole-packet `-T ek`
+mode, even with `select()`. Other pushable conjuncts can still be pushed down.
+Inspect `cap.plan().explain()` to see the plan. Invalid literals and unsupported
+operations can raise rather than silently approximate.
 
-## The DuckDB workspace
+**Reader limits:** with tshark older than 4.4, control characters in
+`-T fields` values can remain escaped and affect residual results. On any
+version, a field value containing byte `0x1e` can be split into multiple
+occurrences in fields mode. Use whole-packet `-T ek` when those values matter.
+Workspace materialization also uses `-T fields`; see the
+[reader limitations](docs/semantics.md#what-is-still-divergent) before caching
+such data.
 
-`Capture` re-dissects the pcap on every iteration. A **workspace** dissects it once into DuckDB columns and answers every later question from those columns — the same `Expr` trees, compiled to a SQL predicate instead of a display filter, plus aggregates and sessionization a display filter cannot express. It needs the `workspace` extra (`pip install 'remora[workspace]'`).
+## DuckDB workspace
+
+`Capture` re-dissects the pcap on each iteration. For repeated queries over the
+same capture, a workspace materializes selected fields in DuckDB and evaluates
+expressions as SQL over those columns. Install the optional dependency from a
+checkout (the brackets must be quoted):
+
+```sh
+git clone https://github.com/iceboundrock/remora.git
+python -m pip install './remora[workspace]'
+```
+
+With `capture.pcap` in the working directory:
 
 <!-- ci:run -->
 ```python
@@ -176,7 +183,7 @@ from remora import IP, TCP
 from remora.workspace import Workspace
 
 with Workspace("capture.duckdb", mode="rw") as ws:
-    ws.materialize("capture.pcap", [IP.src, IP.dst, TCP.port])  # dissect once
+    ws.materialize("capture.pcap", [IP.src, IP.dst, TCP.port])
 
 with Workspace("capture.duckdb") as ws:  # read-only is the default
     for row in ws.query().filter(TCP.port == 443).select(IP.src):
@@ -184,105 +191,112 @@ with Workspace("capture.duckdb") as ws:  # read-only is the default
     ws.export_parquet("pkts", "pkts.parquet")
 ```
 
-This snippet is executed by CI against the same test pcap, not merely typechecked — a call that is type-correct and fails at runtime is exactly what a typecheck-only fence cannot see.
+The workspace caches only the fields you materialize, so keep the original pcap
+to revisit other fields or raw bytes. Queries require the fields they use to be
+materialized. The SQL backend refuses some expressions that `Capture` supports,
+and materialization filters must be fully pushable to tshark. See the [workspace guide](docs/workspace.md) for reuse,
+locking, exports, streams, annotations, and cross-capture analysis.
 
-Sessionization — `ws.build_streams()`, which rolls packets up into conversations carrying endpoints, counts and durations — is deliberately not an afterthought line on that snippet: it reads nine specific fields out of `pkts` and refuses loudly if any of them was never materialized, so it needs a projection of its own. The guide's [Streams](docs/workspace.md#streams-build_streams) section lists the set.
+DuckDB is optional. PyArrow is a separate optional dependency needed for
+`Query.arrow()`, not for the Parquet export above; install both with
+`python -m pip install './remora[workspace,arrow]'` from the checkout's parent.
 
-Three things to know before trusting one, all covered in the [workspace guide](docs/workspace.md):
+## Protocol extensions
 
-- **It is a cache, not an archive.** The file holds the columns you asked for and nothing else — no payloads, no field you did not project. Keep the original pcaps.
-- **Cache keys cover the tshark argv**, so `-X lua_script:`, `-d` and `-o` invalidate a workspace: they dissect identical bytes differently. A repeat `materialize()` is a hit, a backfill, or a loud refusal.
-- **`mode="ro"` is the default** because DuckDB allows one writer at a time and a long-lived read-write connection blocks every other process's reads. Most writes are short transactions, but `materialize()` holds the exclusive lock for as long as tshark takes on the capture, and in `rw` mode a *read* holds it too; `compact()` reclaims space and needs sole access.
+In addition to the core protocols listed in [codegen.toml](codegen.toml), three
+separate distributions add domain-specific fields:
 
-## Local generation (`psdsl gen`)
+| Distribution | Protocols |
+| --- | --- |
+| `remora-wireless` | `WLAN`, `RADIOTAP` |
+| `remora-industrial` | `MODBUS`, `MBTCP`, `DNP3` |
+| `remora-telecom` | `GTP`, `DIAMETER` |
 
-The committed protocol modules only cover what a stock tshark knows. If your tshark has plugins, Lua dissectors, or unusual protocols, generate typed modules locally against *your* binary:
+These distributions are not currently published on PyPI. Install the ones you
+need from a checkout, alongside core; for example:
 
 ```sh
-uv run psdsl gen --protocols udp dns --out ./gen
+git clone https://github.com/iceboundrock/remora.git
+python -m pip install ./remora ./remora/packages/remora-wireless
 ```
 
-`psdsl gen` runs the dump → parse → emit → fingerprint pipeline against the locally installed tshark (resolved from `--tshark`, then `$TSHARK`, then `PATH`, then Homebrew) with no version pin — the fingerprint header records whatever version generated the files. A missing binary or unknown protocol name exits nonzero with a one-line error.
+Replace the package path with `remora-industrial` or `remora-telecom`, or list
+multiple package paths. Although `pyproject.toml` defines `wireless`,
+`industrial`, `telecom`, and `all` extras, their protocol distributions cannot
+currently be resolved from PyPI. `all` also includes DuckDB and PyArrow.
 
-`tshark -G fields` carries no multiplicity signal, so multiplicity is curated by hand: pass `--multi` with the field abbrevs that occur several times per packet, and they are declared multi-valued (`MultiField`); every other field is scalar and resolves to its first occurrence:
+The dynamic import below works at runtime when the distribution is installed,
+but a type checker sees `object`:
 
-```sh
-uv run psdsl gen --protocols dns ip --multi dns.qry.name ip.addr --out ./gen
+<!-- ci:exec -->
+```python
+from remora.proto import WLAN
 ```
 
-The committed `remora.proto` modules curate multiplicity the same way, by hand.
-
-**Importing the output.** The output directory is a plain directory of modules: each `.pyi` stub sits beside its `.py` module, so type checkers and IDEs resolve the stubs with no extra configuration. Generate into a directory inside your project (say `./gen`) and import it as a package — Python ≥3.3 namespace packages need no `__init__.py`:
+For static typing and IDE completion, import from the generated submodule:
 
 ```python
-from gen.udp import UDP
-
-query = UDP.srcport == 53
+from remora.proto.wlan import WLAN
 ```
 
-This works as long as the *parent* of the output directory is on the import path — true automatically when `gen/` sits in your project root and you run Python from there. At runtime, the generated modules import from `remora`, so `remora` must be installed in the environment that imports them. For mypy, the same layout just works; if you generate outside the project tree, add the parent directory to `mypy_path` (or `MYPYPATH`) and to `sys.path` at runtime.
+### Local generation (`psdsl gen`)
 
-For a worked end-to-end example (non-core protocol, `--multi` curation, imports), see the [codegen guide](docs/codegen.md).
+For a protocol missing from the shipped sets, including one provided by a local
+dissector or plugin, generate modules against your installed tshark:
 
-## Further reading
+```sh
+psdsl gen --protocols mqtt --out ./gen
+```
 
-The durable documents, each CI-checked against the code it describes:
+The generated `.py` and `.pyi` files can be imported as `gen.mqtt` when the
+parent of `gen` is on Python's import path and Remora is installed. Fields are
+scalar unless listed with `--multi`, and a repeated field left scalar returns
+only its first occurrence. See the [codegen guide](docs/codegen.md#worked-example-generating-a-non-core-protocol-with-psdsl-gen)
+for a complete example and multiplicity configuration.
 
-- [docs/semantics.md](docs/semantics.md) — what an operator means when a field is absent, and which regex constructs survive all three backends.
-- [docs/workspace.md](docs/workspace.md) — the DuckDB workspace: cache keys and what invalidates them, locking and `compact()`, Parquet export, annotations, streams, cross-capture `attach()`.
-- [docs/codegen.md](docs/codegen.md) — regenerating protocol modules, and a worked `psdsl gen` example.
+## Documentation
 
-## Contributing: regenerating the committed protocols
+- [Semantics](docs/semantics.md): absence, expression behavior, regex and reader limits.
+- [Workspace](docs/workspace.md): materialization, cache reuse, locking, exports and analysis.
+- [Code generation](docs/codegen.md): local generation, regeneration and drift checks.
 
-Protocol modules under `src/remora/proto/` (and the extras packages) are generated artifacts pinned to the tshark version in `codegen.toml`; CI re-checks byte equality on every pull request and every push to `main` (`uv run python -m remora.codegen check`). How to regenerate them, and what to do when the drift check fails, is covered in [docs/codegen.md](docs/codegen.md).
+## Development and contributing
+
+Clone the repository and install the development environment with
+[uv](https://docs.astral.sh/uv/):
+
+```sh
+git clone https://github.com/iceboundrock/remora.git
+cd remora
+uv sync
+uv run pytest
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy --strict src tests
+uv run mypy --strict --python-version 3.12 .github/scripts/check_stub_resolution.py
+```
+
+Some tests require a real tshark; use `uv run pytest -m "not integration"` to
+run without integration tests. Report problems or propose changes through
+[GitHub Issues](https://github.com/iceboundrock/remora/issues) and pull requests.
+For repository conventions, see [AGENTS.md](AGENTS.md).
+
+Protocol modules are generated, not hand-edited. See the
+[regeneration instructions](docs/codegen.md#checking-and-regenerating) for the
+pinned tshark toolchain and drift-check procedure.
 
 ## Roadmap
 
-Each milestone has an EPIC issue defining its execution path and the PR ↔ issue plan:
+The milestone epics record their scope and remaining work:
 
-| Milestone | EPIC | Goal |
-|-----------|------|------|
-| M1 可用内核 | [#40](https://github.com/iceboundrock/remora/issues/40) | end-to-end typed query over a pcap |
-| M2 生成器与分发 | [#41](https://github.com/iceboundrock/remora/issues/41) | codegen + fingerprint + distribution |
-| M3 打磨 | [#42](https://github.com/iceboundrock/remora/issues/42) | extended operators, real-tshark validation, docs |
-| M4 数据工作区 | [#43](https://github.com/iceboundrock/remora/issues/43) | DuckDB materialized workspace |
+- Completed: [M1 typed capture queries (#40)](https://github.com/iceboundrock/remora/issues/40),
+  [M2 generation and distribution (#41)](https://github.com/iceboundrock/remora/issues/41),
+  and [M3 operators, validation and docs (#42)](https://github.com/iceboundrock/remora/issues/42).
+- In progress: [M4 DuckDB workspace (#43)](https://github.com/iceboundrock/remora/issues/43).
+  The workspace features shown above are already implemented; the epic tracks
+  outstanding work.
 
-### M1 可用内核 — dependency graph
+## License and support
 
-Goal: run one end-to-end typed query against a pcap. Arrows point from a blocker to the issue it unblocks.
-
-```mermaid
-graph TD
-    I1["#1 chore: bootstrap skeleton + CI"]
-    I2["#2 core: Expr expression tree"]
-    I3["#3 core: typed value conversion"]
-    I4["#4 reader: tshark subprocess lifecycle"]
-    I6["#6 core: compile Expr → display filter"]
-    I7["#7 core: compile Expr → Python predicate"]
-    I8["#8 core: Field / FieldRef descriptor"]
-    I9["#9 reader: -T fields projection reader"]
-    I10["#10 reader: -T ek fallback reader"]
-    I11["#11 core: lazy protocol metaclass"]
-    I12["#12 core: query planner (two-level pushdown)"]
-    I13["#13 core: seed protocols (eth/ip/tcp/udp/dns)"]
-    I15["#15 core: end-to-end Capture API"]
-    I20["#20 test: pcap fixtures + e2e tests"]
-
-    I2 --> I6
-    I2 --> I7
-    I2 --> I8
-    I4 --> I9
-    I4 --> I10
-    I8 --> I11
-    I6 --> I12
-    I7 --> I12
-    I3 --> I13
-    I11 --> I13
-    I9 --> I15
-    I10 --> I15
-    I12 --> I15
-    I13 --> I15
-    I15 --> I20
-```
-
-Milestones: [M1 可用内核](https://github.com/iceboundrock/remora/milestone/1) · [M2 生成器与分发](https://github.com/iceboundrock/remora/milestone/2) · [M3 打磨](https://github.com/iceboundrock/remora/milestone/3)
+Remora is distributed under the [MIT License](LICENSE). For questions and bug
+reports, use [GitHub Issues](https://github.com/iceboundrock/remora/issues).
