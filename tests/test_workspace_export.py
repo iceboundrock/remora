@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import os
 import stat
-import sys
 import tracemalloc
 from collections.abc import Iterator
 from ipaddress import IPv6Address
@@ -308,24 +307,14 @@ class TestDestinationGuard:
         out = tmp_path / "planted-hard.parquet"
         os.link(ws_path, out)
         db_inode = os.stat(ws_path).st_ino
-        if sys.platform == "win32":
-            # The planted link is a second name for the database file, which
-            # the ro Workspace holds open, and os.replace (a rename without
-            # POSIX semantics) cannot replace a file that has open handles: it
-            # fails with access denied, the failure src/remora/workspace/AGENTS.md
-            # records for compact's swap. The export fails loudly instead of
-            # writing through the link, so the guarantee still holds.
-            with Workspace(ws_path) as ws, pytest.raises(PermissionError):
-                ws.export_parquet("pkts", out)
-            assert os.stat(out).st_ino == db_inode
-            leftovers = sorted(p.name for p in tmp_path.iterdir())
-            assert leftovers == [out.name, ws_path.name]
-        else:
-            with Workspace(ws_path) as ws:
-                ws.export_parquet("pkts", out)
-            assert os.stat(out).st_ino != db_inode
-            with open(out, "rb") as handle:
-                assert handle.read(4) == b"PAR1"
+        # On Windows too the rename replaces the planted name although the ro
+        # Workspace holds the database open through its other name: duckdb
+        # >= 1.5.0 opens it with FILE_SHARE_DELETE (src/remora/workspace/AGENTS.md).
+        with Workspace(ws_path) as ws:
+            ws.export_parquet("pkts", out)
+        assert os.stat(out).st_ino != db_inode
+        with open(out, "rb") as handle:
+            assert handle.read(4) == b"PAR1"
         assert_still_a_workspace(ws_path)
 
     def test_export_beside_the_workspace_still_works(self, ws_path: Path) -> None:
