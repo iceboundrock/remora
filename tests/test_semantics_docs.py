@@ -236,8 +236,8 @@ def oid_rows() -> list[tuple[int, str, bytes, str]]:
 
 
 def test_the_oid_table_covers_every_measured_encoding() -> None:
-    # Fifteen OIDs of tests/fixtures/oid.pcap (#149); the sysDescr name is left out.
-    assert len(oid_rows()) == 15
+    # Sixteen OIDs of tests/fixtures/oid.pcap (#149); the sysDescr name is left out.
+    assert len(oid_rows()) == 16
 
 
 @pytest.mark.parametrize(("frame", "field", "octets", "printed"), oid_rows())

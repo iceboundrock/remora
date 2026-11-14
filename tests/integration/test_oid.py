@@ -4,14 +4,17 @@
 that text, and this suite holds the result over ``tests/fixtures/oid.pcap``:
 
 - both readers print the same text, which is the text ``docs/semantics.md``
-  documents for each encoding, malformed ones included;
+  documents for each encoding, malformed ones included, except that
+  ``-T fields`` reads frame 11's lone empty OID as absence;
 - tshark rejects the quoted literal the ``str`` rendering would push, and
   compares a bare one by its encoded bytes rather than its text or its arcs,
   which is why the dfilter backend pushes presence only;
-- for every expression below, the plan pushes what it should, and the Python
-  residual in ``-T fields`` and ``-T ek`` mode and the workspace's SQL select
-  the same frames, which are also the frames the expression is declared to
-  select.
+- for every expression below, the plan pushes what it should, and selects the
+  frames the expression is declared to select with and without a projection,
+  because a residual over an OID reads ``-T ek``. The Python residual over
+  ``-T fields`` and the workspace's SQL, whose rows come from ``-T fields``,
+  select the same frames except where frame 11's empty value and absence give
+  different answers; those rows pin the difference.
 
 Measured on 4.2.2, 4.4.19 and 4.6.9. They print the same text and agree on
 everything asserted here. One difference is recorded, not asserted: a two-arc
@@ -46,7 +49,9 @@ FRAME_NUMBER = FieldRef[int]("frame.number", "FT_UINT32", False)
 # second occurrence in a scalar column, so this suite declares it multi.
 NAME = FieldRef[str]("snmp.name", "FT_OID", True)
 ALL_REFS: tuple[FieldRef[str], ...] = (NAME, SNMP.value_oid, SNMP.enterprise)
-ALL_FRAMES = frozenset(range(1, 11))
+ALL_FRAMES = frozenset(range(1, 12))
+#: Its only snmp.name prints empty, which -T fields cannot tell from absence.
+LONE_EMPTY = 11
 
 #: Per field, frame number -> every occurrence as tshark prints it, from
 #: tests/fixtures/make_fixtures.py.
@@ -63,6 +68,8 @@ EXPECTED: dict[str, dict[int, tuple[str, ...]]] = {
         9: ("1.3.6.16384",),
         # One occurrence on each side of the subtree 1.3.6.1.2.1.1.
         10: ("1.3.6.1.2.1.0", "1.3.6.1.2.1.3"),
+        # Frame 4's arc of 2**32 alone: -T ek keeps the empty value.
+        LONE_EMPTY: ("",),
     },
     SNMP.value_oid.name: {1: ("1.3.6.1.4.1.8072.3.2.10",)},
     SNMP.enterprise.name: {2: ("1.3.6.1.4.1.9",)},
@@ -80,6 +87,11 @@ pytestmark = [
         reason="tshark not installed; skipping integration tests",
     ),
 ]
+
+
+def _fields_expected(ref: FieldRef[Any]) -> dict[int, tuple[str, ...]]:
+    """EXPECTED as -T fields reads it: a lone empty value is an empty column."""
+    return {frame: values for frame, values in EXPECTED[ref.name].items() if values != ("",)}
 
 
 def _ek() -> list[RawPacket]:
@@ -128,15 +140,25 @@ class TestReadersAgree:
     @pytest.mark.parametrize("ref", ALL_REFS, ids=lambda ref: ref.name)
     def test_ek_and_fields_print_the_built_text(self, ref: FieldRef[str]) -> None:
         assert _occurrences(_ek(), ref) == EXPECTED[ref.name]
-        assert _occurrences(_fields(), ref) == EXPECTED[ref.name]
+        assert _occurrences(_fields(), ref) == _fields_expected(ref)
+
+    def test_fields_reads_a_lone_empty_oid_as_absent(self) -> None:
+        ek = {_frame(pkt): pkt for pkt in _ek()}
+        fields = {_frame(pkt): pkt for pkt in _fields()}
+        assert ek[LONE_EMPTY].get_raw(NAME.name) == ("",)
+        assert fields[LONE_EMPTY].get_raw(NAME.name) == ()
+        # Among other occurrences the empty value survives in both readers.
+        assert fields[4].get_raw(NAME.name) == ("1.3", "2.999.1", "")
 
     def test_the_documented_renderings_are_what_tshark_prints(self) -> None:
         rows = _doc_rows()
         assert rows, "the oid-forms table parsed to nothing"
-        for packets in (_ek(), _fields()):
+        for mode, packets in (("ek", _ek()), ("fields", _fields())):
             by_frame = {_frame(pkt): pkt for pkt in packets}
             for frame, field, printed in rows:
-                assert printed in by_frame[frame].get_raw(field), (frame, field, printed)
+                if mode == "fields" and frame == LONE_EMPTY:
+                    continue  # test_fields_reads_a_lone_empty_oid_as_absent
+                assert printed in by_frame[frame].get_raw(field), (mode, frame, field, printed)
 
     def test_instance_access_is_the_printed_text(self) -> None:
         packets = {_frame(pkt): pkt for pkt in Capture(OID_PCAP)}
@@ -189,8 +211,9 @@ class TestTsharkEvidence:
         # Frame 5 prints 1.3.6, but its encoding (2b 06 81) is not 1.3.6's.
         assert _tshark_frames("snmp.name == 1.3.6") == set()
         # Byte order puts .10 above .9 (frame 3), and the encodings of frames 5
-        # and 6 sort above it too; the text puts .10 below .9.
-        assert _tshark_frames("snmp.name > 1.3.6.1.2.1.1.9") == {3, 4, 5, 6, 8, 9, 10}
+        # and 6 sort above it too, as does frame 11's, which prints empty; the
+        # text puts .10 below .9.
+        assert _tshark_frames("snmp.name > 1.3.6.1.2.1.1.9") == {3, 4, 5, 6, 8, 9, 10, 11}
 
     def test_a_bare_oid_orders_the_encoding_not_the_arcs(self) -> None:
         # Well formed, and still not arc order: 16383 is ff 7f and 16384 is
@@ -214,31 +237,69 @@ class TestTsharkEvidence:
 
 @dataclass(frozen=True)
 class Row:
-    """One expression, the frames it selects, and the ``-Y`` the plan carries."""
+    """One expression, the frames it selects, and the ``-Y`` the plan carries.
+
+    ``expected`` is what the pcap path selects. ``stored`` is what an engine
+    reading ``-T fields`` rows selects (the residual over ``_fields()`` and the
+    workspace's SQL): the same, unless the expression answers frame 11's lone
+    empty value differently from absence.
+    """
 
     label: str
     expr: Expr
     expected: frozenset[int]
     dfilter: str | None
     residual: bool
+    stored: frozenset[int]
 
 
-def row(label: str, expr: Expr, expected: set[int], *, dfilter: str | None = None) -> Row:
+def row(
+    label: str,
+    expr: Expr,
+    expected: set[int],
+    *,
+    dfilter: str | None = None,
+    stored: set[int] | None = None,
+) -> Row:
     """A row whose OID value tests are residual; *dfilter* is the pushed remainder."""
-    return Row(label, expr, frozenset(expected), dfilter, residual=True)
+    return Row(
+        label,
+        expr,
+        frozenset(expected),
+        dfilter,
+        residual=True,
+        stored=frozenset(expected if stored is None else stored),
+    )
 
 
 SYS_OBJECT_ID = "1.3.6.1.2.1.1.2.0"
 SUBTREE = r"^1\.3\.6\.1\.2\.1\.1(\.|$)"
 
 MATRIX: list[Row] = [
-    Row("present", NAME.present(), ALL_FRAMES - {2}, "(snmp.name)", residual=False),
+    # -Y sees frame 11's name; the workspace stored it as absent.
+    Row(
+        "present",
+        NAME.present(),
+        ALL_FRAMES - {2},
+        "(snmp.name)",
+        residual=False,
+        stored=ALL_FRAMES - {2, LONE_EMPTY},
+    ),
     row("==", NAME == SYS_OBJECT_ID, {1}),
     row("!= (absent included)", NAME != SYS_OBJECT_ID, set(ALL_FRAMES - {1})),
     row("value oid ==", SNMP.value_oid == "1.3.6.1.4.1.8072.3.2.10", {1}),
     row("enterprise ==", SNMP.enterprise == "1.3.6.1.4.1.9", {2}),
     row("malformed encodings by their text", NAME.in_(["1.3.6", "1.3.1", "0"]), {5, 6, 7}),
-    row("the empty rendering", NAME == "", {4}),
+    # Frame 11's only name prints empty: the residual reads -T ek to see it.
+    row("the empty rendering", NAME == "", {4, LONE_EMPTY}, stored={4}),
+    row(
+        "not the empty rendering",
+        NAME != "",
+        set(ALL_FRAMES - {4, LONE_EMPTY}),
+        stored=set(ALL_FRAMES - {4}),
+    ),
+    row("the empty rendering sorts first", NAME < "1", {4, 7, LONE_EMPTY}, stored={4, 7}),
+    row("a pattern the empty rendering matches", NAME.matches("^$"), {4, LONE_EMPTY}, stored={4}),
     row("> is text order", NAME > "1.3.6.1.2.1.1.9", {4, 8, 9, 10}),
     # tshark adds frame 8 (1.3.6.16383) by its encoding; text and arcs do not.
     row("> is not byte order", NAME > "1.3.6.16384", {4}),
@@ -291,18 +352,30 @@ class TestRowSetParity:
         assert {_frame(pkt) for pkt in cap} == item.expected
 
     @pytest.mark.parametrize("item", MATRIX, ids=_IDS)
+    def test_a_projection_selects_the_same_frames(self, item: Row) -> None:
+        # A residual over an OID reads -T ek even under a projection, so
+        # select() cannot turn frame 11's empty name into absence.
+        cap = Capture(OID_PCAP).filter(item.expr).select(FRAME_NUMBER)
+        plan = cap.plan()
+        assert plan.dfilter == item.dfilter, plan.explain()
+        assert plan.mode == ("ek" if item.residual else "fields"), plan.explain()
+        assert {_frame(pkt) for pkt in cap} == item.expected
+
+    @pytest.mark.parametrize("item", MATRIX, ids=_IDS)
     def test_python_residual_in_both_reader_modes(self, item: Row) -> None:
         predicate = compile_predicate(item.expr)
         assert {_frame(pkt) for pkt in _ek() if predicate(pkt)} == item.expected
-        assert {_frame(pkt) for pkt in _fields() if predicate(pkt)} == item.expected
+        assert {_frame(pkt) for pkt in _fields() if predicate(pkt)} == item.stored
 
     @pytest.mark.parametrize("item", MATRIX, ids=_IDS)
     def test_workspace_sql(self, workspace: Path, item: Row) -> None:
+        # The workspace materializes through -T fields, so it stores frame
+        # 11's lone empty name as absent (docs/semantics.md).
         from remora.workspace import Workspace
 
         with Workspace(workspace) as ws:
             frames = {r.frame_number for r in ws.query().filter(item.expr)}
-        assert frames == item.expected
+        assert frames == item.stored
 
 
 class TestWorkspaceRoundTrip:
@@ -312,6 +385,9 @@ class TestWorkspaceRoundTrip:
         with Workspace(workspace) as ws:
             rows = {r.frame_number: r for r in ws.query().select(*ALL_REFS)}
         stored = {n: r.get_all(NAME) for n, r in rows.items() if r.get_all(NAME)}
-        assert stored == EXPECTED[NAME.name]
+        assert stored == _fields_expected(NAME)
+        # The known loss: frame 11's lone empty name is stored as absent.
+        assert rows[LONE_EMPTY].get_all(NAME) == ()
+        assert rows[4].get_all(NAME) == ("1.3", "2.999.1", "")
         assert rows[2].get(SNMP.enterprise) == "1.3.6.1.4.1.9"
         assert rows[1].get(SNMP.value_oid) == "1.3.6.1.4.1.8072.3.2.10"

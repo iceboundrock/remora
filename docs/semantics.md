@@ -450,7 +450,8 @@ means").
 `FT_OID` fields are `str`: #69 kept the text tshark prints and left a richer
 type to #149. #149 measured that text on 4.2.2 (the Ubuntu 24.04 package),
 4.4.19 and 4.6.9 (Debian) over `tests/fixtures/oid.pcap`. All three print the
-same thing in `-T fields` and `-T ek`:
+same thing in `-T fields` and `-T ek`, except that `-T fields` reads frame 11's
+lone empty value as absence:
 
 <!-- oid-forms:start -->
 
@@ -471,19 +472,23 @@ same thing in `-T fields` and `-T ek`:
 | 9 | `snmp.name` | `2b 06 81 80 00` | `1.3.6.16384` |
 | 10 | `snmp.name` | `2b 06 01 02 01 00` | `1.3.6.1.2.1.0` |
 | 10 | `snmp.name` | `2b 06 01 02 01 03` | `1.3.6.1.2.1.3` |
+| 11 | `snmp.name` | `2b 06 01 04 01 90 80 80 80 00` | (empty) |
 
 <!-- oid-forms:end -->
 
 A field value is always numeric dotted decimal. The names Wireshark resolves
 (`iso.3.6.1.4.1.9`, `joint-iso-itu-t.999.1`) appear in the protocol tree and
-the Info column, never in a field value. Frames 4 to 7 carry encodings no
-conforming agent sends, and they show that the text does not determine the
+the Info column, never in a field value. Frames 4 to 7 and 11 carry encodings
+no conforming agent sends, and they show that the text does not determine the
 bytes:
 
 - An arc of 2^32 or more does not fit Wireshark's 32-bit arcs. The value prints
   as the empty string, the field is still present, and dissection of the packet
-  stops there. In `-T fields`, a lone empty value is indistinguishable from
-  absence, the reader limitation `src/remora/reader/fields_reader.py` documents.
+  stops there. `-T ek` keeps the empty value. `-T fields` keeps it among
+  other occurrences (frame 4), but a lone empty value (frame 11) prints as an
+  empty column, which is how absence prints too: the reader limitation
+  `src/remora/reader/fields_reader.py` documents. The next section says what
+  that costs.
 - An arc whose last octet keeps the continuation bit (`2b 06 81`) is dropped
   from the text.
 - A non-minimal arc (`80 01`) prints as the minimal one would.
@@ -525,8 +530,26 @@ neither a string nor a byte needle. tshark does accept a bare dotted literal
   4.2.2 and a rejected `Double` on 4.4.19 and 4.6.9.
 
 So every value test runs over the printed text, in Python on the pcap path and
-in SQL over the stored text in the workspace. Those two agree, including on the
-malformed rows. Three consequences follow from the text representation:
+in SQL over the stored text in the workspace. A residual that reads an OID field
+makes the planner read `-T ek` even when the query has a projection
+(`src/remora/planner.py`, step 6). In `-T fields` mode the residual would see
+frame 11 as a packet without `snmp.name`, so `name == ""` would miss it and
+`name != ""` would select it, and the row set would depend on whether the query
+called `select()`.
+
+The workspace does not get that choice: it materializes through `-T fields`,
+so it stores frame 11's lone empty value as absent (`NULL` in a scalar column,
+`[]` in a list column), as it stores a lone empty value of any field. The pcap
+path and the workspace's SQL agree on every frame except such a packet, and on
+it only for a test whose answer differs between the empty string and absence:
+`name == ""`, `name != ""`, `name < x` for any non-empty `x`, `name <= x`,
+a `matches` the empty string satisfies, and presence, which `-Y` answers from
+the dissection on the pcap path. The malformed frames 4 to 7 agree. Keeping the
+value would take a reader change: on 4.4.19, `-E quote=d` prints a present
+empty value as `""` and an absent one as nothing, but it reframes every column
+and changes every stored cache key, so it is outside #149.
+
+Three consequences follow from the text representation:
 
 - `<`, `<=`, `>` and `>=` compare text, so `"1.3.6.1.2.1.1.10" < "1.3.6.1.2.1.1.9"`.
 - `contains("1.3.6.1.2.1.1")` also matches `1.3.6.1.2.1.10`.
@@ -544,7 +567,9 @@ to a single occurrence.
 `tests/test_semantics_table.py` run the three backends.
 `tests/integration/test_oid.py` checks the table above against a live tshark in
 both reader modes. It also pins the tshark behavior behind the refusal and
-asserts that the residual and the workspace's SQL select the same frames.
+asserts that the plan, with and without a projection, and the residual over
+`-T ek` select the declared frames, and that the workspace's SQL selects them
+too except for the frame 11 rows above, which it pins.
 
 ### A structured representation (#149's recommendation)
 
@@ -553,7 +578,7 @@ The text type is the one shipped. #149 compared it with two structured forms:
 | | `str` (shipped) | `tuple[int, ...]` | `OID` value object |
 | --- | --- | --- | --- |
 | order | text, wrong at `.9`/`.10` | numeric, arc by arc; not tshark's byte order | numeric, arc by arc; not tshark's byte order |
-| subtree test | regex anchored on `.` | slice compare | a method; `>= p` and `< next(p)` on a scalar field only |
+| subtree test | regex anchored on `.` | slice compare | `f.within(p)`, a new per-occurrence IR node |
 | stub type | `Field[str]` | needs a generic alias in `FTypeInfo.py_type: type[T]` | `Field[OID]`, imported like `UUID` |
 | literal | any string | not in the `Expr` literal union | `OID`, or dotted text through `coerce_literal` |
 | workspace column | `VARCHAR` | `UINTEGER[]` | `UINTEGER[]` |
@@ -574,19 +599,28 @@ it lands, `str` stays, with the refusals above. The class should work like this:
   malformed text does, and `get_raw` still returns it.
 - `contains` and `matches` become `TypeError`, as on a GUID. A caller that
   needs the text has `str(oid)`.
-- A subtree test asks whether one occurrence starts with the arcs of `p`. On a
-  scalar field, `(f >= p) & (f < next(p))` answers it, where `next(p)`
-  increments the last arc, and existing operators express that with no new IR
-  node. On a multi-value field it does not, whatever the arcs' order: the two
-  halves are independent any-occurrence tests, so frame 10 matches
-  `p = 1.3.6.1.2.1.1` with no member of the subtree. `f.in_([(p, next(p))])`
-  does test one occurrence, but its range is closed, so it also selects
-  `next(p)` itself. The multi-value form therefore needs a new IR node, a
-  subtree test such as `f.within(p)` that every backend applies per
-  occurrence: in Python, any occurrence whose leading arcs equal `p`'s; in SQL,
+- A subtree test asks whether one occurrence starts with the arcs of `p`. It
+  gets a new IR node, a subtree test such as `f.within(p)` that every backend
+  applies per occurrence: in Python, any occurrence whose leading arcs equal
+  `p`'s; in SQL, `f[1:len(p)] = p` on a scalar column and, on a list column,
   the `list_filter` any-occurrence form that `in {lo .. hi}` already uses,
-  over `x[1:len(p)] = p`; on `-Y`, refused like every other value test. A
-  scalar field can lower to the same node, so the API has one spelling.
+  over `x[1:len(p)] = p`; on `-Y`, refused like every other value test.
+  Scalar and multi-value fields lower to the same node, so the API has one
+  spelling, and a prefix compare needs no upper bound.
+
+  Existing operators are not a substitute. On a multi-value field,
+  `(f >= p) & (f < next(p))` is two independent any-occurrence tests, so
+  frame 10 matches `p = 1.3.6.1.2.1.1` with no member of the subtree, whatever
+  the arcs' order. `f.in_([(p, next(p))])` does test one occurrence, but its
+  range is closed, so it also selects `next(p)` itself. On a scalar field the
+  two bounds are exact only if `next(p)` is the smallest OID above every
+  descendant of `p`. That is `p` with its last arc incremented, unless the
+  last arc is 2^32 - 1, which has no successor below 2^32. Then the increment
+  carries: drop the trailing arcs equal to 2^32 - 1 and increment the last
+  arc left, so `next(1.3.6.4294967295)` is `1.3.7`. Nothing lies between them
+  but descendants of `p`, because no arc can exceed 2^32 - 1. If every arc is
+  2^32 - 1, nothing sorts above the subtree and `f >= p` alone is the test.
+  The node avoids that boundary altogether.
 - The column type moves to `UINTEGER[]` (`UINTEGER[][]` for a multi-value
   field), because DuckDB orders lists element by element, as the arcs order.
   A `VARCHAR` column would keep SQL on text order and fork it from Python.
@@ -620,8 +654,11 @@ Migration follows #69's precedent for GUIDs:
   above). tshark rejects the quoted literal, and its bare-literal comparison
   reads the encoded bytes where the other two read the text. The planner
   evaluates them as Python predicates over the text, which is what the
-  workspace's SQL compares too, so the row set does not depend on the reader
-  or the tshark build.
+  workspace's SQL compares too, and reads `-T ek` to do it, so the row set does
+  not depend on the projection or the tshark build. The workspace differs on
+  one malformed case: it stores an OID whose only occurrence prints empty (an
+  arc of 2^32 or more) as absent, so a test the empty string answers
+  differently from absence diverges on that packet (measured above).
 - **IEEE-754 NaN literals** reach the same row set three different ways, so this
   is a mechanism difference rather than a semantic one. Python's comparisons
   with NaN are all false, which is what `predicate.py` evaluates directly and

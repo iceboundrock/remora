@@ -85,8 +85,11 @@ accepted, but not pushed either, for three reasons:
   on 4.2.2 and a rejected ``Double`` on 4.4.19 and 4.6.9.
 
 So these filters run as Python predicates over the printed text, which is the
-same text the workspace stores and SQL compares. The measurements are in
-``docs/semantics.md``.
+same text the workspace stores and SQL compares. The planner reads ``-T ek``
+for them (:mod:`remora.planner`, step 6), because ``-T fields`` reads an OID
+that prints empty as absence when it is the only occurrence; the workspace,
+which materializes through ``-T fields``, still stores it so. The measurements
+are in ``docs/semantics.md``.
 
 Time literals (M1 design decision)
 ----------------------------------
