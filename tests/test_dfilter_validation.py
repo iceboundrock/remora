@@ -178,12 +178,13 @@ class TestSemanticsTableGoldensValidate:
     def test_every_semantics_golden_is_accepted_by_tshark(self) -> None:
         dfilters = [case.dfilter for case in CASES if case.dfilter is not None]
         # Exact count: a case losing its golden string must fail loudly here.
-        # Update deliberately when the table grows. 35 of the 44 base cases
-        # carry a golden -- the other nine (two time literals, three NaN, three
-        # ordered GUID comparisons and one EUI-64 contains, #69) are refused by
-        # this backend and have none -- plus all 36 absent-field truth-table
-        # cases (nine operators x scalar/multi x positive/negated).
-        assert len(dfilters) == 71
+        # Update deliberately when the table grows. 36 of the 51 base cases
+        # carry a golden -- the other fifteen (two time literals, three NaN,
+        # three ordered GUID comparisons and one EUI-64 contains, #69, and six
+        # OID value tests, #149) are refused by this backend and have none --
+        # plus all 36 absent-field truth-table cases (nine operators x
+        # scalar/multi x positive/negated).
+        assert len(dfilters) == 72
         _assert_all_valid(
             [
                 (f"semantics[{case.id}]: {case.expr!r}", case.dfilter)

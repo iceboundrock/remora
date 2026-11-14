@@ -41,6 +41,11 @@ ABS_TIME_END = "<!-- abs-time-forms:end -->"
 GUID_EUI64_START = "<!-- guid-eui64-forms:start -->"
 GUID_EUI64_END = "<!-- guid-eui64-forms:end -->"
 
+OID_START = "<!-- oid-forms:start -->"
+OID_END = "<!-- oid-forms:end -->"
+
+OID_PCAP = REPO_ROOT / "tests" / "fixtures" / "oid.pcap"
+
 
 def read_doc() -> str:
     return DOC.read_text(encoding="utf-8")
@@ -206,6 +211,43 @@ def test_each_guid_eui64_form_reads_as_the_doc_says(ftype: str, printed: str, re
         assert reading == "8 `bytes`"
         assert isinstance(value, bytes)
         assert value.hex(":") == printed
+
+
+def oid_rows() -> list[tuple[int, str, bytes, str]]:
+    """Parse the marked OID table into (frame, field, content octets, printed text).
+
+    ``(none)`` is empty content and ``(empty)`` the empty rendering. The same
+    parse lives in tests/integration/test_oid.py, which holds the printed
+    column against a live tshark.
+    """
+    body = read_doc().split(OID_START, 1)[1].split(OID_END, 1)[0]
+    rows: list[tuple[int, str, bytes, str]] = []
+    for raw in body.splitlines():
+        line = raw.strip()
+        if not line.startswith("|") or set(line) <= set("|-: "):
+            continue
+        cells = [cell.strip() for cell in line.strip("|").split("|")]
+        if len(cells) != 4 or cells[0] == "frame":
+            continue
+        octets = b"" if cells[2] == "(none)" else bytes.fromhex(cells[2].strip("`"))
+        printed = "" if cells[3] == "(empty)" else cells[3].strip("`")
+        rows.append((int(cells[0]), cells[1].strip("`"), octets, printed))
+    return rows
+
+
+def test_the_oid_table_covers_every_measured_encoding() -> None:
+    # Sixteen OIDs of tests/fixtures/oid.pcap (#149); the sysDescr name is left out.
+    assert len(oid_rows()) == 16
+
+
+@pytest.mark.parametrize(("frame", "field", "octets", "printed"), oid_rows())
+def test_each_documented_oid_encoding_is_in_the_fixture(
+    frame: int, field: str, octets: bytes, printed: str
+) -> None:
+    # The content octets the doc names, as the OBJECT IDENTIFIER TLV the
+    # fixture has to carry for the printed column to be about it.
+    assert bytes([0x06, len(octets)]) + octets in OID_PCAP.read_bytes()
+    assert convert("FT_OID", printed) == printed
 
 
 def test_the_doc_names_the_zone_tshark_is_pinned_to() -> None:

@@ -61,8 +61,11 @@ literal for an EUI-64 field must be exactly 8 bytes long, the same check the
 text form gets.
 
 ``FT_OID``, ``FT_UINT_STRING``, ``FT_STRINGZPAD`` and ``FT_AX25`` stay ``str``
-by decision (#69): an OID's richer form is an open question (#149), and the
-other three are text on the wire or in the display.
+by decision (#69); the other three are text on the wire or in the display. An
+OID is the numeric dotted text tshark prints in both readers (``"1.3.6.1.2.1"``,
+never a resolved name), so ``<`` compares it as text, not arc by arc. #149
+measured it and recommends an ``OID`` value object; ``docs/semantics.md`` has
+the renderings and the recommendation.
 
 Unknown ftypes fall back to ``str`` (identity), so new or exotic dissector
 types degrade gracefully instead of failing.
@@ -415,9 +418,9 @@ _STR_FTYPES = (
     # Surfaced by the issue #19 core protocol set, and kept as ``str`` by the
     # issue #69 decision: listing them makes the choice deliberate rather than
     # accidental, so `test_every_ftype_is_known` can hold the line on genuinely
-    # unrecognized ftypes. A richer OID type is researched in #149; the other
-    # three are text. Changing any of them changes the shipped static type of
-    # every field that uses it.
+    # unrecognized ftypes. The OID type #149 recommends is in docs/semantics.md;
+    # the other three are text. Changing any of them changes the shipped static
+    # type of every field that uses it.
     "FT_OID",  # snmp, tls
     "FT_UINT_STRING",  # ssh
     "FT_STRINGZPAD",  # dhcp, stp

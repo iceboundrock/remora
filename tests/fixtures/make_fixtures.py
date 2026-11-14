@@ -79,6 +79,33 @@ guid_eui64.pcap (5 packets) — FT_GUID and FT_EUI64 values (issue #69):
    struct order, so an ordered GUID filter that tshark evaluated would split
    the two builds
 
+oid.pcap (11 packets) — FT_OID renderings (issue #149). Every frame is an SNMP
+message ``10.0.5.1 -> 10.0.5.2``; ``snmp.name`` is the varbind name, so it
+occurs once per varbind. Frames 4 to 7 and 11 carry encodings no conforming
+agent sends, to pin what tshark prints for them:
+
+1. GetResponse    ``snmp.name`` = ``1.3.6.1.2.1.1.2.0`` (sysObjectID.0, whose
+   ``snmp.value.oid`` = ``1.3.6.1.4.1.8072.3.2.10``) and ``1.3.6.1.2.1.1.1.0``
+2. SNMPv1 Trap    ``snmp.enterprise`` = ``1.3.6.1.4.1.9``
+3. GetResponse    ``snmp.name`` = ``1.3.6.1.2.1.1.10`` and ``1.3.6.1.2.1.1.9``:
+   arc order and text order disagree on which is smaller
+4. GetResponse    ``snmp.name`` = ``1.3``, ``2.999.1`` (a first arc of 2 takes
+   a second arc above 39) and an arc of 2**32, which tshark cannot hold and
+   prints as the empty string, then stops dissecting the packet
+5. GetResponse    ``snmp.name`` encoded ``2b 06 81``, whose last arc never
+   ends: prints ``1.3.6``
+6. GetResponse    ``snmp.name`` encoded ``2b 80 01``, a non-minimal arc:
+   prints ``1.3.1``
+7. GetResponse    ``snmp.name`` encoded with no content octets: prints ``0``
+8. GetResponse    ``snmp.name`` = ``1.3.6.16383`` (``2b 06 ff 7f``)
+9. GetResponse    ``snmp.name`` = ``1.3.6.16384`` (``2b 06 81 80 00``): the
+   arc one above frame 8's, whose encoding tshark sorts below it
+10. GetResponse   ``snmp.name`` = ``1.3.6.1.2.1.0`` and ``1.3.6.1.2.1.3``: one
+   occurrence on each side of the subtree ``1.3.6.1.2.1.1``, none inside it
+11. GetResponse   ``snmp.name`` = frame 4's arc of 2**32 alone: the only
+   occurrence prints as the empty string, which ``-T ek`` keeps and
+   ``-T fields`` cannot tell from absence
+
 Regenerate with::
 
     uv run python tests/fixtures/make_fixtures.py
@@ -516,6 +543,104 @@ def build_guid_eui64() -> bytes:
     return pcap_file(frames, base_ts=1700000400)
 
 
+def ber(tag: int, content: bytes) -> bytes:
+    """One BER TLV, with a definite length in short or long form."""
+    if len(content) < 0x80:
+        length = bytes([len(content)])
+    else:
+        octets = len(content).to_bytes((len(content).bit_length() + 7) // 8, "big")
+        length = bytes([0x80 | len(octets)]) + octets
+    return bytes([tag]) + length + content
+
+
+def ber_int(value: int) -> bytes:
+    """A non-negative BER INTEGER."""
+    return ber(0x02, value.to_bytes(value.bit_length() // 8 + 1, "big"))
+
+
+def oid_content(arcs: tuple[int, ...]) -> bytes:
+    """The minimal BER encoding of an OID's arcs (X.690 8.19), content octets only."""
+
+    def base128(value: int) -> bytes:
+        out = [value & 0x7F]
+        value >>= 7
+        while value:
+            out.append(0x80 | (value & 0x7F))
+            value >>= 7
+        return bytes(reversed(out))
+
+    first, second, *rest = arcs
+    return base128(first * 40 + second) + b"".join(base128(arc) for arc in rest)
+
+
+BER_NULL = ber(0x05, b"")
+SNMP_A = bytes([10, 0, 5, 1])
+SNMP_B = bytes([10, 0, 5, 2])
+
+
+def snmp_response(request_id: int, varbinds: list[tuple[bytes, bytes]]) -> bytes:
+    """An SNMPv2c GetResponse; each varbind is (OID content octets, value TLV)."""
+    bindings = b"".join(ber(0x30, ber(0x06, name) + value) for name, value in varbinds)
+    pdu = ber(0xA2, ber_int(request_id) + ber_int(0) + ber_int(0) + ber(0x30, bindings))
+    return ber(0x30, ber_int(1) + ber(0x04, b"public") + pdu)
+
+
+def snmp_v1_trap(enterprise: tuple[int, ...]) -> bytes:
+    """An SNMPv1 enterpriseSpecific Trap-PDU with no varbinds."""
+    pdu = ber(
+        0xA4,
+        ber(0x06, oid_content(enterprise))
+        + ber(0x40, SNMP_A)  # agent-addr
+        + ber_int(6)  # generic-trap: enterpriseSpecific
+        + ber_int(1)  # specific-trap
+        + ber(0x43, b"\x01")  # time-stamp
+        + ber(0x30, b""),
+    )
+    return ber(0x30, ber_int(0) + ber(0x04, b"public") + pdu)
+
+
+def build_oid() -> bytes:
+    """Every FT_OID rendering the #149 integration suite reads."""
+
+    def frame(message: bytes, sport: int, dport: int) -> bytes:
+        datagram = udp(SNMP_A, SNMP_B, sport, dport, message)
+        return ether(MAC_B, MAC_A, 0x0800, ipv4(SNMP_A, SNMP_B, 17, datagram))
+
+    def response(request_id: int, *names: bytes) -> bytes:
+        return frame(snmp_response(request_id, [(name, BER_NULL) for name in names]), 161, 50000)
+
+    sys_object_id = ber(0x06, oid_content((1, 3, 6, 1, 4, 1, 8072, 3, 2, 10)))
+    frames = [
+        frame(
+            snmp_response(
+                1,
+                [
+                    (oid_content((1, 3, 6, 1, 2, 1, 1, 2, 0)), sys_object_id),
+                    (oid_content((1, 3, 6, 1, 2, 1, 1, 1, 0)), ber(0x04, b"Linux")),
+                ],
+            ),
+            161,
+            50000,
+        ),
+        frame(snmp_v1_trap((1, 3, 6, 1, 4, 1, 9)), 50001, 162),
+        response(3, oid_content((1, 3, 6, 1, 2, 1, 1, 10)), oid_content((1, 3, 6, 1, 2, 1, 1, 9))),
+        response(
+            4,
+            oid_content((1, 3)),
+            oid_content((2, 999, 1)),
+            oid_content((1, 3, 6, 1, 4, 1, 2**32)),
+        ),
+        response(5, b"\x2b\x06\x81"),
+        response(6, b"\x2b\x80\x01"),
+        response(7, b""),
+        response(8, oid_content((1, 3, 6, 16383))),
+        response(9, oid_content((1, 3, 6, 16384))),
+        response(10, oid_content((1, 3, 6, 1, 2, 1, 0)), oid_content((1, 3, 6, 1, 2, 1, 3))),
+        response(11, oid_content((1, 3, 6, 1, 4, 1, 2**32))),
+    ]
+    return pcap_file(frames, base_ts=1700000500)
+
+
 # Destination ports and source hosts build_bulk_tcp cycles through, in order.
 # Ten hosts and four ports, so a host selects a tenth of the capture, a port a
 # quarter, and a (host, port) conjunction a twentieth — known fractions the
@@ -561,6 +686,7 @@ def main() -> None:
         ("ctrl_comments.pcapng", build_ctrl_comments),
         ("ntp_times.pcap", build_ntp_times),
         ("guid_eui64.pcap", build_guid_eui64),
+        ("oid.pcap", build_oid),
     ]:
         path = FIXTURES_DIR / name
         data = build()
